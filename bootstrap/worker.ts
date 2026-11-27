@@ -19,9 +19,10 @@ import { assessRiskLane, captureLaneSnapshot, closedLaneBlockedDetails, isDecisi
 import { requiredChecksOf, upstreamRequiredChecks, verifyEvidence } from "./evidence.ts";
 import { inspectFactoryReleaseState, isFactoryTaskId, resolveCheckoutIdentity } from "./factory-evidence.ts";
 import {
-	assertNoSymlinkPath, atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, factoryRunPath, failurePolicyOf, inboundEdgesOf, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, processStartTime, publishExclusive, readJson, readRegularJsonNoSymlink, readyPath, resultPath, unknownAllowedSkills,
+	assertNoSymlinkPath, atomicJson, BOOTSTRAP_LAUNCH_COMMAND, collaborationModeOf, completionRecord, delay, dependencyPolicyOf, dispositionPath, dispositionRecord, errorMessage, expectedResultVersion, factoryRunPath, failurePolicyOf, inboundEdgesOf, isRecord, nodeIdentity, parseCompletion, parseDisposition, parseManifest, parseWorkerConfig, parseWorkerReady, pathEntryExists, processAlive, processStartTime, publishExclusive, readJson, readRegularJsonNoSymlink, readyPath, resultPath, unknownAllowedSkills,
 	type BootstrapResult, type Disposition, type EdgeDeliveryState, type WorkerCompletion, type WorkerConfig, type WorkerReady,
 } from "./session-store.ts";
+import { createHost, defaultHostExec, hostBackendOf, type HostBackendName, type HostExecutor, type HostNodeRef } from "./host.ts";
 import {
 	claimOutcome, DEFAULT_CANCEL_GRACE_MS, DEFAULT_DEPENDENCY_WAIT_MS, HEARTBEAT_STALE_MS, humanWaitStartedAt, readCancelRecordSafe, readOutcomeClaimSafe, readRunCancelRecordSafe, writeCancelRecord, type CancelIdentity, type ProgressSnapshot,
 } from "./cancellation.ts";
@@ -82,10 +83,16 @@ const piHarnessDocs = new RegExp([
 
 export interface WorkerExtensionOptions {
 	tryPaneWake?: typeof tryPaneWake;
+	createHost?: typeof createHost;
+	hostExec?: HostExecutor;
+	env?: NodeJS.ProcessEnv;
 }
 
 export default function (pi: ExtensionAPI, options: WorkerExtensionOptions = {}) {
-	const paneWake = typeof options?.tryPaneWake === "function" ? options.tryPaneWake : tryPaneWake;
+	const injectedPaneWake = typeof options?.tryPaneWake === "function" ? options.tryPaneWake : undefined;
+	const hostFactory = options?.createHost ?? createHost;
+	const hostExec = options?.hostExec ?? defaultHostExec;
+	const hostEnv = options?.env;
 	pi.registerFlag("bootstrap-worker-config", { description: "Bootstrap child launch configuration", type: "string" });
 	pi.registerFlag("allowed-skills", { description: "Comma-separated skill names to advertise, or none", type: "string" });
 	let config: WorkerConfig | undefined;
@@ -1137,12 +1144,37 @@ export default function (pi: ExtensionAPI, options: WorkerExtensionOptions = {})
 			originalTools = [...active];
 			const tools = config.tools.length ? config.tools : active;
 			pi.setActiveTools([...new Set([...tools.filter(tool => !tool.startsWith("bootstrap_") && !tool.startsWith("factory_")), "bootstrap_complete", "bootstrap_read_input", "bootstrap_verify", ...(config.intervention && config.factory_managed ? ["bootstrap_request_direction"] : []), ...active.filter(tool => tool.startsWith("coms_"))])]);
-			const paneId = process.env.HERDR_ENV === "1" ? process.env.HERDR_PANE_ID?.trim() || undefined : undefined;
+			const runtimeEnv = hostEnv ?? process.env;
+			const paneId = runtimeEnv.HERDR_ENV === "1" ? runtimeEnv.HERDR_PANE_ID?.trim() || undefined : undefined;
+			const hcTerminalId = typeof runtimeEnv.HC_TERMINAL_ID === "string" && !runtimeEnv.HC_TERMINAL_ID.includes("\0")
+				? runtimeEnv.HC_TERMINAL_ID.trim() || undefined
+				: undefined;
+			let recordedBackend: HostBackendName | undefined = config.host_backend;
+			const manifestFile = join(config.session_dir, "manifest.json");
+			if (!recordedBackend && existsSync(manifestFile)) {
+				try {
+					recordedBackend = hostBackendOf(parseManifest(readJson<unknown>(manifestFile), config.task_id));
+				} catch { /* unreadable manifest is surfaced on fallback if needed */ }
+			}
+			const useHcRef = recordedBackend === "hc"
+				? Boolean(hcTerminalId)
+				: recordedBackend === "herdr"
+					? false
+					: Boolean(hcTerminalId);
+			const useHerdrRef = recordedBackend === "hc"
+				? false
+				: Boolean(paneId);
+			const hostRef: HostNodeRef | undefined = useHcRef
+				? { backend: "hc", address: hcTerminalId! }
+				: useHerdrRef
+					? { backend: "herdr", pane_id: paneId! }
+					: undefined;
 			const ready: WorkerReady = {
 				version: 1, task_id: config.task_id, token: config.token, instance_id: config.instance_id,
 				pid: process.pid, name: registry.name, session_id: registry.session_id, endpoint: registry.endpoint,
 				model: `${ctx.model.provider}/${ctx.model.id}`, start_time: processStartTime(process.pid),
-				...(paneId ? { pane_id: paneId } : {}),
+				...(hostRef ? { host_ref: hostRef } : {}),
+				...(useHerdrRef && paneId ? { pane_id: paneId } : {}),
 			};
 			const flag = pi.getFlag("allowed-skills");
 			const allowed = typeof flag === "string" ? new Set(flag.split(",").filter(name => name !== "none")) : undefined;
@@ -2381,7 +2413,7 @@ export default function (pi: ExtensionAPI, options: WorkerExtensionOptions = {})
 						if (!signal?.aborted && offer && isComsFallbackEligibleError(comsError)) {
 							let fallback: Awaited<ReturnType<typeof tryPaneWake>>;
 							try {
-								fallback = await paneWake({
+								const wakeReq = {
 									sessionDir: config.session_dir,
 									destinationAttempt: offer.destination.attempt_id,
 									handoffId: offer.handoff_id,
@@ -2390,7 +2422,20 @@ export default function (pi: ExtensionAPI, options: WorkerExtensionOptions = {})
 									reviewPlan: config.review_plan,
 									topology: config.topology,
 									signal,
-								});
+								};
+								if (injectedPaneWake) {
+									fallback = await injectedPaneWake(wakeReq);
+								} else {
+									const manifestFile = join(config.session_dir, "manifest.json");
+									const backend: HostBackendName = existsSync(manifestFile)
+										? hostBackendOf(parseManifest(readJson<unknown>(manifestFile), config.task_id))
+										: config.host_backend
+											?? (isRecord(ready.host_ref) && typeof ready.host_ref.address === "string" && !ready.pane_id && typeof ready.host_ref.pane_id !== "string"
+												? "hc"
+												: "herdr");
+									const host = hostFactory(backend, { exec: hostExec, env: hostEnv ?? process.env });
+									fallback = await host.sendWakeUp(wakeReq);
+								}
 							} catch (fallbackErr) {
 								fallback = { outcome: "failed", reason: errorMessage(fallbackErr) };
 							}

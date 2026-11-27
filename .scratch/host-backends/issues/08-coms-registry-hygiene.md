@@ -10,9 +10,9 @@ Spec: `../spec.md` (hygiene). Tests drive behaviour from outside with a real reg
 
 **Blocked by:** the `coms-handoff-reliability` work merged to `main`.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] After several keepalive intervals (with a short test interval), the entry's start time equals the session start while its heartbeat time has advanced.
-- [ ] Two concurrent writers for one name never fail or leave a corrupt entry.
-- [ ] After a reload cycle the process's interrupt and terminate listener counts do not grow.
-- [ ] Existing Coms suites pass; documentation is updated if it mentions the registry fields.
+- [x] After several keepalive intervals (with a short test interval), the entry's start time equals the session start while its heartbeat time has advanced.
+- [x] Two concurrent writers for one name never fail or leave a corrupt entry.
+- [x] After a reload cycle the process's interrupt and terminate listener counts do not grow.
+- [x] Existing Coms suites pass; documentation is updated if it mentions the registry fields.

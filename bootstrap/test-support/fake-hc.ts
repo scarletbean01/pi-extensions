@@ -1,0 +1,382 @@
+/**
+ * Stateful fake `hc` executor for deterministic Host/bootstrap tests.
+ * Simulates `hc server status`, `hc run`, `hc ls`, `hc get`, `hc kill`, `hc rm`, and `hc send`
+ * without ever touching a real `hc` binary or core.
+ */
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import type { HostExecResult } from "../host.ts";
+import { atomicJson, readJson, readyPath, type WorkerConfig } from "../session-store.ts";
+
+export interface FakeHcTerminal {
+	address: string;
+	name: string | null;
+	cwd: string;
+	argv: string[];
+	labels: Record<string, string>;
+	state: "live" | "finished";
+	status?: "idle" | "working" | "blocked" | "done" | "error" | null;
+	parent: string | null;
+	notify: boolean;
+	exit_code: number | null;
+	created_ms: number;
+	finished_ms: number | null;
+	screen: string;
+	cols: number;
+	rows: number;
+}
+
+export interface FakeHcErrorBehavior {
+	code?: number;
+	kind?: string;
+	message: string;
+	hint?: string;
+	stdout?: string;
+	stderr?: string;
+	killed?: boolean;
+	truncated?: boolean;
+}
+
+export type FakeHcErrorHook =
+	| boolean
+	| FakeHcErrorBehavior
+	| ((terminal: FakeHcTerminal | undefined, args: string[]) => boolean | FakeHcErrorBehavior | void);
+
+export interface FakeHcOptions {
+	cwd?: string;
+	serverRunning?: boolean;
+	callerTerminalId?: string;
+	acknowledge?: boolean;
+	runLauncher?: boolean;
+	launcherEnv?: NodeJS.ProcessEnv;
+	omitLabelsInLs?: boolean;
+}
+
+function hcError(code: number, kind: string, message: string, hint?: string): HostExecResult {
+	return {
+		code,
+		stdout: "",
+		stderr: JSON.stringify({ error: { kind, message, ...(hint ? { hint } : {}) } }),
+	};
+}
+
+function resolveFakeError(
+	spec: FakeHcErrorHook,
+	defaultError: FakeHcErrorBehavior,
+	terminal: FakeHcTerminal | undefined,
+	args: string[],
+): HostExecResult | undefined {
+	const resolved = typeof spec === "function" ? spec(terminal, args) : spec;
+	if (!resolved) return undefined;
+	const err = typeof resolved === "object" ? resolved : defaultError;
+	const base = err.kind
+		? hcError(err.code ?? 1, err.kind, err.message, err.hint)
+		: { code: err.code ?? 1, stdout: "", stderr: err.message };
+	return {
+		...base,
+		code: err.code ?? 1,
+		stdout: err.stdout ?? base.stdout,
+		stderr: err.stderr ?? base.stderr,
+		...(err.killed === undefined ? {} : { killed: err.killed }),
+		...(err.truncated === undefined ? {} : { truncated: err.truncated }),
+	};
+}
+
+export function makeFakeHcExec(options: FakeHcOptions = {}) {
+	const calls: string[][] = [];
+	const terminals = new Map<string, FakeHcTerminal>();
+	const sent: Array<{ address: string; text: string; forced: boolean; ifStatus?: string }> = [];
+	const behavior = {
+		serverRunning: options.serverRunning ?? true,
+		acknowledge: options.acknowledge ?? false,
+		runLauncher: options.runLauncher ?? false,
+		omitLabelsInLs: options.omitLabelsInLs ?? false,
+		failLs: false as FakeHcErrorHook,
+		failGet: false as FakeHcErrorHook,
+		failKill: false as FakeHcErrorHook,
+		failRm: false as FakeHcErrorHook,
+		failSend: false as FakeHcErrorHook,
+		failRun: false,
+		onKill: undefined as ((terminal: FakeHcTerminal) => void) | undefined,
+		onRm: undefined as ((terminal: FakeHcTerminal) => void) | undefined,
+	};
+	let seq = 0;
+
+	if (options.callerTerminalId) {
+		terminals.set(options.callerTerminalId, {
+			address: options.callerTerminalId,
+			name: "caller",
+			cwd: options.cwd ?? process.cwd(),
+			argv: ["pi"],
+			labels: {},
+			state: "live",
+			parent: null,
+			notify: false,
+			exit_code: null,
+			created_ms: Date.now(),
+			finished_ms: null,
+			screen: "exact",
+			cols: 200,
+			rows: 120,
+		});
+	}
+
+	const findByTarget = (target: string): FakeHcTerminal | undefined => {
+		const byAddr = terminals.get(target);
+		if (byAddr) return byAddr;
+		const byName = [...terminals.values()].filter(t => t.name === target);
+		return byName.find(t => t.state === "live") ?? byName[0];
+	};
+
+	const exec = async (command: string, args: string[]): Promise<HostExecResult> => {
+		if (command !== "hc") {
+			throw new Error(`Fake hc executor received non-hc command: ${command}`);
+		}
+		calls.push([...args]);
+
+		if (args[0] === "server" && args[1] === "status") {
+			if (!behavior.serverRunning) {
+				return hcError(1, "unavailable", "herdr-core is not running", "run hc server start");
+			}
+			const all = [...terminals.values()];
+			return {
+				code: 0,
+				stdout: JSON.stringify({
+					core: { id: "fake-hc-core", name: "fake-host" },
+					version: "0.1.25",
+					pid: process.pid,
+					uptime_ms: 1000,
+					holders: [],
+					live: all.filter(t => t.state === "live").length,
+					finished: all.filter(t => t.state === "finished").length,
+				}),
+				stderr: "",
+			};
+		}
+
+		if (args[0] === "get") {
+			const target = args.find((arg, idx) => idx > 0 && !arg.startsWith("-"));
+			const found = target ? findByTarget(target) : undefined;
+			const injected = resolveFakeError(
+				behavior.failGet,
+				{ code: 1, kind: "unavailable", message: "core socket not found" },
+				found,
+				args,
+			);
+			if (injected) return injected;
+			if (!target) return hcError(7, "needs_target", "missing terminal target");
+			if (!found) return hcError(3, "not_found", `terminal ${target} not found`);
+			return { code: 0, stdout: JSON.stringify(found), stderr: "" };
+		}
+
+		if (args[0] === "ls") {
+			const injected = resolveFakeError(
+				behavior.failLs,
+				{ code: 1, kind: "unavailable", message: "ls failed" },
+				undefined,
+				args,
+			);
+			if (injected) return injected;
+			const includeAll = args.includes("--all");
+			const requiredLabels: Array<[string, string]> = [];
+			for (let i = 1; i < args.length; i++) {
+				if (args[i] === "--label" && args[i + 1]) {
+					const kv = args[++i]!;
+					const eq = kv.indexOf("=");
+					if (eq !== -1) requiredLabels.push([kv.slice(0, eq), kv.slice(eq + 1)]);
+				}
+			}
+			const all = [...terminals.values()];
+			const hidden_finished = includeAll ? 0 : all.filter(t => t.state === "finished").length;
+			const matched = all.filter(t => {
+				if (!includeAll && t.state !== "live") return false;
+				return requiredLabels.every(([k, v]) => t.labels[k] === v);
+			}).map(t => behavior.omitLabelsInLs ? { ...t, labels: {} } : t);
+			return {
+				code: 0,
+				stdout: JSON.stringify({ terminals: matched, hidden_finished, machines: [] }),
+				stderr: "",
+			};
+		}
+
+		if (args[0] === "run") {
+			if (behavior.failRun) return hcError(1, "spawn_failed", "fake run failure");
+			let name: string | null = null;
+			let cwd = options.cwd ?? process.cwd();
+			let noParent = false;
+			let noNotify = false;
+			const labels: Record<string, string> = {};
+			const argv: string[] = [];
+			let pastOptions = false;
+			for (let i = 1; i < args.length; i++) {
+				const arg = args[i]!;
+				if (pastOptions) {
+					argv.push(arg);
+					continue;
+				}
+				if (arg === "--") {
+					pastOptions = true;
+					continue;
+				}
+				if (arg === "--json" || arg === "--bg") continue;
+				if (arg === "--no-parent") { noParent = true; continue; }
+				if (arg === "--no-notify") { noNotify = true; continue; }
+				if (arg === "--name" && args[i + 1] !== undefined) { name = args[++i]!; continue; }
+				if (arg === "--cwd" && args[i + 1] !== undefined) { cwd = args[++i]!; continue; }
+				if (arg === "--label" && args[i + 1] !== undefined) {
+					const kv = args[++i]!;
+					const eq = kv.indexOf("=");
+					if (eq === -1) return hcError(1, "invalid_params", `invalid label ${kv}`);
+					labels[kv.slice(0, eq)] = kv.slice(eq + 1);
+					continue;
+				}
+				if (arg.startsWith("-")) {
+					return hcError(1, "invalid_params", `unexpected option ${arg}`);
+				}
+				pastOptions = true;
+				argv.push(arg);
+			}
+			if (name !== null) {
+				if (!/^[a-z0-9_-]{1,32}$/.test(name)) {
+					return hcError(1, "invalid_params", `invalid terminal name ${JSON.stringify(name)}`);
+				}
+				const liveDup = [...terminals.values()].find(t => t.state === "live" && t.name === name);
+				if (liveDup) {
+					return hcError(1, "name_taken", `live terminal name "${name}" is already taken (${liveDup.address})`);
+				}
+			}
+			const address = `t${++seq}`;
+			const terminal: FakeHcTerminal = {
+				address,
+				name,
+				cwd,
+				argv,
+				labels,
+				state: "live",
+				parent: noParent ? null : (options.callerTerminalId ?? null),
+				notify: !noNotify,
+				exit_code: null,
+				created_ms: Date.now(),
+				finished_ms: null,
+				screen: "exact",
+				cols: 200,
+				rows: 120,
+			};
+			terminals.set(address, terminal);
+
+			if (behavior.runLauncher && argv.length > 0) {
+				execFileSync(argv[0]!, argv.slice(1), {
+					cwd,
+					...(options.launcherEnv ? { env: options.launcherEnv } : {}),
+				});
+			}
+			if (behavior.acknowledge && labels.bootstrap_run && labels.bootstrap_node && options.cwd) {
+				const sessionDir = join(options.cwd, ".pi", "agent-sessions", labels.bootstrap_run);
+				const configPath = join(sessionDir, `${labels.bootstrap_node}.config.json`);
+				if (existsSync(configPath)) {
+					const config = readJson<WorkerConfig>(configPath);
+					const ready = {
+						task_id: labels.bootstrap_run,
+						token: config.token,
+						instance_id: labels.bootstrap_node,
+						name: labels.bootstrap_node,
+						pid: process.pid,
+						session_id: `session-${labels.bootstrap_node}`,
+						endpoint: "/tmp/fake-coms",
+						model: config.expected_model,
+					};
+					atomicJson(readyPath(sessionDir, labels.bootstrap_node), ready);
+					const registryDir = join(config.coms_dir, "projects", config.coms_project, "agents");
+					mkdirSync(registryDir, { recursive: true });
+					atomicJson(join(registryDir, `${labels.bootstrap_node}.json`), ready);
+					const launcherPath = join(sessionDir, `${labels.bootstrap_node}.sh`);
+					if (existsSync(launcherPath)) {
+						// Sanity-check that launcher file is readable UTF-8 script.
+						readFileSync(launcherPath, "utf8");
+					}
+				}
+			}
+			return { code: 0, stdout: JSON.stringify(terminal), stderr: "" };
+		}
+
+		if (args[0] === "kill") {
+			const target = args.find((arg, idx) => idx > 0 && !arg.startsWith("-"));
+			const found = target ? findByTarget(target) : undefined;
+			const injected = resolveFakeError(
+				behavior.failKill,
+				{ code: 1, kind: "unavailable", message: "kill failed" },
+				found,
+				args,
+			);
+			if (injected) return injected;
+			if (!target) return hcError(7, "needs_target", "missing terminal target");
+			if (!found) return hcError(3, "not_found", `terminal ${target} not found`);
+			found.state = "finished";
+			found.exit_code = 143;
+			found.finished_ms = Date.now();
+			behavior.onKill?.(found);
+			return { code: 0, stdout: JSON.stringify(found), stderr: "" };
+		}
+
+		if (args[0] === "rm") {
+			const target = args.find((arg, idx) => idx > 0 && !arg.startsWith("-"));
+			const found = target ? findByTarget(target) : undefined;
+			const injected = resolveFakeError(
+				behavior.failRm,
+				{ code: 1, kind: "unavailable", message: "rm failed" },
+				found,
+				args,
+			);
+			if (injected) return injected;
+			if (!target) return hcError(7, "needs_target", "missing terminal target");
+			if (!found) return hcError(3, "not_found", `terminal ${target} not found`);
+			if (found.state === "live") return hcError(1, "live", `terminal ${found.address} is still live`);
+			terminals.delete(found.address);
+			behavior.onRm?.(found);
+			return { code: 0, stdout: JSON.stringify({ removed: found.address }), stderr: "" };
+		}
+
+		if (args[0] === "send") {
+			let forced = false;
+			let ifStatus: string | undefined;
+			const positional: string[] = [];
+			for (let i = 1; i < args.length; i++) {
+				const arg = args[i]!;
+				if (arg === "--json" || arg === "--wait") continue;
+				if (arg === "--force") { forced = true; continue; }
+				if (arg === "--if" && args[i + 1] !== undefined) { ifStatus = args[++i]!; continue; }
+				if (arg === "--timeout" && args[i + 1] !== undefined) { i++; continue; }
+				if (arg.startsWith("-")) return hcError(1, "invalid_params", `unexpected option ${arg}`);
+				positional.push(arg);
+			}
+			const [target, text] = positional;
+			if (!target) return hcError(7, "needs_target", "missing terminal target");
+			if (text === undefined) return hcError(1, "invalid_params", "missing text");
+			const found = findByTarget(target);
+			const injected = resolveFakeError(
+				behavior.failSend,
+				{ code: 1, kind: "unavailable", message: "core socket not found" },
+				found,
+				args,
+			);
+			if (injected) return injected;
+			if (!found) return hcError(3, "not_found", `terminal ${target} not found`);
+			if (found.state === "finished") return hcError(11, "finished", `terminal ${found.address} has finished`);
+			if (found.status === "blocked" && !forced) return hcError(9, "blocked", `terminal ${found.address} is blocked`);
+			if (ifStatus !== undefined && found.status !== ifStatus) {
+				return hcError(10, "status_mismatch", `terminal ${found.address} status is ${found.status ?? "null"}, expected ${ifStatus}`);
+			}
+			sent.push({ address: found.address, text, forced, ...(ifStatus !== undefined ? { ifStatus } : {}) });
+			return {
+				code: 0,
+				stdout: JSON.stringify({ turn: sent.length, started: true, status: found.status ?? null, wait: null }),
+				stderr: "",
+			};
+		}
+
+		throw new Error(`Unexpected fake hc command: ${args.join(" ")}`);
+	};
+
+	return { exec, calls, terminals, behavior, sent };
+}

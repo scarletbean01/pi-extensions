@@ -12,6 +12,7 @@ import {
 } from "./outcomes.ts";
 import type { ArtifactMetadata, OutputContract, RosterEntry, VerificationSummary } from "./contracts.ts";
 import type { HandoffTransport } from "./handoff.ts";
+import { HOST_BACKENDS, type HostBackendName, type HostNodeRef } from "./host-backend.ts";
 
 /**
  * Identities (see the bootstrap README): the run is the public `task_id`; a node is one planned assignment;
@@ -134,6 +135,8 @@ export interface AgentLaunch {
 	tab_id?: string;
 	pane_id?: string;
 	terminal_id?: string;
+	/** Backend-owned opaque per-launch handle reference. */
+	host_ref?: HostNodeRef;
 	status: "planned" | "creating" | "tab_created" | "launch_submitted" | "ready" | "released" | "closed";
 	error?: string;
 	/**
@@ -207,6 +210,8 @@ export interface BootstrapManifest {
 	failure_policy?: FailurePolicy;
 	/** Workspace strategy used for this run ("shared_cwd" by default). */
 	workspace_strategy?: WorkspaceStrategy;
+	/** Host backend selected when the run launched; absent on legacy runs (read as "herdr"). */
+	host_backend?: HostBackendName;
 	task_id: string;
 	task: string;
 	topology: "chain" | "team" | "graph";
@@ -257,6 +262,8 @@ export interface WorkerConfig {
 	learned_constraints?: LearnedConstraintsSnapshot;
 	/** Source attempt for the active inbound handoff. Derived locally from the review plan. */
 	predecessor_attempt?: number;
+	/** Optional Host backend override for worker fixtures without a manifest. */
+	host_backend?: HostBackendName;
 	/** The run ID. */
 	task_id: string;
 	token: string;
@@ -345,6 +352,8 @@ export interface WorkerReady {
 	start_time?: string;
 	kept_skills?: string[];
 	unmatched_skills?: string[];
+	/** Backend-neutral Host terminal/pane reference recorded from the worker's Host environment. */
+	host_ref?: HostNodeRef;
 	/** Herdr pane ID recorded from the worker's Herdr environment when running inside a Herdr pane. */
 	pane_id?: string;
 }
@@ -992,6 +1001,9 @@ function parseManifestFields(raw: unknown, taskId: string): BootstrapManifest {
 	}
 	if (raw.task_id !== taskId || !Array.isArray(raw.pane_manifest)) throw new Error(`Invalid bootstrap manifest for "${taskId}"`);
 	if (raw.topology !== "chain" && raw.topology !== "team" && raw.topology !== "graph") throw new Error(`Unsupported topology ${JSON.stringify(raw.topology)} for "${taskId}"`);
+	if (raw.host_backend !== undefined && !(HOST_BACKENDS as readonly unknown[]).includes(raw.host_backend)) {
+		throw new Error(`Unsupported host_backend ${JSON.stringify(raw.host_backend)} for "${taskId}": expected ${HOST_BACKENDS.join(" or ")}`);
+	}
 	checkPolicy(raw);
 	checkRunPolicies(raw);
 	const cleanup_policy = raw.cleanup_policy === undefined ? undefined : parseCleanupPolicy(raw.cleanup_policy);
@@ -1005,6 +1017,13 @@ function parseManifestFields(raw: unknown, taskId: string): BootstrapManifest {
 			checkPolicy(entry);
 			checkNodeKindFields(entry, version);
 			checkEdgeList(entry.inbound_edges, "inbound_edges");
+			if (entry.host_ref !== undefined) {
+				if (!isRecord(entry.host_ref)) throw new Error("host_ref must be an object");
+				if (raw.host_backend === "hc") {
+					nonEmpty(entry.host_ref.name, "host_ref.name");
+					nonEmpty(entry.host_ref.address, "host_ref.address");
+				}
+			}
 			const instance = nonEmpty(entry.instance_id, "instance_id");
 			if (nodes.has(identity.node_id.toLowerCase())) throw new Error(`duplicate node ID ${identity.node_id}`);
 			if (instances.has(instance)) throw new Error(`duplicate instance ${instance}`);
@@ -1079,6 +1098,9 @@ export function parseWorkerConfig(raw: unknown): WorkerConfig {
 	checkRunPolicies(raw);
 	checkNodeKindFields(raw, version);
 	if (raw.topology !== "chain" && raw.topology !== "team" && raw.topology !== "graph") throw new Error(`Unsupported worker topology ${JSON.stringify(raw.topology)}`);
+	if (raw.host_backend !== undefined && !(HOST_BACKENDS as readonly unknown[]).includes(raw.host_backend)) {
+		throw new Error(`Unsupported host_backend ${JSON.stringify(raw.host_backend)}: expected ${HOST_BACKENDS.join(" or ")}`);
+	}
 	checkEdgeList(raw.inbound_edges, "inbound_edges");
 	checkEdgeList(raw.outbound_edges, "outbound_edges");
 	if (raw.handoff_protocol !== undefined && raw.handoff_protocol !== 1) throw new Error(`Unsupported handoff protocol ${JSON.stringify(raw.handoff_protocol)}: this release reads protocol 1. The configuration was left untouched`);
@@ -1295,6 +1317,7 @@ export function parseWorkerReady(raw: unknown): WorkerReady {
 	if (raw.endpoint !== undefined) nonEmpty(raw.endpoint, "endpoint");
 	if (raw.model !== undefined && typeof raw.model !== "string") throw new Error("model must be a string");
 	if (raw.start_time !== undefined && typeof raw.start_time !== "string") throw new Error("start_time must be a string");
+	if (raw.host_ref !== undefined && !isRecord(raw.host_ref)) throw new Error("host_ref must be an object");
 	if (raw.pane_id !== undefined) nonEmpty(raw.pane_id, "pane_id");
 	for (const field of ["kept_skills", "unmatched_skills"] as const) {
 		const names = raw[field];
@@ -1513,15 +1536,17 @@ function lockTimeout(path: string, pid: number | undefined): Error {
 	return new Error(`Bootstrap run is locked by another process (pid ${pid ?? "unknown"}). Retry later, or remove ${path} if that process is gone.`);
 }
 
-async function acquireFileLock(path: string, waitMs: number): Promise<void> {
+async function acquireFileLock(path: string, waitMs: number, signal?: AbortSignal): Promise<void> {
+	checkAbort(signal);
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	const deadline = Date.now() + waitMs;
 	for (;;) {
+		checkAbort(signal);
 		const result = tryAcquireFileLock(path);
 		if (result.acquired) return;
 		if (result.retry) continue;
 		if (Date.now() >= deadline) throw lockTimeout(path, result.pid);
-		await new Promise(resolve => setTimeout(resolve, 50));
+		await delay(50, signal);
 	}
 }
 
@@ -1548,22 +1573,64 @@ export function withSyncRunLock<T>(key: string, action: () => T): T {
 }
 
 const locks = new Map<string, Promise<void>>();
+
+function waitForTurn(previous: Promise<void>, signal?: AbortSignal): Promise<void> {
+	checkAbort(signal);
+	if (!signal) return previous;
+	return new Promise<void>((resolve, reject) => {
+		let settled = false;
+		const onAbort = () => {
+			if (settled) return;
+			settled = true;
+			reject(new Error("Bootstrap cancelled"));
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		previous.then(
+			() => {
+				if (settled) return;
+				settled = true;
+				signal.removeEventListener("abort", onAbort);
+				resolve();
+			},
+			error => {
+				if (settled) return;
+				settled = true;
+				signal.removeEventListener("abort", onAbort);
+				reject(error);
+			},
+		);
+	});
+}
+
 /**
  * Serialize launch/report/cleanup on a run without blocking unrelated runs: an in-process queue
  * plus a lock file (`<key>.lock`) that coordinates separate dispatcher processes.
  */
-export async function withRunLock<T>(key: string, action: () => Promise<T>, waitMs = LOCK_WAIT_MS): Promise<T> {
+export async function withRunLock<T>(key: string, action: () => Promise<T>, waitMs = LOCK_WAIT_MS, signal?: AbortSignal): Promise<T> {
+	checkAbort(signal);
 	const previous = locks.get(key) ?? Promise.resolve();
 	let release!: () => void;
 	const current = new Promise<void>(resolve => { release = resolve; });
 	locks.set(key, current);
-	await previous;
+	let acquiredTurn = false;
 	try {
-		await acquireFileLock(`${key}.lock`, waitMs);
+		await waitForTurn(previous, signal);
+		acquiredTurn = true;
+		await acquireFileLock(`${key}.lock`, waitMs, signal);
 		try { return await action(); }
 		finally { releaseFileLock(`${key}.lock`); }
+	} finally {
+		if (acquiredTurn) {
+			release();
+			if (locks.get(key) === current) locks.delete(key);
+		} else {
+			// Keep downstream in-process waiters behind the active holder until its turn finishes.
+			void previous.then(() => {
+				release();
+				if (locks.get(key) === current) locks.delete(key);
+			});
+		}
 	}
-	finally { release(); if (locks.get(key) === current) locks.delete(key); }
 }
 
 export function errorMessage(error: unknown): string {

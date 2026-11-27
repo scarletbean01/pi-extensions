@@ -183,7 +183,7 @@ waiting -> running -> submitted(n) -> parked -+-> revision handoff -> running(n+
 
 ### Finalization and cleanup
 
-Closing a tab ends the Pi process running in it: Herdr attaches the pane's process to the tab. Cleanup therefore needs no separate kill step, and a parked agent needs no acknowledgement before its tab is closed, because it has nothing in flight (its results are durable, and finalization releases its ownership).
+On Herdr, closing a tab ends the Pi process running in it because Herdr attaches the pane's process to the tab. Cleanup therefore needs no separate kill step, and a parked agent needs no acknowledgement before its tab is closed, because it has nothing in flight (its results are durable, and finalization releases its ownership). See the [Host contract](bootstrap/HOST.md) for backend cleanup semantics.
 
 Finalization (state)
 
@@ -315,7 +315,7 @@ Decided (2026-11-18):
 - Record naming is fixed at plan time: attempt-scoped throughout plans with a decision, legacy names otherwise.
 - Fan-out delivery is tracked, retried and recovered per edge.
 - Attempt limits live in the plan, with `bootstrap.json` supplying defaults and operator ceilings (not the persona), merged field by field. See "Limits and configuration".
-- Cleanup is automatic when a graph run succeeds and manual otherwise; `chain` and `team` stay manual by default. Closing a tab ends its Pi process (confirmed in Herdr), so finalization is state, not process control.
+- Cleanup is automatic when a graph run succeeds and manual otherwise; `chain` and `team` stay manual by default. On Herdr, closing a tab ends its Pi process (confirmed in Herdr), so finalization is state, not process control. See the [Host contract](bootstrap/HOST.md) for backend cleanup semantics.
 - Out of scope: quorum/any joins, `keep_alive` outside loops, concurrency slots, a runtime owner and lazy launch.
 
 No open questions remain.

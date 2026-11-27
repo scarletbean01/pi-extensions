@@ -21,6 +21,7 @@ const releaseNotes = readFileSync(join(bootstrapDir, "RELEASE-NOTES.md"), "utf8"
 const factoryGuide = readFileSync(join(repoRoot, "docs", "factory-guide.md"), "utf8");
 const viewerDocPath = join(repoRoot, "docs", "factory-web-viewer.md");
 const viewerDoc = readFileSync(viewerDocPath, "utf8");
+const factoryLaunchDoc = readFileSync(join(repoRoot, "docs", "factory-launch.md"), "utf8");
 const glossary = readFileSync(join(repoRoot, "GLOSSARY.md"), "utf8");
 
 function registeredDispatcherSurface() {
@@ -93,6 +94,9 @@ test("README documents graph topology, decisions, limits, cleanup and /bootgraph
 	assert.match(readme, /\bcleanup\b[\s\S]*\bon_success\b/);
 	assert.match(readme, /\/bootgraph\b/);
 	assert.match(readme, /factory-guide\.md/);
+	assert.doesNotMatch(readme, /does not observe the cancellation signal/i);
+	assert.doesNotMatch(readme, /keeps waiting \(up to 15 minutes\), and cancels as soon as it gets the lock/i);
+	assert.match(readme, /observes the cancellation signal/i);
 
 	assertNoStaleGraphUnavailability(readme, "README.md");
 });
@@ -211,6 +215,8 @@ test("model-facing dispatcher and worker tool descriptions follow GLOSSARY vocab
 	assert.match(generate.description, /\bdecision\b/);
 	assert.match(generate.description, /\bcleanup\b/);
 	assert.match(generate.description, /\/bootgraph\b/);
+	assert.doesNotMatch(generate.description, /cancellation takes effect only once that wait ends/i);
+	assert.match(generate.description, /cancellation stops the wait/i);
 	assert.doesNotMatch(JSON.stringify(generate.parameters), /Available in dry runs/i);
 
 	const complete = worker.tools.get("bootstrap_complete");
@@ -634,4 +640,32 @@ test("docs/factory-web-viewer.md, links, and GLOSSARY Run graph entry match the 
 	assert.throws(() => assertViewerDocMatchesSource(viewerDoc.replace(/### Starting and stopping from Pi[\s\S]*?^---/m, "---")), /Starting and stopping from Pi/);
 	assert.throws(() => assertViewerDocMatchesSource(viewerDoc.replace(/after 5 seconds/, "after 99 seconds")), /STOP_SIGTERM_WAIT_MS/);
 	assert.throws(() => assertViewerDocMatchesSource(viewerDoc.replace(/waits up to 10 seconds/, "waits up to 99 seconds")), /DEFAULT_STARTUP_TIMEOUT_MS/);
+});
+
+test("model-facing tool descriptions and factory docs are Host-backend-neutral and drop ticket-01 Herdr-only placeholders", () => {
+	const dispatcher = registeredDispatcherSurface();
+	const generate = dispatcher.tools.get("bootstrap_generate")!;
+	const status = dispatcher.tools.get("bootstrap_status")!;
+	const recover = dispatcher.tools.get("bootstrap_recover")!;
+	const cleanup = dispatcher.tools.get("bootstrap_cleanup")!;
+	const tabIdsDesc = collectDescriptions((cleanup.parameters as any).args[0].tab_ids).join("\n");
+
+	assert.doesNotMatch(generate.description, /originating Herdr workspace/i);
+	assert.doesNotMatch(status.description, /from Herdr idle status/i);
+	assert.doesNotMatch(recover.description, /shared Herdr pane wake-up fallback/i);
+	assert.match(tabIdsDesc, /Herdr-only/i);
+	assert.match(tabIdsDesc, /refused on hc/i);
+
+	for (const [label, doc] of [
+		["docs/factory-guide.md", factoryGuide],
+		["docs/factory-launch.md", factoryLaunchDoc],
+	] as const) {
+		assert.doesNotMatch(doc, /currently uses Herdr/i, `${label} still has ticket-01 Herdr-only wording`);
+		assert.doesNotMatch(doc, /follow-on implementation/i, `${label} still claims hc is follow-on work`);
+		assert.doesNotMatch(doc, /herdr in this checkout/i, `${label} still claims herdr-only checkout`);
+		assert.doesNotMatch(doc, /inside Herdr/i, `${label} still requires running inside Herdr`);
+		assert.match(doc, /bootstrap\/HOST\.md/, `${label} must link to bootstrap/HOST.md`);
+		assert.match(doc, /\bhc\b/i, `${label} must document hc backend support`);
+		assert.match(doc, /\bherdr\b/i, `${label} must document herdr backend support`);
+	}
 });

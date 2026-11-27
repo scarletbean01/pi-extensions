@@ -1,0 +1,884 @@
+/**
+ * Parameterised Host contract suite running the same semantic checks against both
+ * `herdr` (via fake herdr exec) and `hc` (via stateful fake hc exec).
+ */
+import test from "node:test";
+import assert from "node:assert/strict";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+	createHost,
+	type Host,
+	type HostBackendName,
+	type HostExecResult,
+	type HostNodeTarget,
+} from "./host.ts";
+import { BootstrapService, type GenerateRequest } from "./lifecycle.ts";
+import { atomicJson, completionRecord, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
+import { makeFakeHcExec } from "./test-support/fake-hc.ts";
+
+const FAKE_HC_STATUS_JSON = JSON.stringify({
+	core: { id: "fake-hc-core", name: "fake-host" },
+	version: "0.1.25",
+	pid: 1234,
+	uptime_ms: 1000,
+	holders: [],
+	live: 0,
+	finished: 0,
+});
+
+function installFakeBinary(dir: string, name: string, script: string): void {
+	mkdirSync(dir, { recursive: true });
+	const binPath = join(dir, name);
+	writeFileSync(binPath, script, "utf8");
+	chmodSync(binPath, 0o700);
+}
+
+function makeFakeHerdrContractExec(cwd: string) {
+	const calls: string[][] = [];
+	const tabs: Array<{ tab_id: string; label: string; workspace_id: string }> = [];
+	const panes: Array<{ tab_id: string; pane_id: string; terminal_id: string; label: string; workspace_id: string }> = [];
+	const behavior = { failPreflight: false, failDiscovery: false, acknowledge: true };
+	let seq = 0;
+
+	const exec = async (command: string, args: string[]): Promise<HostExecResult> => {
+		assert.equal(command, "herdr");
+		calls.push([...args]);
+		const ok = (value: unknown = "") => ({ code: 0, stdout: typeof value === "string" ? value : JSON.stringify({ result: value }), stderr: "" });
+		if (args[0] === "pane" && args[1] === "get") {
+			if (behavior.failPreflight && args[2] === "caller") return { code: 1, stdout: "", stderr: "caller pane unreachable" };
+			if (args[2] === "caller") return ok({ pane: { pane_id: "caller", workspace_id: "ws-origin" } });
+			if (behavior.failDiscovery) return { code: 1, stdout: "", stderr: "server error" };
+			const found = panes.find(p => p.pane_id === args[2]);
+			if (!found) return { code: 1, stdout: "", stderr: "pane not found" };
+			return ok({ pane: found });
+		}
+		if (args[0] === "pane" && args[1] === "send-text") {
+			if (behavior.failDiscovery) return { code: 1, stdout: "", stderr: "send-text failed" };
+			const found = panes.find(p => p.pane_id === args[2]);
+			if (!found) return { code: 1, stdout: "", stderr: "pane not found" };
+			return ok();
+		}
+		if (args[0] === "pane" && args[1] === "send-keys") {
+			if (behavior.failDiscovery) return { code: 1, stdout: "", stderr: "send-keys failed" };
+			const found = panes.find(p => p.pane_id === args[2]);
+			if (!found) return { code: 1, stdout: "", stderr: "pane not found" };
+			return ok();
+		}
+		if (args[0] === "tab" && args[1] === "create") {
+			seq++;
+			const label = args[args.indexOf("--label") + 1]!;
+			const tab = { tab_id: `t${seq}`, label, workspace_id: "ws-origin" };
+			const pane = { tab_id: `t${seq}`, pane_id: `p${seq}`, terminal_id: `term${seq}`, label, workspace_id: "ws-origin" };
+			tabs.push(tab);
+			panes.push(pane);
+			return ok({ tab: { tab_id: tab.tab_id }, root_pane: { pane_id: pane.pane_id, terminal_id: pane.terminal_id } });
+		}
+		if (args[0] === "pane" && args[1] === "run") {
+			if (behavior.acknowledge) {
+				const pane = panes.find(p => p.pane_id === args[2])!;
+				const [task, instance] = pane.label.split(":");
+				const sessionDir = join(cwd, ".pi", "agent-sessions", task!);
+				const configPath = join(sessionDir, `${instance}.config.json`);
+				if (existsSync(configPath)) {
+					const config = JSON.parse(readFileSync(configPath, "utf8")) as WorkerConfig;
+					const ready = { task_id: task, token: config.token, instance_id: instance, name: instance, pid: process.pid, session_id: `session-${instance}`, endpoint: "/tmp/fake-coms", model: config.expected_model };
+					atomicJson(readyPath(sessionDir, instance!), ready);
+					const registryDir = join(config.coms_dir, "projects", config.coms_project, "agents");
+					mkdirSync(registryDir, { recursive: true });
+					atomicJson(join(registryDir, `${instance}.json`), ready);
+				}
+			}
+			return ok();
+		}
+		if (args[0] === "api" && args[1] === "snapshot") {
+			if (behavior.failDiscovery) return { code: 1, stdout: "", stderr: "snapshot unavailable" };
+			return ok({ workspaces: [{ workspace_id: "ws-origin" }], tabs, panes });
+		}
+		if (args[0] === "workspace" && args[1] === "list") {
+			if (behavior.failDiscovery) return { code: 1, stdout: "", stderr: "workspace list unavailable" };
+			return ok({ workspaces: [{ workspace_id: "ws-origin" }] });
+		}
+		if (args[0] === "tab" && args[1] === "list") return ok({ tabs });
+		if (args[0] === "pane" && args[1] === "list") return ok({ panes });
+		if (args[0] === "pane" && args[1] === "close") {
+			const idx = panes.findIndex(p => p.pane_id === args[2]);
+			if (idx === -1) return { code: 1, stdout: "", stderr: "pane not found" };
+			const [removed] = panes.splice(idx, 1);
+			if (!panes.some(p => p.tab_id === removed.tab_id)) {
+				const tIdx = tabs.findIndex(t => t.tab_id === removed.tab_id);
+				if (tIdx !== -1) tabs.splice(tIdx, 1);
+			}
+			return ok();
+		}
+		if (args[0] === "tab" && args[1] === "close") {
+			const idx = tabs.findIndex(t => t.tab_id === args[2]);
+			if (idx === -1) return { code: 1, stdout: "", stderr: "tab not found" };
+			const [removed] = tabs.splice(idx, 1);
+			for (let i = panes.length - 1; i >= 0; i--) {
+				if (panes[i].tab_id === removed.tab_id) panes.splice(i, 1);
+			}
+			return ok();
+		}
+		throw new Error(`Unexpected fake Herdr command: ${args.join(" ")}`);
+	};
+
+	return { exec, calls, tabs, panes, behavior };
+}
+
+interface ContractHarness {
+	backend: HostBackendName;
+	root: string;
+	cwd: string;
+	home: string;
+	bin: string;
+	stateDir: string;
+	extensionDir: string;
+	env: NodeJS.ProcessEnv;
+	host: Host;
+	exec: (command: string, args: string[], options: any) => Promise<HostExecResult>;
+	calls: string[][];
+	failPreflight: () => void;
+	setDiscoveryFailure: (failing: boolean) => void;
+	hasNodeResource: (target: HostNodeTarget) => boolean;
+	removeNodeResource: (target: HostNodeTarget) => void;
+	renameNodeResource: (target: HostNodeTarget, newName: string) => void;
+	addLookAlikeResource: (name: string) => () => boolean;
+	mismatchOwnership: (target: HostNodeTarget) => void;
+	duplicateOwnership: (target: HostNodeTarget) => void;
+	markFinishedIfSupported: (target: HostNodeTarget) => boolean;
+}
+
+function createContractHarness(t: test.TestContext, backend: HostBackendName): ContractHarness {
+	const root = mkdtempSync(join(tmpdir(), `bootstrap-contract-${backend}-`));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const cwd = join(root, "project");
+	const home = join(root, "home");
+	const bin = join(root, "bin");
+	const stateDir = join(root, "state");
+	const extensionDir = dirname(dirname(fileURLToPath(import.meta.url)));
+	mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+	mkdirSync(join(cwd, "extensions"), { recursive: true });
+	mkdirSync(home, { recursive: true });
+	installFakeBinary(bin, "pi", "#!/bin/sh\nexit 0\n");
+	writeFileSync(join(cwd, "extensions", "coms.ts"), "export default function () {}\n");
+	for (const name of ["first", "second"]) {
+		writeFileSync(join(cwd, ".pi", "agents", `${name}.md`), `---\nname: ${name}\nmodel: provider/model\ntools: read\n---\nPersona ${name}\n`);
+	}
+
+	if (backend === "herdr") {
+		installFakeBinary(bin, "herdr", "#!/bin/sh\nexit 0\n");
+		const fake = makeFakeHerdrContractExec(cwd);
+		const env: NodeJS.ProcessEnv = { PATH: bin, HERDR_ENV: "1", HERDR_PANE_ID: "caller" };
+		const host = createHost("herdr", { exec: fake.exec, env });
+		return {
+			backend,
+			root,
+			cwd,
+			home,
+			bin,
+			stateDir,
+			extensionDir,
+			env,
+			host,
+			exec: fake.exec,
+			calls: fake.calls,
+			failPreflight: () => { fake.behavior.failPreflight = true; },
+			setDiscoveryFailure: failing => { fake.behavior.failDiscovery = failing; },
+			hasNodeResource: target => fake.panes.some(p => p.pane_id === target.pane_id),
+			removeNodeResource: target => {
+				const pIdx = fake.panes.findIndex(p => p.terminal_id === target.terminal_id);
+				if (pIdx !== -1) fake.panes.splice(pIdx, 1);
+				const tIdx = fake.tabs.findIndex(tab => tab.tab_id === target.tab_id);
+				if (tIdx !== -1) fake.tabs.splice(tIdx, 1);
+			},
+			renameNodeResource: (target, newName) => {
+				const tab = fake.tabs.find(item => item.tab_id === target.tab_id);
+				if (tab) tab.label = newName;
+			},
+			addLookAlikeResource: name => {
+				const lookAlikeLabel = `${name}-lookalike`;
+				fake.tabs.push({ tab_id: "t-lookalike", label: lookAlikeLabel, workspace_id: "ws-origin" });
+				fake.panes.push({ tab_id: "t-lookalike", pane_id: "p-lookalike", terminal_id: "term-lookalike", label: lookAlikeLabel, workspace_id: "ws-origin" });
+				return () => fake.panes.some(p => p.terminal_id === "term-lookalike");
+			},
+			mismatchOwnership: target => {
+				const pane = fake.panes.find(p => p.tab_id === target.tab_id);
+				if (pane) pane.terminal_id = "term-reused-foreign";
+			},
+			duplicateOwnership: target => {
+				fake.tabs.push({ tab_id: "t-dup", label: "dup", workspace_id: "ws-origin" });
+				fake.panes.push({ tab_id: "t-dup", pane_id: "p-dup", terminal_id: target.terminal_id!, label: "dup", workspace_id: "ws-origin" });
+			},
+			markFinishedIfSupported: () => false,
+		};
+	}
+
+	installFakeBinary(
+		bin,
+		"hc",
+		`#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then printf '%s\\n' '${FAKE_HC_STATUS_JSON}'; exit 0; fi\nexit 1\n`,
+	);
+	const fake = makeFakeHcExec({ cwd, serverRunning: true, acknowledge: true });
+	const env: NodeJS.ProcessEnv = { PATH: bin };
+	const host = createHost("hc", { exec: fake.exec, env });
+	return {
+		backend,
+		root,
+		cwd,
+		home,
+		bin,
+		stateDir,
+		extensionDir,
+		env,
+		host,
+		exec: fake.exec,
+		calls: fake.calls,
+		failPreflight: () => { fake.behavior.serverRunning = false; },
+		setDiscoveryFailure: failing => { fake.behavior.failLs = failing; },
+		hasNodeResource: target => {
+			const addr = String((target.host_ref as any)?.address);
+			return fake.terminals.has(addr);
+		},
+		removeNodeResource: target => {
+			const addr = String((target.host_ref as any)?.address);
+			fake.terminals.delete(addr);
+		},
+		renameNodeResource: (target, newName) => {
+			const addr = String((target.host_ref as any)?.address);
+			const term = fake.terminals.get(addr);
+			if (term) term.name = newName;
+		},
+		addLookAlikeResource: name => {
+			fake.terminals.set("t-lookalike", {
+				address: "t-lookalike",
+				name,
+				cwd,
+				argv: ["/bin/sh", "lookalike.sh"],
+				labels: {},
+				state: "live",
+				parent: null,
+				notify: false,
+				exit_code: null,
+				created_ms: Date.now(),
+				finished_ms: null,
+				screen: "exact",
+				cols: 200,
+				rows: 120,
+			});
+			return () => fake.terminals.has("t-lookalike");
+		},
+		mismatchOwnership: target => {
+			const addr = String((target.host_ref as any)?.address);
+			const term = fake.terminals.get(addr);
+			if (term) term.labels = { bootstrap_run: "other-run", bootstrap_node: "other-node" };
+		},
+		duplicateOwnership: target => {
+			const runId = target.run_id ?? target.label.split(":")[0]!;
+			fake.terminals.set("t-dup", {
+				address: "t-dup",
+				name: "look-alike",
+				cwd,
+				argv: ["/bin/sh", "dup.sh"],
+				labels: { bootstrap_run: runId, bootstrap_node: target.instance_id },
+				state: "live",
+				parent: null,
+				notify: false,
+				exit_code: null,
+				created_ms: Date.now(),
+				finished_ms: null,
+				screen: "exact",
+				cols: 200,
+				rows: 120,
+			});
+		},
+		markFinishedIfSupported: target => {
+			const addr = String((target.host_ref as any)?.address);
+			const term = fake.terminals.get(addr);
+			if (!term) return false;
+			term.state = "finished";
+			term.exit_code = 0;
+			term.finished_ms = Date.now();
+			return true;
+		},
+	};
+}
+
+for (const backend of ["herdr", "hc"] as const) {
+	test(`Host contract (${backend}): preflight failure names backend and operation`, async t => {
+		const h = createContractHarness(t, backend);
+		h.failPreflight();
+		await assert.rejects(
+			() => h.host.preflight(),
+			err => err instanceof Error && err.message.toLowerCase().includes(backend) && /preflight|get|status/i.test(err.message),
+		);
+
+		const emptyBin = join(h.root, "empty-bin");
+		mkdirSync(emptyBin, { recursive: true });
+		const missingBinHost = createHost(backend, { exec: h.exec, env: { ...h.env, PATH: emptyBin } });
+		await assert.rejects(
+			() => missingBinHost.preflight(),
+			err => err instanceof Error && err.message.includes(backend),
+		);
+	});
+
+	test(`Host contract (${backend}): launch, discovery, and existence states (present, gone, ambiguous)`, async t => {
+		const h = createContractHarness(t, backend);
+		const preflight = await h.host.preflight();
+		assert.equal(preflight.backend, backend);
+
+		const runId = "contract-run-1";
+		const launcher1 = join(h.root, "n1.sh");
+		const launcher2 = join(h.root, "n2.sh");
+		writeFileSync(launcher1, "#!/bin/sh\nexit 0\n");
+		writeFileSync(launcher2, "#!/bin/sh\nexit 0\n");
+
+		const handle1 = await h.host.launchNode({
+			name: `${runId}:a1-n1`,
+			runId,
+			instanceId: "a1-n1",
+			directory: h.cwd,
+			launcher: launcher1,
+			environment: { PI_COMS_DIR: join(h.root, "coms"), PI_COMS_TIMEOUT_MS: "300000" },
+			preflight,
+		});
+		const handle2 = await h.host.launchNode({
+			name: `${runId}:a2-n2`,
+			runId,
+			instanceId: "a2-n2",
+			directory: h.cwd,
+			launcher: launcher2,
+			environment: { PI_COMS_DIR: join(h.root, "coms"), PI_COMS_TIMEOUT_MS: "300000" },
+			preflight,
+		});
+
+		const targets: HostNodeTarget[] = [
+			{
+				run_id: runId,
+				node_id: "n1",
+				persona_name: "first",
+				instance_id: "a1-n1",
+				label: `${runId}:a1-n1`,
+				tab_id: handle1.tab_id,
+				pane_id: handle1.pane_id,
+				terminal_id: handle1.terminal_id,
+				host_ref: handle1.host_ref,
+			},
+			{
+				run_id: runId,
+				node_id: "n2",
+				persona_name: "second",
+				instance_id: "a2-n2",
+				label: `${runId}:a2-n2`,
+				tab_id: handle2.tab_id,
+				pane_id: handle2.pane_id,
+				terminal_id: handle2.terminal_id,
+				host_ref: handle2.host_ref,
+			},
+		];
+
+		// Both launched nodes are discovered and present.
+		const discovered = await h.host.discoverOwnedNodes(targets);
+		assert.equal(discovered.length, 2);
+		assert.equal(discovered[0]!.existence.state, "present");
+		assert.equal(discovered[1]!.existence.state, "present");
+		assert.equal((await h.host.nodeExists(targets[0]!)).state, "present");
+
+		// Finished terminal still reports present on backends that retain finished records.
+		if (h.markFinishedIfSupported(targets[0]!)) {
+			assert.equal((await h.host.nodeExists(targets[0]!)).state, "present");
+		}
+
+		// Removing node 1 makes node 1 gone while node 2 stays present.
+		h.removeNodeResource(targets[0]!);
+		assert.equal((await h.host.nodeExists(targets[0]!)).state, "gone");
+		assert.equal((await h.host.nodeExists(targets[1]!)).state, "present");
+
+		// Conflicting ownership makes node 2 ambiguous.
+		h.duplicateOwnership(targets[1]!);
+		const amb = await h.host.nodeExists(targets[1]!);
+		assert.equal(amb.state, "ambiguous");
+
+		// Transient discovery failure rejects instead of reporting gone.
+		h.setDiscoveryFailure(true);
+		await assert.rejects(() => h.host.discoverOwnedNodes([targets[1]!]));
+		await assert.rejects(() => h.host.nodeExists(targets[1]!));
+		h.setDiscoveryFailure(false);
+	});
+
+	test(`Host contract (${backend}): BootstrapService.generate launches end-to-end and records host_backend + host_ref`, async t => {
+		const h = createContractHarness(t, backend);
+		const service = new BootstrapService({
+			exec: h.exec,
+			extensionDir: h.extensionDir,
+			stateDir: h.stateDir,
+			home: h.home,
+			env: h.env,
+			pollMs: 5,
+		});
+		const request: GenerateRequest = {
+			task: `Contract launch on ${backend}`,
+			topology: "chain",
+			project_cwd: h.cwd,
+			agents: [
+				{ node_id: "n1", persona: "first", sub_task: "Step 1" },
+				{ node_id: "n2", persona: "second", sub_task: "Step 2" },
+			],
+			ready_timeout_ms: 200,
+		};
+		const manifest = await service.generate(request);
+		assert.equal(manifest.status, "applied");
+		assert.equal(manifest.host_backend, backend);
+		assert.equal(manifest.pane_manifest.length, 2);
+		for (const entry of manifest.pane_manifest) {
+			assert.ok(entry.host_ref && typeof entry.host_ref === "object");
+		}
+	});
+
+	test(`Host contract (${backend}): closeNode enforces ownership safety, handles finished/gone terminals, and leaves look-alike and other-run terminals alone`, async t => {
+		const h = createContractHarness(t, backend);
+		const preflight = await h.host.preflight();
+		const run1 = "contract-close-1";
+		const run2 = "contract-close-2";
+		const launcher = join(h.root, "close-worker.sh");
+		writeFileSync(launcher, "#!/bin/sh\nexit 0\n");
+
+		const launchTarget = async (runId: string, nodeId: string, instanceId: string): Promise<HostNodeTarget> => {
+			const handle = await h.host.launchNode({
+				name: `${runId}:${instanceId}`,
+				runId,
+				instanceId,
+				directory: h.cwd,
+				launcher,
+				environment: { PI_COMS_DIR: join(h.root, "coms"), PI_COMS_TIMEOUT_MS: "300000" },
+				preflight,
+			});
+			return {
+				run_id: runId,
+				node_id: nodeId,
+				persona_name: "first",
+				instance_id: instanceId,
+				label: `${runId}:${instanceId}`,
+				tab_id: handle.tab_id,
+				pane_id: handle.pane_id,
+				terminal_id: handle.terminal_id,
+				host_ref: handle.host_ref,
+			};
+		};
+
+		const t1 = await launchTarget(run1, "n1", "a1-n1");
+		const t2 = await launchTarget(run1, "n2", "a2-n2");
+		const t3 = await launchTarget(run1, "n3", "a3-n3");
+		const otherRun = await launchTarget(run2, "n1", "a1-n1");
+
+		// A look-alike terminal/tab with the same name as t1's resource is never closed.
+		const lookAlikeName = String((t1.host_ref as any)?.name ?? t1.label);
+		const lookAlikeAlive = h.addLookAlikeResource(lookAlikeName);
+
+		// Closing a renamed terminal still works via labels + id/address.
+		h.renameNodeResource(t1, "operator-renamed-terminal");
+		assert.deepEqual(await h.host.closeNode(t1), { outcome: "closed" });
+		assert.equal(h.hasNodeResource(t1), false);
+		assert.equal((await h.host.nodeExists(t1)).state, "gone");
+		assert.equal(lookAlikeAlive(), true, "look-alike terminal must remain untouched");
+		assert.equal(h.hasNodeResource(otherRun), true, "other run terminal must remain untouched");
+
+		// Closing an already-gone terminal is idempotent and reported as already_gone, not an error.
+		const secondClose = await h.host.closeNode(t1);
+		assert.equal(secondClose.outcome, "already_gone");
+		assert.ok(secondClose.note.length > 0);
+		assert.equal(lookAlikeAlive(), true);
+
+		// Finished-but-not-removed terminals are removed cleanly on backends that retain finished records.
+		if (h.markFinishedIfSupported(t2)) {
+			assert.equal((await h.host.nodeExists(t2)).state, "present");
+			assert.deepEqual(await h.host.closeNode(t2), { outcome: "closed" });
+			assert.equal(h.hasNodeResource(t2), false);
+			assert.equal((await h.host.nodeExists(t2)).state, "gone");
+		}
+
+		// Mismatched labels / reused resource ownership is reported as ambiguous and never closed.
+		h.mismatchOwnership(t3);
+		assert.equal((await h.host.nodeExists(t3)).state, "ambiguous");
+		await assert.rejects(() => h.host.closeNode(t3));
+		assert.equal(h.hasNodeResource(t3), true, "mismatched/unowned terminal must be left alone");
+
+		// Duplicate ownership is also rejected without closing.
+		h.duplicateOwnership(otherRun);
+		await assert.rejects(() => h.host.closeNode(otherRun));
+		assert.equal(h.hasNodeResource(otherRun), true);
+	});
+
+	test(`Host contract (${backend}): recovery and cleanup from no-context and opposite-backend environments follow recorded host_backend`, async t => {
+		const h = createContractHarness(t, backend);
+		const launchService = new BootstrapService({
+			exec: h.exec,
+			extensionDir: h.extensionDir,
+			stateDir: h.stateDir,
+			home: h.home,
+			env: h.env,
+			pollMs: 5,
+		});
+		const request: GenerateRequest = {
+			task: `Recover and clean ${backend}`,
+			topology: "chain",
+			project_cwd: h.cwd,
+			agents: [
+				{ node_id: "n1", persona: "first", sub_task: "Step 1" },
+				{ node_id: "n2", persona: "second", sub_task: "Step 2" },
+			],
+			ready_timeout_ms: 200,
+		};
+		const run1 = await launchService.generate(request);
+		const run2 = await launchService.generate({ ...request, task: `Unrelated ${backend}` });
+		assert.equal(run1.host_backend, backend);
+
+		// Install both fake binaries on a shared PATH, with NO Host context variables set,
+		// and also build an opposite-backend caller environment.
+		const neutralBin = join(h.root, "neutral-bin");
+		installFakeBinary(neutralBin, "pi", "#!/bin/sh\nexit 0\n");
+		installFakeBinary(neutralBin, "herdr", "#!/bin/sh\nexit 0\n");
+		installFakeBinary(
+			neutralBin,
+			"hc",
+			`#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then printf '%s\\n' '${FAKE_HC_STATUS_JSON}'; exit 0; fi\nexit 1\n`,
+		);
+		const oppositeEnv: NodeJS.ProcessEnv = backend === "herdr"
+			? { PATH: neutralBin, PI_BOOTSTRAP_HOST: "hc", HC_TERMINAL_ID: "t-caller" }
+			: { PATH: neutralBin, PI_BOOTSTRAP_HOST: "herdr", HERDR_ENV: "1", HERDR_PANE_ID: "caller" };
+		const noContextEnv: NodeJS.ProcessEnv = { PATH: neutralBin };
+
+		const targetOf = (entry: typeof run1.pane_manifest[number]): HostNodeTarget => ({
+			run_id: run1.task_id,
+			node_id: entry.node_id,
+			persona_name: entry.persona_name,
+			instance_id: entry.instance_id,
+			label: entry.label,
+			tab_id: entry.tab_id,
+			pane_id: entry.pane_id,
+			terminal_id: entry.terminal_id,
+			host_ref: entry.host_ref,
+		});
+		const run2TargetOf = (entry: typeof run2.pane_manifest[number]): HostNodeTarget => ({
+			...targetOf(entry),
+			run_id: run2.task_id,
+		});
+
+		const callsBeforeNeutral = h.calls.length;
+		const neutralService = new BootstrapService({
+			exec: h.exec,
+			extensionDir: h.extensionDir,
+			stateDir: h.stateDir,
+			home: h.home,
+			env: noContextEnv,
+			pollMs: 5,
+		});
+		assert.equal(neutralService.status(run1.task_id).manifest.host_backend, backend);
+		const inspected = await neutralService.recover(run1.task_id, { action: "inspect" });
+		assert.equal(inspected.assessments.length, 1);
+
+		// Subset cleanup by agent selection from a shell with NO Host context closes only n1 via recorded backend.
+		const partial = await neutralService.cleanup(run1.task_id, undefined, false, h.cwd, undefined, ["n1"]);
+		assert.equal(partial.phase, "partially-cleaned");
+		assert.equal(h.hasNodeResource(targetOf(run1.pane_manifest[0]!)), false);
+		assert.equal(h.hasNodeResource(targetOf(run1.pane_manifest[1]!)), true);
+		assert.ok(h.calls.length > callsBeforeNeutral, "cleanup must invoke the recorded backend executor");
+
+		// Full cleanup from an opposite-backend caller environment closes remaining n2 via recorded backend, leaving run2 untouched.
+		const oppositeService = new BootstrapService({
+			exec: h.exec,
+			extensionDir: h.extensionDir,
+			stateDir: h.stateDir,
+			home: h.home,
+			env: oppositeEnv,
+			pollMs: 5,
+		});
+		const full = await oppositeService.cleanup(run1.task_id);
+		assert.equal(full.status, "cleaned");
+		assert.equal(full.phase, "cleaned");
+		assert.equal(h.hasNodeResource(targetOf(run1.pane_manifest[1]!)), false);
+		assert.equal(h.hasNodeResource(run2TargetOf(run2.pane_manifest[0]!)), true);
+		assert.equal(h.hasNodeResource(run2TargetOf(run2.pane_manifest[1]!)), true);
+	});
+}
+
+test("Host contract (hc): failGet/failLs reject instead of reporting gone, genuine not_found reports gone, and mismatched labels report ambiguous", async t => {
+	const root = mkdtempSync(join(tmpdir(), "bootstrap-contract-hc-err-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const cwd = join(root, "project");
+	const bin = join(root, "bin");
+	mkdirSync(cwd, { recursive: true });
+	installFakeBinary(
+		bin,
+		"hc",
+		`#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then printf '%s\\n' '{"core":{"id":"fake-hc-core","name":"fake-host"},"version":"0.1.25","pid":1234,"uptime_ms":1000,"holders":[],"live":0,"finished":0}'; exit 0; fi\nexit 1\n`,
+	);
+
+	const fake = makeFakeHcExec({ cwd, serverRunning: true });
+	const host = createHost("hc", { exec: fake.exec, env: { PATH: bin } });
+	const preflight = await host.preflight();
+	const launcher = join(root, "n1.sh");
+	writeFileSync(launcher, "#!/bin/sh\nexit 0\n");
+	const handle = await host.launchNode({
+		name: "hc-err-run:a1-n1",
+		runId: "hc-err-run",
+		instanceId: "a1-n1",
+		directory: cwd,
+		launcher,
+		environment: { PI_COMS_DIR: join(root, "coms"), PI_COMS_TIMEOUT_MS: "300000" },
+		preflight,
+	});
+	const target: HostNodeTarget = {
+		run_id: "hc-err-run",
+		node_id: "n1",
+		persona_name: "first",
+		instance_id: "a1-n1",
+		label: "hc-err-run:a1-n1",
+		host_ref: handle.host_ref,
+	};
+
+	// failLs must reject rather than returning gone.
+	fake.behavior.failLs = true;
+	await assert.rejects(() => host.nodeExists(target), /hc ls.*failed/i);
+	await assert.rejects(() => host.discoverOwnedNodes([target]), /hc ls.*failed/i);
+	fake.behavior.failLs = false;
+
+	// failGet with "unavailable ... not found" message must reject, NOT return gone.
+	fake.behavior.failGet = { code: 1, kind: "unavailable", message: "core socket not found" };
+	await assert.rejects(() => host.nodeExists(target), /unavailable.*core socket not found/i);
+	await assert.rejects(() => host.discoverOwnedNodes([target]), /unavailable.*core socket not found/i);
+
+	// Even with exit code 3, an explicit non-not_found error kind must reject, NOT return gone.
+	fake.behavior.failGet = { code: 3, kind: "unavailable", message: "socket not found" };
+	await assert.rejects(() => host.nodeExists(target), /unavailable.*socket not found/i);
+
+	// Genuine not_found (kind="not_found", or exit code 3 with no other kind) reports gone when absent from ls.
+	const savedAddr = String((handle.host_ref as any).address);
+	fake.terminals.delete(savedAddr);
+	fake.behavior.failGet = false;
+	assert.equal((await host.nodeExists(target)).state, "gone");
+
+	// Restoring the terminal with different labels at the saved address reports ambiguous.
+	fake.terminals.set(savedAddr, {
+		address: savedAddr,
+		name: String((handle.host_ref as any).name),
+		cwd,
+		argv: ["/bin/sh", launcher],
+		labels: { bootstrap_run: "other-run", bootstrap_node: "other-node" },
+		state: "live",
+		parent: null,
+		notify: false,
+		exit_code: null,
+		created_ms: Date.now(),
+		finished_ms: null,
+		screen: "exact",
+		cols: 200,
+		rows: 120,
+	});
+	const mismatched = await host.nodeExists(target);
+	assert.equal(mismatched.state, "ambiguous");
+	assert.match((mismatched as { state: "ambiguous"; reason: string }).reason, /labels do not match/i);
+
+	// Genuine kind="not_found" with a different exit code or exit 3 without kind still classifies as gone.
+	fake.terminals.clear();
+	fake.behavior.failGet = { code: 1, kind: "not_found", message: "missing" };
+	assert.equal((await host.nodeExists(target)).state, "gone");
+	fake.behavior.failGet = { code: 3, message: "missing" };
+	assert.equal((await host.nodeExists(target)).state, "gone");
+});
+
+for (const backend of ["herdr", "hc"] as const) {
+	test(`Host contract (${backend}): sendWakeUp sends when eligible, skips when gone, and fails when unavailable`, async t => {
+		const h = createContractHarness(t, backend);
+		const preflight = await h.host.preflight();
+		const runId = `contract-wake-${backend}`;
+		const launcher = join(h.root, "wake-node.sh");
+		writeFileSync(launcher, "#!/bin/sh\nexit 0\n");
+
+		const handle = await h.host.launchNode({
+			name: `${runId}:a2-n2`,
+			runId,
+			instanceId: "a2-n2",
+			directory: h.cwd,
+			launcher,
+			environment: { PI_COMS_DIR: join(h.root, "coms"), PI_COMS_TIMEOUT_MS: "300000" },
+			preflight,
+		});
+
+		const sessionDir = join(h.root, "wake-session");
+		mkdirSync(sessionDir, { recursive: true });
+		const { buildTaskInputRecord, taskInputPath } = await import("./contracts.ts");
+		const { offerHandoff } = await import("./handoff.ts");
+		const { completionRecord, processStartTime, resultPath } = await import("./session-store.ts");
+		const roster = [
+			{ instance_id: "a1-n1", node_id: "n1", persona_name: "first", sub_task: "step 1" },
+			{ instance_id: "a2-n2", node_id: "n2", persona_name: "second", sub_task: "step 2" },
+		];
+		const srcCfg: WorkerConfig = {
+			version: 2, task_id: runId, token: "tok-c", session_dir: sessionDir, project_cwd: h.cwd,
+			coms_dir: join(h.root, "coms"), coms_project: "p-c", instance_id: "a1-n1", node_id: "n1", persona_name: "first", attempt_id: "a1-n1.1",
+			persona: "P1", tools: ["read"], sub_task: "step 1", topology: "chain", successor: "a2-n2", handoff_protocol: 1, roster,
+			startup_message: "go", ready_timeout_ms: 5000,
+		};
+		atomicJson(taskInputPath(sessionDir, "a2-n2"), buildTaskInputRecord({
+			identity: { run_id: runId, node_id: "n2", persona_name: "second", attempt_id: "a2-n2.1", instance_id: "a2-n2" },
+			brief: { task: "Wake", goal: "Wake" }, assignment: { sub_task: "step 2" }, roster,
+		}));
+		const resFile = resultPath(sessionDir, "a1-n1");
+		const comp = completionRecord(srcCfg, { status: "success", agent_name: "first", node_id: "n1", summary: "Done", detail: "Ok" }, "pending", new Date().toISOString());
+		atomicJson(resFile, comp);
+		const offer = offerHandoff(srcCfg, comp, resFile);
+		atomicJson(readyPath(sessionDir, "a2-n2"), {
+			version: 1, task_id: runId, token: "tok-c", instance_id: "a2-n2",
+			pid: process.pid, start_time: processStartTime(process.pid),
+			name: "a2-n2", session_id: "sess-a2-n2", endpoint: join(h.root, "a2.sock"), model: "provider/model",
+			host_ref: handle.host_ref,
+			...(handle.pane_id ? { pane_id: handle.pane_id } : {}),
+		});
+
+		const callsBeforeWake = h.calls.length;
+
+		// 1. Present node -> sent through the Host's injected executor (no PATH fallback)
+		const sent = await h.host.sendWakeUp({
+			sessionDir,
+			destinationAttempt: offer.destination.attempt_id,
+			handoffId: offer.handoff_id,
+		});
+		assert.equal(sent.outcome, "sent");
+		assert.equal(sent.handoff_id, offer.handoff_id);
+		const wakeCalls = h.calls.slice(callsBeforeWake);
+		assert.ok(
+			wakeCalls.some(c => backend === "herdr" ? c[0] === "pane" && c[1] === "send-text" : c[0] === "send"),
+			`expected ${backend} wake-up to run through injected Host executor, got calls: ${JSON.stringify(wakeCalls)}`,
+		);
+
+		// 2. Gone node -> skipped
+		h.removeNodeResource({
+			run_id: runId,
+			node_id: "n2",
+			persona_name: "second",
+			instance_id: "a2-n2",
+			label: `${runId}:a2-n2`,
+			tab_id: handle.tab_id,
+			pane_id: handle.pane_id,
+			terminal_id: handle.terminal_id,
+			host_ref: handle.host_ref,
+		});
+		const goneRes = await h.host.sendWakeUp({
+			sessionDir,
+			destinationAttempt: offer.destination.attempt_id,
+			handoffId: offer.handoff_id,
+		});
+		assert.equal(goneRes.outcome, "skipped");
+
+		// 3. Unavailable Host -> failed
+		h.setDiscoveryFailure(true);
+		const failRes = await h.host.sendWakeUp({
+			sessionDir,
+			destinationAttempt: offer.destination.attempt_id,
+			handoffId: offer.handoff_id,
+		});
+		assert.equal(failRes.outcome, "failed");
+		h.setDiscoveryFailure(false);
+	});
+}
+
+test("Host contract (hc): recycled-name look-alike at another address never resolves by name, reports gone, and preflight rejects name fallback", async t => {
+	const root = mkdtempSync(join(tmpdir(), "bootstrap-contract-hc-recycled-name-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const cwd = join(root, "project");
+	const bin = join(root, "bin");
+	mkdirSync(cwd, { recursive: true });
+	installFakeBinary(
+		bin,
+		"hc",
+		`#!/bin/sh\nif [ "$1" = "server" ] && [ "$2" = "status" ]; then printf '%s\\n' '${FAKE_HC_STATUS_JSON}'; exit 0; fi\nexit 1\n`,
+	);
+
+	const fake = makeFakeHcExec({ cwd, serverRunning: true });
+	const host = createHost("hc", { exec: fake.exec, env: { PATH: bin } });
+	const preflight = await host.preflight();
+	const launcher = join(root, "n1.sh");
+	writeFileSync(launcher, "#!/bin/sh\nexit 0\n");
+
+	const handle = await host.launchNode({
+		name: "recycled-run:a1-n1",
+		runId: "recycled-run",
+		instanceId: "a1-n1",
+		directory: cwd,
+		launcher,
+		environment: { PI_COMS_DIR: join(root, "coms"), PI_COMS_TIMEOUT_MS: "300000" },
+		preflight,
+	});
+	const oldAddress = String((handle.host_ref as any).address);
+	const target: HostNodeTarget = {
+		run_id: "recycled-run",
+		node_id: "n1",
+		persona_name: "first",
+		instance_id: "a1-n1",
+		label: "recycled-run:a1-n1",
+		host_ref: handle.host_ref,
+	};
+
+	// Remove t1 and create a new unrelated terminal t2 whose --name equals the old address ("t1").
+	fake.terminals.delete(oldAddress);
+	const lookAlikeRes = await fake.exec("hc", [
+		"run", "--json", "--bg", "--name", oldAddress, "--cwd", cwd,
+		"--label", "bootstrap_run=other-run", "--label", "bootstrap_node=other-node",
+		"--no-parent", "--no-notify", "/bin/sh", launcher,
+	]);
+	assert.equal(lookAlikeRes.code, 0);
+	const lookAlikeAddr = (JSON.parse(lookAlikeRes.stdout) as { address: string }).address;
+	assert.notEqual(lookAlikeAddr, oldAddress);
+
+	// Faithful fake: `hc get <oldAddress>` falls back to name and returns t2.
+	const rawGet = await fake.exec("hc", ["get", "--json", oldAddress]);
+	assert.equal(rawGet.code, 0);
+	assert.equal((JSON.parse(rawGet.stdout) as { address: string }).address, lookAlikeAddr);
+
+	// HcHost must reject the name fallback: report gone (not ambiguous/present) and never touch t2 on close.
+	const exists = await host.nodeExists(target);
+	assert.equal(exists.state, "gone");
+	const discovered = await host.discoverOwnedNodes([target]);
+	assert.equal(discovered.length, 1);
+	assert.equal(discovered[0]!.existence.state, "gone");
+	const closed = await host.closeNode(target);
+	assert.equal(closed.outcome, "already_gone");
+	assert.ok(fake.terminals.has(lookAlikeAddr), "recycled-name look-alike terminal must remain intact");
+
+	// Preflight with HC_TERMINAL_ID pointing at the removed address must also reject name fallback.
+	const callerHost = createHost("hc", {
+		exec: fake.exec,
+		env: { PATH: bin, HC_TERMINAL_ID: oldAddress },
+	});
+	await assert.rejects(
+		() => callerHost.preflight(),
+		err => err instanceof Error && /hc/i.test(err.message) && /preflight/i.test(err.message),
+	);
+
+	// Positive control: when an actual terminal exists at `oldAddress` AND another has `name: oldAddress`,
+	// address lookup wins and operations target `oldAddress` only.
+	fake.terminals.set(oldAddress, {
+		address: oldAddress,
+		name: String((handle.host_ref as any).name),
+		cwd,
+		argv: ["/bin/sh", launcher],
+		labels: { bootstrap_run: "recycled-run", bootstrap_node: "a1-n1" },
+		state: "live",
+		parent: null,
+		notify: false,
+		exit_code: null,
+		created_ms: Date.now(),
+		finished_ms: null,
+		screen: "exact",
+		cols: 200,
+		rows: 120,
+	});
+	assert.equal((await callerHost.preflight()).backend, "hc");
+	assert.equal((await host.nodeExists(target)).state, "present");
+	assert.deepEqual(await host.closeNode(target), { outcome: "closed" });
+	assert.equal(fake.terminals.has(oldAddress), false);
+	assert.equal(fake.terminals.has(lookAlikeAddr), true);
+});

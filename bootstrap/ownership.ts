@@ -422,6 +422,8 @@ export interface OwnershipWaitDetail {
 	instance_id: string;
 	status: "running" | "uncertain";
 	reason: string;
+	/** Node with a pending direction request in this live holder or its review loop. */
+	human_wait_node_id?: string;
 }
 
 export interface OwnershipEvaluation {

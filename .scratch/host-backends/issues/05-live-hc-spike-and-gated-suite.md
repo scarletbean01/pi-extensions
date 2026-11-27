@@ -10,9 +10,9 @@ Spec: `../spec.md` (further notes: undocumented hc behaviours).
 
 **Blocked by:** 03
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] The gated suite exists, is skipped without its environment variable, and cannot reach a core other than its own.
-- [ ] The spike covers each listed question and writes its findings to a file.
-- [ ] After the operator runs it: the findings are in the contract document and the unverified tags are resolved or restated.
-- [ ] The existing live Herdr suite is unchanged.
+- [x] The gated suite exists, is skipped without its environment variable, and cannot reach a core other than its own.
+- [x] The spike covers each listed question and writes its findings to a file.
+- [x] After the operator runs it: the findings are in the contract document and the unverified tags are resolved or restated. *(Runs 2, 3 (`FbreNh`), and 4 (`6bLWs8`) on `hc 0.1.22` verified `(a)–(i)`: (a) plain raw-mode delivery with `HC_SCOPE` excluded caveat, (b) OSC 7501 `ESC]7501;state=<word>[:key=value…] ST`/BEL, all 5 words, `app`/`progress`/`kind`, raw non-base64 `msg=hello` and `title` rejection (base64 `msg=` acceptance unverified), `message=` accepted/not shown in `get`, `id=` in `get.records`, capability queries, (c) isolation and exact added env keys, (d) immediate PTY write vs target startup drain, (e) compact `run`/`ls` vs full `get`, (f) name reuse, (g) status shape, (h) `blocked` exit 9/0 bytes, `working` exit 0/`started:true`, `done` exit 0/`started:false` ~6 s, (i) `kill` on finished. Explicitly restated unverified follow-ups in `HOST.md`/`README.md`: whether a real `pi` agent launched via `hc run … launcher` receives an `<hc from="…" [reach="…"]>` wrapper; unaltered-env terminal `self-probe`, unset `HC_SESSION`/`HC_SOCKET` injection, and `HC_SCOPE`-preserving sends (in full `a–i` run); and `message=`'s visible effect.)*
+- [x] The existing live Herdr suite is unchanged.

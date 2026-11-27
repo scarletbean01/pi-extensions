@@ -13,11 +13,11 @@ Spec: `../spec.md` (the hc backend). Contract document from ticket 01.
 
 **Blocked by:** 02
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] With the fake `hc`, a run launches on hc, its nodes are discovered and their state is reported.
-- [ ] Backend selection chooses correctly in every case of the decided rules, including an orchestrator with no Host context, and fails clearly when neither tool is available.
-- [ ] Names are valid and distinct for long and awkward task and instance ids.
-- [ ] The contract suite passes against both Herdr and hc backends, and the existing suites still pass.
-- [ ] No real hc terminal is created by any test in this ticket.
-- [ ] The contract document is updated; hc behaviours stay tagged unverified until ticket 05.
+- [x] With the fake `hc`, a run launches on hc, its nodes are discovered and their state is reported.
+- [x] Backend selection chooses correctly in every case of the decided rules, including an orchestrator with no Host context, and fails clearly when neither tool is available.
+- [x] Names are valid and distinct for long and awkward task and instance ids.
+- [x] The contract suite passes against both Herdr and hc backends, and the existing suites still pass.
+- [x] No real hc terminal is created by any test in this ticket.
+- [x] The contract document is updated; hc behaviours stay tagged unverified until ticket 05.

@@ -3,7 +3,7 @@
  *
  *   node bootstrap/run-tests.ts deterministic   # unit/service/worker tests: temp files, fake Herdr, no real Pi
  *   node bootstrap/run-tests.ts runtime         # installed Pi/Coms in RPC mode, isolated state, fake local provider
- *   node bootstrap/run-tests.ts live            # opt-in: real Herdr (requires PI_BOOTSTRAP_LIVE_HERDR=1 inside Herdr)
+ *   node bootstrap/run-tests.ts live            # independent opt-ins: real Herdr or an isolated hc core
  *   node bootstrap/run-tests.ts all             # deterministic + runtime (never live)
  *
  * Flags: --strict (same as PI_BOOTSTRAP_TEST_STRICT=1: missing capabilities fail instead of being skipped), --timeout-ms <n>.
@@ -11,9 +11,10 @@
  * Exit status 0 means every selected test passed; skipped tests are printed as UNVERIFIED and are not coverage.
  */
 import { readdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isolatedPiEnvironment, spawnGroup } from "./test-harness.ts";
+import { HC_LIVE_FILE, HC_LIVE_FINDINGS_DIR, HC_LIVE_GATE, HC_LIVE_ONLY, hcLiveEnabled } from "./test-support/hc-live-env.ts";
 
 export const SUITES = ["deterministic", "runtime", "live"] as const;
 export type Suite = typeof SUITES[number];
@@ -63,18 +64,43 @@ function notRun(options: SuiteOptions, files: string[], reason: string): SuiteRe
 export async function runSuite(options: SuiteOptions): Promise<SuiteResult> {
 	const parent = options.env ?? process.env;
 	const strict = options.strict ?? parent.PI_BOOTSTRAP_TEST_STRICT === "1";
-	const files = suiteFiles(options.dir, options.suite);
+	let files = suiteFiles(options.dir, options.suite);
 	if (files.length === 0) return notRun({ ...options, strict }, files, "no test files match this suite");
+	let runHerdr = false;
+	let runHc = false;
 	if (options.suite === "live") {
-		if (parent.PI_BOOTSTRAP_LIVE_HERDR !== "1") return notRun({ ...options, strict }, files, "live Herdr tests require an explicit opt-in: set PI_BOOTSTRAP_LIVE_HERDR=1 and run inside Herdr");
-		if (parent.HERDR_ENV !== "1" || !parent.HERDR_PANE_ID) return notRun({ ...options, strict }, files, "live Herdr tests must run inside a Herdr pane (HERDR_ENV=1 and HERDR_PANE_ID)");
+		const herdrReason = parent.PI_BOOTSTRAP_LIVE_HERDR !== "1"
+			? "live Herdr tests require an explicit opt-in: set PI_BOOTSTRAP_LIVE_HERDR=1 and run inside Herdr"
+			: parent.HERDR_ENV !== "1" || !parent.HERDR_PANE_ID
+				? "live Herdr tests must run inside a Herdr pane (HERDR_ENV=1 and HERDR_PANE_ID)" : undefined;
+		const hcReason = `live hc tests require an explicit opt-in: set ${HC_LIVE_GATE}=1`;
+		const reasons: string[] = [];
+		if (files.some(name => name !== HC_LIVE_FILE)) {
+			runHerdr = !herdrReason;
+			if (herdrReason) reasons.push(herdrReason);
+		}
+		if (files.includes(HC_LIVE_FILE)) {
+			runHc = hcLiveEnabled(parent);
+			if (!runHc) reasons.push(hcReason);
+		}
+		const selected = files.filter(name => name === HC_LIVE_FILE ? runHc : runHerdr);
+		if (selected.length === 0 || (strict && reasons.length > 0)) return notRun({ ...options, strict }, files, reasons.join(". "));
+		for (const reason of reasons) options.out?.write(`UNVERIFIED: ${reason}\n`);
+		files = selected;
 	}
 	const iso = isolatedPiEnvironment(parent);
 	const env = { ...iso.env, ...(strict ? { PI_BOOTSTRAP_TEST_STRICT: "1" } : {}) };
 	delete env.NODE_TEST_CONTEXT; // a nested `node --test` must act as a top-level runner
-	if (options.suite === "live") {
+	if (runHerdr) {
 		env.PI_BOOTSTRAP_LIVE_HERDR = "1";
+		env.PI_BOOTSTRAP_HOST = "herdr";
 		for (const [key, value] of Object.entries(parent)) if (/^(HERDR_|HC_)/.test(key) && value !== undefined) env[key] = value;
+	}
+	if (runHc) {
+		env[HC_LIVE_GATE] = "1";
+		env[HC_LIVE_FINDINGS_DIR] = parent[HC_LIVE_FINDINGS_DIR] === undefined
+			? undefined : resolve(parent[HC_LIVE_FINDINGS_DIR]);
+		if (parent[HC_LIVE_ONLY] !== undefined) env[HC_LIVE_ONLY] = parent[HC_LIVE_ONLY];
 	}
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS[options.suite];
 	let output = "";

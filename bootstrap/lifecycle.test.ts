@@ -1119,16 +1119,19 @@ test("planned nodes carry inbound edges for chains and none for teams without ch
 			node_id: "plan", persona_name: "first", attempt_id: "a1-plan.1", instance_id: "a1-plan", expected_coms_name: "a1-plan",
 			expected_model: "provider/model", label: "<TASK_ID>:a1-plan", step: 1, successor: "a2-build", status: "released",
 			tab_id: "t1", pane_id: "p1", terminal_id: "term1",
+			host_ref: { tab_id: "t1", pane_id: "p1", terminal_id: "term1", label: "<TASK_ID>:a1-plan" },
 		},
 		{
 			node_id: "build", persona_name: "second", attempt_id: "a2-build.1", instance_id: "a2-build", expected_coms_name: "a2-build",
 			expected_model: "provider/model", label: "<TASK_ID>:a2-build", step: 2, predecessor: "a1-plan", successor: "a3-check",
 			status: "released", dependency_policy: "require_success", tab_id: "t2", pane_id: "p2", terminal_id: "term2",
+			host_ref: { tab_id: "t2", pane_id: "p2", terminal_id: "term2", label: "<TASK_ID>:a2-build" },
 		},
 		{
 			node_id: "check", persona_name: "first", attempt_id: "a3-check.1", instance_id: "a3-check", expected_coms_name: "a3-check",
 			expected_model: "provider/model", label: "<TASK_ID>:a3-check", step: 3, predecessor: "a2-build", status: "released",
 			dependency_policy: "require_success", tab_id: "t3", pane_id: "p3", terminal_id: "term3",
+			host_ref: { tab_id: "t3", pane_id: "p3", terminal_id: "term3", label: "<TASK_ID>:a3-check" },
 		},
 	]);
 	const chainRoster = [
@@ -1193,10 +1196,12 @@ test("planned nodes carry inbound edges for chains and none for teams without ch
 		{
 			node_id: "a", persona_name: "first", attempt_id: "a1-a.1", instance_id: "a1-a", expected_coms_name: "a1-a",
 			expected_model: "provider/model", label: "<TASK_ID>:a1-a", status: "released", tab_id: "t4", pane_id: "p4", terminal_id: "term4",
+			host_ref: { tab_id: "t4", pane_id: "p4", terminal_id: "term4", label: "<TASK_ID>:a1-a" },
 		},
 		{
 			node_id: "b", persona_name: "second", attempt_id: "a2-b.1", instance_id: "a2-b", expected_coms_name: "a2-b",
 			expected_model: "provider/model", label: "<TASK_ID>:a2-b", status: "released", tab_id: "t5", pane_id: "p5", terminal_id: "term5",
+			host_ref: { tab_id: "t5", pane_id: "p5", terminal_id: "term5", label: "<TASK_ID>:a2-b" },
 		},
 	]);
 	const teamRoster = [

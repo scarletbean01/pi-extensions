@@ -9,8 +9,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildTaskInputRecord, taskInputPath } from "./contracts.ts";
 import { claimHandoff, claimJoinHandoff, handoffClaimPath, handoffOfferPath, offerHandoff } from "./handoff.ts";
+import { createHost } from "./host.ts";
 import { tryPaneWake } from "./pane-wake.ts";
 import { atomicJson, completionRecord, processStartTime, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
+import { makeFakeHcExec } from "./test-support/fake-hc.ts";
 
 function installFakeHerdr(t: test.TestContext, options: {
 	paneGetMode?: "exists" | "exists_working" | "exists_blocked" | "missing" | "unknown_pane" | "mismatch_id" | "server_error" | "syntax_error" | "connect_error" | "bad_json";
@@ -1228,4 +1230,267 @@ test("tryPaneWake rejects handoff IDs with control/escape characters or non-cano
 		assert.match((res as { reason: string }).reason, /invalid handoff ID/i);
 	}
 	assert.deepEqual(fake.calls(), []);
+});
+
+test("tryPaneWake accepts backend-neutral host_ref for Herdr while keeping pane_id-only old records working", async t => {
+	const fake = installFakeHerdr(t);
+	const f = setupChainFixture(fake.root);
+	const readyFile = readyPath(f.sessionDir, "a2-n2");
+	const baseReady = JSON.parse(readFileSync(readyFile, "utf8")) as Record<string, unknown>;
+	delete baseReady.pane_id;
+	atomicJson(readyFile, { ...baseReady, host_ref: { backend: "herdr", pane_id: "pane-neutral-7" } });
+
+	const res = await tryPaneWake({
+		sessionDir: f.sessionDir,
+		destinationAttempt: f.offer.destination.attempt_id,
+		handoffId: f.offer.handoff_id,
+		env: fake.env,
+	});
+	assert.deepEqual(res, {
+		outcome: "sent",
+		pane_id: "pane-neutral-7",
+		handoff_id: f.offer.handoff_id,
+		line: `[BOOTSTRAP_WAKE handoff=${f.offer.handoff_id}]`,
+	});
+	assert.deepEqual(fake.calls(), [
+		["pane", "get", "pane-neutral-7"],
+		["pane", "send-text", "pane-neutral-7", `[BOOTSTRAP_WAKE handoff=${f.offer.handoff_id}]`],
+		["pane", "send-keys", "pane-neutral-7", "Enter"],
+	]);
+});
+
+test("HcHost.sendWakeUp sends once without --force or status gating, skips blocked/finished/gone, and fails on unavailable", async t => {
+	const setupHcWake = (options: { status?: "idle" | "working" | "blocked" | null; state?: "live" | "finished"; omitReadyRef?: boolean } = {}) => {
+		const root = mkdtempSync(join(tmpdir(), "bootstrap-hc-wake-"));
+		t.after(() => rmSync(root, { recursive: true, force: true }));
+		const binDir = join(root, "bin");
+		mkdirSync(binDir, { recursive: true, mode: 0o700 });
+		const hcBin = join(binDir, "hc");
+		writeFileSync(hcBin, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+
+		const f = setupChainFixture(root);
+		const fakeHc = makeFakeHcExec({ cwd: root, serverRunning: true });
+		fakeHc.terminals.set("t7", {
+			address: "t7",
+			name: "run-1-a2-n2-abc",
+			cwd: root,
+			argv: ["/bin/sh", "a2-n2.sh"],
+			labels: { bootstrap_run: "run-1", bootstrap_node: "a2-n2" },
+			state: options.state ?? "live",
+			status: options.status ?? null,
+			parent: null,
+			notify: false,
+			exit_code: options.state === "finished" ? 0 : null,
+			created_ms: Date.now(),
+			finished_ms: options.state === "finished" ? Date.now() : null,
+			screen: "exact",
+			cols: 200,
+			rows: 120,
+		});
+		const readyFile = readyPath(f.sessionDir, "a2-n2");
+		const baseReady = JSON.parse(readFileSync(readyFile, "utf8")) as Record<string, unknown>;
+		delete baseReady.pane_id;
+		atomicJson(readyFile, {
+			...baseReady,
+			...(options.omitReadyRef ? {} : { host_ref: { backend: "hc", address: "t7" } }),
+		});
+		const host = createHost("hc", { exec: fakeHc.exec, env: { PATH: binDir } });
+		return { f, fakeHc, host };
+	};
+
+	// 1. Working / idle / null status all send exactly one hc wake-up without --force or --if, and carry host_ref.
+	for (const status of [null, "idle", "working"] as const) {
+		const { f, fakeHc, host } = setupHcWake({ status });
+		const res = await host.sendWakeUp({
+			sessionDir: f.sessionDir,
+			destinationAttempt: f.offer.destination.attempt_id,
+			handoffId: f.offer.handoff_id,
+		});
+		assert.equal(res.outcome, "sent");
+		assert.deepEqual(res.host_ref, { name: "run-1-a2-n2-abc", address: "t7" });
+		assert.equal(res.handoff_id, f.offer.handoff_id);
+		assert.equal(res.line, `[BOOTSTRAP_WAKE handoff=${f.offer.handoff_id}]`);
+		assert.deepEqual(fakeHc.sent, [{ address: "t7", text: `[BOOTSTRAP_WAKE handoff=${f.offer.handoff_id}]`, forced: false }]);
+		const sendCalls = fakeHc.calls.filter(c => c[0] === "send");
+		assert.equal(sendCalls.length, 1);
+		assert.deepEqual(sendCalls[0], ["send", "--json", "t7", `[BOOTSTRAP_WAKE handoff=${f.offer.handoff_id}]`]);
+		assert.equal(fakeHc.calls.some(c => c.includes("--force") || c.includes("--if")), false);
+	}
+
+	// 2. Blocked terminal -> skipped(blocked), never forced, offer remains on disk unclaimed.
+	{
+		const { f, fakeHc, host } = setupHcWake({ status: "blocked" });
+		const res = await host.sendWakeUp({
+			sessionDir: f.sessionDir,
+			destinationAttempt: f.offer.destination.attempt_id,
+			handoffId: f.offer.handoff_id,
+		});
+		assert.equal(res.outcome, "skipped");
+		assert.match((res as { reason: string }).reason, /blocked/i);
+		assert.equal(fakeHc.calls.some(c => c.includes("--force")), false, "hc send must never pass --force");
+		assert.equal(fakeHc.sent.length, 0);
+		assert.equal(existsSync(handoffOfferPath(f.sessionDir, "a2-n2")), true, "offer must stay on disk for Redelivery");
+		assert.equal(existsSync(handoffClaimPath(f.sessionDir, "a2-n2")), false);
+	}
+
+	// 3. Finished terminal -> skipped (no longer wakeable), offer stays on disk.
+	{
+		const { f, fakeHc, host } = setupHcWake({ state: "finished" });
+		const res = await host.sendWakeUp({
+			sessionDir: f.sessionDir,
+			destinationAttempt: f.offer.destination.attempt_id,
+			handoffId: f.offer.handoff_id,
+		});
+		assert.equal(res.outcome, "skipped");
+		assert.match((res as { reason: string }).reason, /finished/i);
+		assert.equal(fakeHc.sent.length, 0);
+		assert.equal(existsSync(handoffOfferPath(f.sessionDir, "a2-n2")), true);
+	}
+
+	// 4. Gone terminal (not_found) -> skipped without calling send.
+	{
+		const { f, fakeHc, host } = setupHcWake();
+		fakeHc.terminals.delete("t7");
+		const res = await host.sendWakeUp({
+			sessionDir: f.sessionDir,
+			destinationAttempt: f.offer.destination.attempt_id,
+			handoffId: f.offer.handoff_id,
+		});
+		assert.equal(res.outcome, "skipped");
+		assert.match((res as { reason: string }).reason, /not found|gone/i);
+		assert.equal(fakeHc.calls.some(c => c[0] === "send"), false);
+	}
+
+	// 5. Unavailable error during send -> failed(reason), offer stays on disk.
+	{
+		const { f, fakeHc, host } = setupHcWake();
+		fakeHc.behavior.failSend = { code: 1, kind: "unavailable", message: "core socket offline" };
+		const res = await host.sendWakeUp({
+			sessionDir: f.sessionDir,
+			destinationAttempt: f.offer.destination.attempt_id,
+			handoffId: f.offer.handoff_id,
+		});
+		assert.equal(res.outcome, "failed");
+		assert.match((res as { reason: string }).reason, /unavailable.*core socket offline/i);
+		assert.equal(existsSync(handoffOfferPath(f.sessionDir, "a2-n2")), true);
+	}
+
+	// 6. Missing host_ref on readiness record -> skipped without calling hc.
+	{
+		const { f, fakeHc, host } = setupHcWake({ omitReadyRef: true });
+		const res = await host.sendWakeUp({
+			sessionDir: f.sessionDir,
+			destinationAttempt: f.offer.destination.attempt_id,
+			handoffId: f.offer.handoff_id,
+		});
+		assert.equal(res.outcome, "skipped");
+		assert.deepEqual(fakeHc.calls, []);
+	}
+
+	// 7. not_found from `hc send` itself (after nodeExists succeeds) -> skipped on the send path, offer stays on disk.
+	for (const sendNotFound of [
+		{ code: 3, kind: "not_found", message: "terminal t7 vanished" },
+		{ code: 3, message: "terminal t7 vanished" },
+	]) {
+		const { f, fakeHc, host } = setupHcWake();
+		fakeHc.behavior.failSend = sendNotFound;
+		const res = await host.sendWakeUp({
+			sessionDir: f.sessionDir,
+			destinationAttempt: f.offer.destination.attempt_id,
+			handoffId: f.offer.handoff_id,
+		});
+		assert.equal(res.outcome, "skipped");
+		assert.match((res as { reason: string }).reason, /not found/i);
+		assert.equal(fakeHc.calls.filter(c => c[0] === "send").length, 1, "send must be attempted after nodeExists passed");
+		assert.equal(existsSync(handoffOfferPath(f.sessionDir, "a2-n2")), true);
+	}
+
+	// 8. Claimed or missing offer prevents `hc send` (0 hc calls).
+	{
+		const { f, fakeHc, host } = setupHcWake();
+		claimHandoff(
+			f.destCfg,
+			{ outcome: "proceed", offer: f.offer, input_digest: f.offer.input_digest, predecessor: f.completion },
+			"sess-a1-n1",
+		);
+		const claimedRes = await host.sendWakeUp({
+			sessionDir: f.sessionDir,
+			destinationAttempt: f.offer.destination.attempt_id,
+			handoffId: f.offer.handoff_id,
+		});
+		assert.equal(claimedRes.outcome, "skipped");
+		assert.match((claimedRes as { reason: string }).reason, /claimed/i);
+		assert.equal(fakeHc.calls.filter(c => c[0] === "send").length, 0);
+		assert.equal(fakeHc.calls.length, 0);
+
+		const missingSetup = setupHcWake();
+		rmSync(handoffOfferPath(missingSetup.f.sessionDir, "a2-n2"));
+		const missingRes = await missingSetup.host.sendWakeUp({
+			sessionDir: missingSetup.f.sessionDir,
+			destinationAttempt: missingSetup.f.offer.destination.attempt_id,
+			handoffId: missingSetup.f.offer.handoff_id,
+		});
+		assert.equal(missingRes.outcome, "skipped");
+		assert.match((missingRes as { reason: string }).reason, /offer/i);
+		assert.equal(missingSetup.fakeHc.calls.filter(c => c[0] === "send").length, 0);
+		assert.equal(missingSetup.fakeHc.calls.length, 0);
+	}
+
+	// 9. HcHost.sendWakeUp keeps runRaw env and timeouts unchanged for launchNode/ls/get.
+	{
+		const { f, fakeHc } = setupHcWake();
+		const hostEnv: NodeJS.ProcessEnv = { PATH: f.sessionDir, HC_BASE_ENV: "base" };
+		const wakeOverrideEnv: NodeJS.ProcessEnv = { PATH: f.sessionDir, HC_WAKE_ENV: "override" };
+		const observed: Array<{ args: string[]; env: NodeJS.ProcessEnv | undefined; timeout: number | undefined }> = [];
+		const recordingHost = createHost("hc", {
+			env: hostEnv,
+			exec: async (cmd, args, options) => {
+				observed.push({ args: [...args], env: options?.env, timeout: options?.timeout });
+				return fakeHc.exec(cmd, args);
+			},
+		});
+		const binDir = join(dirname(f.sessionDir), "bin");
+		hostEnv.PATH = binDir;
+		wakeOverrideEnv.PATH = binDir;
+		const launcher = join(dirname(f.sessionDir), "launch.sh");
+		writeFileSync(launcher, "#!/bin/sh\nexit 0\n");
+
+		await recordingHost.launchNode({
+			name: "run-1:a1-n1",
+			runId: "run-1",
+			instanceId: "a1-n1",
+			directory: dirname(f.sessionDir),
+			launcher,
+			environment: {},
+			preflight: { backend: "hc", workspace_id: "hc" },
+		});
+		const sendRes = await recordingHost.sendWakeUp({
+			sessionDir: f.sessionDir,
+			destinationAttempt: f.offer.destination.attempt_id,
+			handoffId: f.offer.handoff_id,
+			env: wakeOverrideEnv,
+		});
+		assert.equal(sendRes.outcome, "sent");
+		await recordingHost.discoverOwnedNodes([{
+			run_id: "run-1",
+			node_id: "n2",
+			persona_name: "second",
+			instance_id: "a2-n2",
+			label: "run-1:a2-n2",
+			host_ref: { name: "run-1-a2-n2-abc", address: "t7" },
+		}]);
+
+		const runCall = observed.find(c => c.args[0] === "run")!;
+		const wakeSendCall = observed.find(c => c.args[0] === "send")!;
+		const postWakeLsCall = observed.filter(c => c.args[0] === "ls").at(-1)!;
+		const postWakeGetCall = observed.filter(c => c.args[0] === "get").at(-1)!;
+		assert.equal(runCall.timeout, 15_000);
+		assert.equal(runCall.env, hostEnv);
+		assert.equal(wakeSendCall.timeout, 70_000);
+		assert.equal(wakeSendCall.env, wakeOverrideEnv);
+		assert.equal(postWakeLsCall.timeout, 15_000);
+		assert.equal(postWakeLsCall.env, hostEnv);
+		assert.equal(postWakeGetCall.timeout, 15_000);
+		assert.equal(postWakeGetCall.env, hostEnv);
+	}
 });

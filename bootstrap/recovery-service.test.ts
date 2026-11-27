@@ -259,7 +259,7 @@ test("retry_delivery: a skipped pane fallback reports why and leaves the destina
 		const readyFile = readyPath(f.run.session_dir, "a2-n2");
 		const ready = readJson<any>(readyFile);
 		if (skipped.paneId) atomicJson(readyFile, { ...ready, pane_id: "pane-2" });
-		else { delete ready.pane_id; atomicJson(readyFile, ready); }
+		else { delete ready.pane_id; delete ready.host_ref; atomicJson(readyFile, ready); }
 		const report = await f.service.recover(f.run.task_id, { action: "retry_delivery", agent: "n2" }, {
 			senderSession: DISPATCHER,
 			wake: async () => { skipped.afterComs(f.run.session_dir); throw new Error("coms: unreachable: socket missing"); },

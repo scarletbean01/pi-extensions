@@ -5,16 +5,16 @@
 - The shared fallback module uses the Host to send the wake-up and to check the node exists. The ready record's optional pane reference becomes a backend-neutral reference, and older records read as before. The allowed-when rules are unchanged (reference present, destination process alive, offer exists and is unclaimed, the Host reports the node exists) and Host status is never consulted.
 - Herdr behaves exactly as today. On hc, the send is never forced and never gated on status. A refusal because the terminal is blocked is **skipped(blocked)**, other errors are **failed(reason)**, and the offer stays on disk so Redelivery covers it.
 - The destination's wake-up check accepts the bare wake-up line or exactly one wrapper around it, stripped before matching. Anything else is ignored as today, and the offer on disk stays the only authority (ADR 0003).
-- If ticket 05's findings differ from these assumptions, follow the findings and say so.
+- If ticket 05's findings differ from these assumptions, follow the findings and say so. *(Run 2 and run 4 findings, `hc 0.1.22`: bare wake-up line + `\r` delivery verified on plain raw-mode terminals with no `<hc from=…>` wrapper observed (caveat: run-2 fixture sends ran with `HC_SCOPE` excluded and `reach: null`); whether a real `pi` agent launched via `hc run` receives a wrapper stays unverified, so accepting bare line or one wrapper stays. Sending while a terminal is booting exits 0 and writes to the PTY immediately; whether early input survives depends on the program's own startup handling (the fixture's 60 ms startup drain discarded it; in cooked mode CR arrives as LF), and Redelivery covers it per ADR 0003. Run 4 (`6bLWs8`) verified `blocked` refusal (exit `9`, `error.kind: "blocked"`, 0 delivered bytes), `working` delivery (exit `0`, `started: true`, ~1.0 s), and `done` delivery (exit `0`, `started: false`, ~6.0 s).)*
 
 Spec: `../spec.md` (the wake-up through the Host). ADR 0003 and 0004.
 
 **Blocked by:** 03 (05 preferred, for the verified wrapper behaviour)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] With the fake `hc`, a Coms failure triggers one hc wake-up; a blocked terminal is skipped and not forced.
-- [ ] Herdr-backed wake-up tests pass unchanged.
-- [ ] The destination accepts the bare line and one wrapper, rejects nested, partial or extra text, and still requires the matching unclaimed offer.
-- [ ] Recovery redelivery reaches an hc node through the Host.
-- [ ] The contract document and README are updated.
+- [x] With the fake `hc`, a Coms failure triggers one hc wake-up; a blocked terminal is skipped and not forced.
+- [x] Herdr-backed wake-up tests pass unchanged.
+- [x] The destination accepts the bare line and one wrapper, rejects nested, partial or extra text, and still requires the matching unclaimed offer.
+- [x] Recovery redelivery reaches an hc node through the Host.
+- [x] The contract document and README are updated.
