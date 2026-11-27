@@ -166,6 +166,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		const skillCommands = pi.getCommands().filter(command => command.source === "skill");
 		const paths: string[] = [];
 		for (const skill of skills ?? []) {
+			if (!skill.trim()) return { paths: [], error: "Skill name or path must not be empty." };
 			const namedSkill = skillCommands.find(command => command.name === `skill:${skill}`);
 			if (namedSkill) {
 				paths.push(namedSkill.sourceInfo.path);
@@ -290,46 +291,58 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		const thinking = options.thinking || state.thinking || pi.getThinkingLevel();
 		state.model = model;
 		state.thinking = thinking;
+		state.error = undefined;
 		const tools = options.writeAccess ? "read,grep,find,ls,bash,edit,write" : "read,grep,find,ls";
 		let childDocsExtensionDir: string | undefined;
-		let childDocsExtension = "";
+		let proc: any;
+		const cleanupChildDocsExtension = () => {
+			if (childDocsExtensionDir) {
+				try { fs.rmSync(childDocsExtensionDir, { recursive: true, force: true }); } catch {}
+			}
+		};
+		const failLaunch = (prefix: string, error: unknown): Promise<void> => {
+			cleanupChildDocsExtension();
+			state.status = "error";
+			state.proc = undefined;
+			state.error = `${prefix}: ${error instanceof Error ? error.message : String(error)}`;
+			state.textChunks.push(state.error);
+			updateWidgets();
+			return Promise.resolve();
+		};
+		let launchStage = "prepare";
 		try {
 			childDocsExtensionDir = createChildDocsDirectory();
-			childDocsExtension = path.join(childDocsExtensionDir, "strip-pi-docs.mjs");
+			const childDocsExtension = path.join(childDocsExtensionDir, "strip-pi-docs.mjs");
 			fs.writeFileSync(childDocsExtension, `export default function (pi) {
 	pi.on("before_agent_start", (event) => {
 		const systemPrompt = event.systemPrompt.replace(/\\n\\n<docs>[\\s\\S]*?<\\/docs>(?=\\n\\n|$)/, "");
 		return systemPrompt === event.systemPrompt ? undefined : { systemPrompt };
 	});
 }`);
-		} catch (error) {
-			if (childDocsExtensionDir) {
-				if (childDocsExtensionDir) try { fs.rmSync(childDocsExtensionDir, { recursive: true, force: true }); } catch {}
-			}
-			state.status = "error";
-			state.proc = undefined;
-			state.error = `Could not prepare subagent launch: ${error instanceof Error ? error.message : String(error)}`;
-			state.textChunks.push(state.error);
-			updateWidgets();
-			return Promise.resolve();
-		}
-		const args = [
-			"--mode", "json", "-p", "--session", state.sessionFile, "--no-extensions",
-			"--no-skills", "--no-mcp", "--no-prompt-templates", "--no-themes", "--offline",
-			"--extension", childDocsExtension,
-			"--model", model, "--tools", tools, "--thinking", thinking,
-		];
-		for (const skill of options.skills ?? []) args.push("--skill", skill);
-		args.push("--");
-		if (!prompt.startsWith("@")) args.push(prompt);
-		const invocation = getPiInvocation(args);
-
-		return new Promise<void>((resolve) => {
-			const proc = spawn(invocation.command, invocation.args, {
+			const args = [
+				"--mode", "json", "-p", "--session", state.sessionFile, "--no-extensions",
+				"--no-skills", "--no-mcp", "--no-prompt-templates", "--no-themes", "--offline",
+				"--extension", childDocsExtension,
+				"--model", model, "--tools", tools, "--thinking", thinking,
+			];
+			for (const skill of options.skills ?? []) args.push("--skill", skill);
+			args.push("--");
+			if (!prompt.startsWith("@")) args.push(prompt);
+			const invocation = getPiInvocation(args);
+			launchStage = "spawn";
+			proc = spawn(invocation.command, invocation.args, {
 				cwd: ctx.cwd,
 				stdio: ["pipe", "pipe", "pipe"],
 				env: childEnvironment(process.env),
 			});
+		} catch (error) {
+			return failLaunch(
+				launchStage === "prepare" ? "Could not prepare subagent launch" : "Could not launch subagent",
+				error,
+			);
+		}
+
+		return new Promise<void>((resolve) => {
 			proc.stdin!.end(prompt.startsWith("@") ? prompt : "");
 
 			state.proc = proc;
@@ -359,7 +372,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			});
 
 			proc.on("close", (code) => {
-				if (childDocsExtensionDir) try { fs.rmSync(childDocsExtensionDir, { recursive: true, force: true }); } catch {}
+			cleanupChildDocsExtension();
 				if (buffer.trim()) processLine(state, buffer);
 				clearInterval(timer);
 				state.elapsed = Date.now() - startTime;
@@ -383,7 +396,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			});
 
 			proc.on("error", (err) => {
-				try { fs.rmSync(childDocsExtensionDir, { recursive: true, force: true }); } catch {}
+			cleanupChildDocsExtension();
 				clearInterval(timer);
 				state.status = "error";
 				state.proc = undefined;
