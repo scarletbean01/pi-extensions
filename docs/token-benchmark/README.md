@@ -130,6 +130,20 @@ For graph agent totals, sum node transcripts and exclude the dispatcher. For wid
 
 2. **Command nodes for deterministic extraction, validation, and merging.** The benchmark's file-field extraction and fixed `|` join have deterministic outputs and do not require model judgment. Prototype command nodes for such steps and compare exact outputs, handoff evidence, end-to-end latency, and agent model tokens with the equivalent graph. Use a command node when it produces the same validated output and lowers end-to-end model usage without changing the run's dependencies or handoff behavior. Keep agent nodes for tasks that require judgment.
 
+## Subagent management tool schemas (ticket 06)
+
+With zero subagents, the registered tool payload shrinks from **803 estimated tokens** (create, continue, remove, list) to **183 estimated tokens** (create only), a saving of **620 estimated input tokens per parent turn**. This exceeds the ticket's ~150-token threshold, so lazy activation is kept. The model's actual tokenizer and provider-side schema framing can change the exact token count; these figures are estimates, not reported usage.
+
+Method: serialize the active tool definitions as compact JSON objects containing only `name`, `description`, and `parameters`, then estimate tokens as `ceil(JSON character count / 4)`. The definitions were obtained from the extension entry point using `createFakeHost` in `subagent-widget.test-helpers.ts`. The harness serializes enum descriptions and values, and the measurement normalizes its TypeBox-shaped declarations into JSON Schema, including `required` properties while omitting the stub's `optional` marker. The pre-change side used source at baseline commit `4e00b6d108fe9c6e3dc4cbc8b2c64ea9b284a9eb` and all four registered tools active; the post-change side used this ticket's source and the harness's default active set. `defaultActive`, executors, and inactive tool definitions are excluded from the serialized request payload.
+
+| State | Active schemas | Serialized characters | Estimated tokens |
+|---|---|---:|---:|
+| Before ticket 06, zero subagents | create, continue, remove, list | 3,210 | 803 |
+| After ticket 06, zero subagents | create | 731 | 183 |
+| Difference | continue, remove, list omitted | 2,479 | 620 |
+
+To reproduce, load the baseline source from the commit above and the current extension through `loadSubagentWidget()` / `createFakeHost()`. Convert each tool's TypeBox-shaped schema into JSON Schema: retain `type`, `description`, `enum`, `items`, and recursively converted `properties`; for objects, include `required` with property names whose schemas are not marked optional. Serialize `host.tools` entries whose names are in `host.getActiveTools()` using `JSON.stringify({ name, description, parameters })`. Divide each serialized length by four and round up. The current test harness models Pi's default activation: tools are active on registration unless `defaultActive: false`.
+
 ## Documentation check
 
 `bootstrap/README.md` and `bootstrap/HOST.md` were checked. Their completion descriptions already cover successful terminating results, retries that find delivery settled, and the refusal or delivery cases that keep the turn open. No stale token or cost claim was found, so neither file needed an edit.

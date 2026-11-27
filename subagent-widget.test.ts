@@ -34,7 +34,7 @@ test("/sub launches the fake pi and delivers final assistant message after norma
 	await assert.doesNotReject(host.emit("session_shutdown", { reason: "test" }));
 	host.setActiveTools(["probe-tool"]);
 	assert.deepEqual(host.getActiveTools(), ["probe-tool"]);
-	assert.equal(host.activeToolCalls.length, 2);
+	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, 1);
 	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("summarize the fixture", host.ctx));
 	const sent = await waitFor(() => host.sentMessages[0], "normal result message");
 	const invocation = await waitFor(() => fake.invocations()[0], "fake pi invocation");
@@ -357,6 +357,7 @@ test("subagent_continue reuses its stored model and thinking level without overr
 	host.addPiCommand({ name: "skill:follow-up", source: "skill", sourceInfo: { path: "/fixture/skills/follow-up/SKILL.md" } });
 	assert.equal(continuation.parameters.properties.thinking.optional, true);
 	assert.match(continuation.parameters.properties.model.description, /stored model/);
+	assert.match(continuation.parameters.properties.thinking.description, /this and later turns/);
 	assert.doesNotMatch(continuation.parameters.properties.model.description, /parent caller/);
 	assert.match(continuation.parameters.properties.skills.items.description, /turn only/);
 	assert.match(continuation.parameters.properties.writeAccess.description, /turn only/);
@@ -1395,4 +1396,76 @@ test("512-character last-line cap never splits surrogate pairs, ZWJ sequences, o
 		assert.equal(row.includes("\u200D"), false, `${label} did not split ZWJ sequence`);
 		assert.equal(/\x1b\[[0-9;]*$/.test(row), false, `${label} left no incomplete ANSI escape sequence`);
 	}
+});
+
+test("management tools are active only while subagents exist and preserve the host active set", async t => {
+	const fake = createFakePi({ events: [] });
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	const managementTools = ["subagent_continue", "subagent_remove", "subagent_list"];
+	const create = host.tools.get("subagent_create");
+	assert.deepEqual(host.getActiveTools(), ["subagent_create"]);
+	for (const name of managementTools) assert.equal(host.tools.get(name).defaultActive, false);
+	for (const tool of host.tools.values()) {
+		assert.ok(tool.description.length < 200, `${tool.name} description should be concise`);
+		const schemas = [...Object.values(tool.parameters.properties) as any[]];
+		while (schemas.length > 0) {
+			const schema = schemas.pop();
+			if (typeof schema.description === "string") {
+				assert.ok(schema.description.length < 120, `${tool.name} parameter descriptions should be concise`);
+			}
+			if (schema.items) schemas.push(schema.items);
+		}
+	}
+	assert.match(create.parameters.properties.skills.items.description, /launch only/i);
+	assert.match(create.parameters.properties.writeAccess.description, /launch only/i);
+	assert.match(host.tools.get("subagent_continue").parameters.properties.skills.items.description, /turn only/i);
+	assert.match(host.tools.get("subagent_continue").parameters.properties.writeAccess.description, /turn only/i);
+
+	host.setActiveTools(["subagent_create", "other-active"]);
+	await host.emit("session_start", { reason: "startup" });
+	assert.deepEqual(host.getActiveTools(), ["subagent_create", "other-active"]);
+	const callsBeforeNoopStart = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
+	await host.emit("session_start", { reason: "reload" });
+	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, callsBeforeNoopStart);
+
+	// A synchronous launch failure still leaves an error subagent, so it activates management tools.
+	const failed = await create.execute("invalid", { task: "bad\u0000task", thinking: "low" }, undefined, undefined, host.ctx);
+	assert.equal(failed.isError, true);
+	assert.deepEqual(host.getActiveTools(), ["subagent_create", "other-active", ...managementTools]);
+	// Simulate another extension changing the active set while subagent tools are available.
+	host.setActiveTools(["subagent_create", "external-new", ...managementTools]);
+	const callsAfterActivation = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
+	const removed = await host.tools.get("subagent_remove").execute("remove", { id: 1 }, undefined, undefined, host.ctx);
+	assert.match(removed.content[0].text, /removed/);
+	assert.deepEqual(host.getActiveTools(), ["subagent_create", "external-new"]);
+	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, callsAfterActivation + 1);
+
+	await withFakePiEnvironment(fake, () => create.execute("recreate", {
+		task: "recreated subagent", thinking: "low",
+	}, undefined, undefined, host.ctx));
+	assert.deepEqual(host.getActiveTools(), ["subagent_create", "external-new", ...managementTools]);
+	await waitFor(() => host.sentMessages[0], "recreated subagent to settle");
+	await host.commands.get("subclear").handler("", host.ctx);
+	assert.deepEqual(host.getActiveTools(), ["subagent_create", "external-new"]);
+	const callsAfterClear = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
+	await host.commands.get("subclear").handler("", host.ctx);
+	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, callsAfterClear);
+});
+
+test("a new session resets management tools even when a subagent existed", async t => {
+	const fake = createFakePi({ events: [], delayMs: 30000 });
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	host.setActiveTools(["subagent_create", "extension-tool"]);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("long running", host.ctx));
+	await waitFor(() => fake.invocations()[0], "subagent process start");
+	assert.ok(["subagent_list", "subagent_continue", "subagent_remove"].every(name => host.getActiveTools().includes(name)));
+	await host.emit("session_start", { reason: "new" });
+	assert.deepEqual(host.getActiveTools(), ["subagent_create", "extension-tool"]);
+	const callsAfterReset = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
+	await host.emit("session_start", { reason: "reload" });
+	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, callsAfterReset);
 });
