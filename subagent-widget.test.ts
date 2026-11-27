@@ -135,22 +135,31 @@ test("subagent_create reports a synchronous spawn failure and removes its temp d
 	assert.deepEqual(fake.invocations(), []);
 });
 
-test("a failed NUL continuation leaves the subagent recoverable", async t => {
-	const fake = createFakePi({ events: [] });
+test("a failed NUL continuation keeps prior done status/result, notes it in list, and stays recoverable", async t => {
+	const fake = createFakePi({ events: [textEvent("initial answer"), assistantMessageEnd("initial answer")] });
 	t.after(() => fake.cleanup());
 	const extension = await loadSubagentWidget();
 	const host = createFakeHost(extension, fake.cwd);
+	const list = host.tools.get("subagent_list");
 	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("initial task", host.ctx));
 	await waitFor(() => host.sentMessages[0], "initial subagent completion");
 	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 invalid\u0000prompt", host.ctx));
 	assert.ok(host.notifications.some(item => item.level === "error" && /Could not launch subagent.*(?:ERR_INVALID_ARG_VALUE|null bytes)/.test(item.message)));
 	const widgetFactory = host.getWidgetFactory("sub-1");
 	const widget = widgetFactory({}, { fg: (_color: string, text: string) => text });
-	assert.ok(widget.render(80).some((line: string) => line.includes("✗")));
+	const lines = widget.render(120);
+	assert.ok(lines.some((line: string) => line.includes("✓")));
+	assert.ok(lines.some((line: string) => line.includes("initial answer")));
+	assert.equal(lines.some((line: string) => line.includes("Could not launch subagent")), false);
+	const listedAfterFail = await list.execute("l1", {}, undefined, undefined, host.ctx);
+	assert.match(listedAfterFail.content[0].text, /#1 \[DONE\].*\[last continue failed: Could not launch subagent/);
 	assert.equal(fake.invocations().length, 1, "the invalid continuation never starts a child");
 	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 valid follow-up", host.ctx));
 	await waitFor(() => host.sentMessages[1], "valid continuation after spawn failure");
 	assert.equal(fake.invocations().length, 2);
+	const listedAfterRetry = await list.execute("l2", {}, undefined, undefined, host.ctx);
+	assert.match(listedAfterRetry.content[0].text, /#1 \[DONE\] \(Turn 2,/);
+	assert.doesNotMatch(listedAfterRetry.content[0].text, /last continue failed/);
 });
 
 test("launches keep prompts literal and add only requested skills and write tools", async t => {
@@ -303,7 +312,9 @@ test("child-extension temp failures mark create and continuation launches as err
 	assert.ok(host.notifications.some(item => item.level === "error" && item.message.includes("Could not prepare subagent launch") && item.message.includes("EISDIR")));
 	assert.deepEqual(fake.invocations().length, 1, "only the valid initial subagent was spawned");
 	const continuationWidget = host.getWidgetFactory("sub-3")({}, { fg: (_color: string, text: string) => text });
-	assert.ok(continuationWidget.render(80).some((line: string) => line.includes("✗")));
+	assert.ok(continuationWidget.render(80).some((line: string) => line.includes("✓")));
+	const listed = await host.tools.get("subagent_list").execute("l1", {}, undefined, undefined, host.ctx);
+	assert.match(listed.content[0].text, /#3 \[DONE\].*\[last continue failed: Could not prepare subagent launch/);
 	assert.ok(childDocsDirectories.every(directory => !existsSync(directory)), "all temporary child-docs directories are removed");
 });
 
@@ -857,7 +868,7 @@ test("failed continuation during an open batch preserves earlier queued result a
 	assert.equal(host.sentMessages.length, 0);
 
 	const listedAfterFail = await list.execute("l2", {}, undefined, undefined, host.ctx);
-	assert.match(listedAfterFail.content[0].text, /#1 \[ERROR\] \(Turn 1, vendor\/orig, high\)/);
+	assert.match(listedAfterFail.content[0].text, /#1 \[DONE\] \(Turn 1, vendor\/orig, high\).*\[last continue failed:/);
 
 	const batchSent = await waitFor(() => host.sentMessages[0], "coalesced batch with preserved Turn 1 result");
 	assert.equal(host.sentMessages.length, 1);
@@ -876,4 +887,86 @@ test("failed continuation during an open batch preserves earlier queued result a
 	assert.equal(getOption(retryInvocation.argv, "--model"), "vendor/orig");
 	assert.equal(getOption(retryInvocation.argv, "--thinking"), "high");
 	await waitFor(() => fake.exits().length >= 3 ? true : undefined, "all continuation interplay processes to exit");
+});
+
+test("tool-call-only final assistant message delivers explicit notice instead of earlier narration", async t => {
+	const fake = createFakePi({
+		events: [
+			textEvent("Earlier narration"),
+			assistantMessageEnd("Earlier narration"),
+			{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "README.md" } }],
+				},
+			},
+		],
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("tool-only end", host.ctx));
+	const sent = await waitFor(() => host.sentMessages[0], "tool-only final message");
+	assert.match(sent.message.content, /Result:\n\(the subagent produced no final message\)/);
+	assert.doesNotMatch(sent.message.content, /Earlier narration/);
+});
+
+test("empty error final assistant message on exit 0 is reported as errored", async t => {
+	const fake = createFakePi({
+		events: [
+			assistantMessageEnd("Earlier output"),
+			{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [],
+					stopReason: "error",
+					errorMessage: "upstream returned empty error",
+				},
+			},
+		],
+		exitCode: 0,
+	});
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("empty error end", host.ctx));
+	const sent = await waitFor(() => host.sentMessages[0], "empty error final message");
+	assert.match(sent.message.content, /Subagent #1 failed \(exit 0\)/);
+	assert.match(sent.message.content, /Result:\n\(the subagent produced no final message\)/);
+	assert.match(sent.message.content, /Error:\nupstream returned empty error/);
+	assert.doesNotMatch(sent.message.content, /Earlier output/);
+	const listed = await host.tools.get("subagent_list").execute("l1", {}, undefined, undefined, host.ctx);
+	assert.match(listed.content[0].text, /#1 \[ERROR\]/);
+});
+
+test("failed first launch keeps turnCount at 0 so the next successful launch is Turn 1", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("recovered answer")] });
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	const create = host.tools.get("subagent_create");
+	const continuation = host.tools.get("subagent_continue");
+	const list = host.tools.get("subagent_list");
+
+	const failed = await withFakePiEnvironment(fake, () => create.execute("c1", {
+		task: "bad\u0000first", thinking: "low",
+	}, undefined, undefined, host.ctx));
+	assert.equal(failed.isError, true);
+
+	const listedFailed = await list.execute("l1", {}, undefined, undefined, host.ctx);
+	assert.match(listedFailed.content[0].text, /#1 \[ERROR\] \(Turn 0,/);
+
+	const retried = await withFakePiEnvironment(fake, () => continuation.execute("c2", {
+		id: 1, prompt: "valid first turn",
+	}, undefined, undefined, host.ctx));
+	assert.equal(retried.terminate, true);
+
+	const sent = await waitFor(() => host.sentMessages[0], "recovered first turn result");
+	assert.match(sent.message.content, /recovered answer/);
+	assert.doesNotMatch(sent.message.content, /\(Turn 2\)/);
+	const listedDone = await list.execute("l2", {}, undefined, undefined, host.ctx);
+	assert.match(listedDone.content[0].text, /#1 \[DONE\] \(Turn 1,/);
+	await waitFor(() => fake.exits().length >= 1 ? true : undefined, "recovered child exit");
 });

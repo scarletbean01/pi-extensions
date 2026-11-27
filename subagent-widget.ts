@@ -71,6 +71,7 @@ interface SubState {
 	model: string;
 	thinking: ThinkingLevel;
 	error?: string;
+	continueError?: string;
 	proc?: any;            // active ChildProcess ref (for kill on /subrm)
 	cancelled?: boolean;
 	killTimer?: ReturnType<typeof setTimeout>;
@@ -100,18 +101,18 @@ function resolveKillGraceMs(options?: SubagentWidgetOptions): number {
 	return DEFAULT_KILL_GRACE_MS;
 }
 
-/** Extract text blocks from an assistant message joined by newlines, or undefined when none exist. */
-function extractAssistantText(message: any): string | undefined {
-	if (!message) return undefined;
+/** Extract text blocks from an assistant message joined by newlines, or empty string when none exist. */
+function extractAssistantText(message: any): string {
+	if (!message) return "";
 	if (typeof message.content === "string") return message.content;
-	if (!Array.isArray(message.content)) return undefined;
+	if (!Array.isArray(message.content)) return "";
 	const parts: string[] = [];
 	for (const part of message.content) {
 		if (part?.type === "text" && typeof part.text === "string") {
 			parts.push(part.text);
 		}
 	}
-	return parts.length > 0 ? parts.join("\n") : undefined;
+	return parts.join("\n");
 }
 
 /** Slice the last maxBytes from text on a valid UTF-8 character boundary. */
@@ -170,7 +171,9 @@ function formatSettledResult(result: SettledResult): string {
 		? "finished"
 		: `failed${result.exitCode !== null ? ` (exit ${result.exitCode})` : ""}`;
 	const header = `Subagent #${result.id}${turnLabel} ${statusLabel} "${result.prompt}" in ${Math.round(result.elapsedMs / 1000)}s.`;
-	const bodyText = result.finalText ? truncateTailText(result.finalText) : "(no output)";
+	const bodyText = result.finalText
+		? truncateTailText(result.finalText)
+		: "(the subagent produced no final message)";
 	const sections = [header, formatUsage(result.usage), `Result:\n${bodyText}`];
 	if (result.status === "error" && result.errorMessage) {
 		sections.push(`Error:\n${result.errorMessage}`);
@@ -488,8 +491,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				const message = event.message;
 				if (!message || typeof message !== "object") return;
 				if (message.role === "assistant") {
-					const text = extractAssistantText(message);
-					if (text !== undefined) state.lastAssistantText = text;
+					state.lastAssistantText = extractAssistantText(message);
 					state.stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
 					state.assistantErrorMessage = typeof message.errorMessage === "string" && message.errorMessage.trim()
 						? message.errorMessage.trim()
@@ -523,6 +525,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			: FALLBACK_MODEL;
 		const model = options.model?.trim() || state.model || parentModel;
 		const thinking = options.thinking || state.thinking || pi.getThinkingLevel();
+		state.continueError = undefined;
 		const tools = options.writeAccess ? "read,grep,find,ls,bash,edit,write" : "read,grep,find,ls";
 		let childDocsExtensionDir: string | undefined;
 		let proc: any;
@@ -533,10 +536,17 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		};
 		const failLaunch = (prefix: string, error: unknown): Promise<void> => {
 			cleanupChildDocsExtension();
-			state.status = "error";
+			const message = `${prefix}: ${error instanceof Error ? error.message : String(error)}`;
 			state.proc = undefined;
-			state.error = `${prefix}: ${error instanceof Error ? error.message : String(error)}`;
-			state.textChunks.push(state.error);
+			if (options.isContinuation) {
+				// Preserve prior turn status, widget narration, and turnCount on a failed continuation.
+				state.continueError = message;
+				return Promise.resolve();
+			}
+			state.status = "error";
+			state.turnCount = 0;
+			state.error = message;
+			state.textChunks.push(message);
 			updateWidgets();
 			return Promise.resolve();
 		};
@@ -573,15 +583,16 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			);
 		}
 
-		// Commit turn metadata only once child setup and spawn have succeeded so a failed continuation
-		// keeps the prior turn's result, model, thinking level, and turn count intact.
+		// Commit turn metadata only once child setup and spawn have succeeded so a failed launch/continuation
+		// keeps turnCount accurate and preserves the prior turn's result, model, and thinking level.
 		if (options.isContinuation) {
 			prepareTurnState(state, prompt);
-			state.turnCount++;
 		}
+		state.turnCount++;
 		state.model = model;
 		state.thinking = thinking;
 		state.error = undefined;
+		state.continueError = undefined;
 		updateWidgets();
 
 		return new Promise<void>((resolve) => {
@@ -714,7 +725,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				toolCount: 0,
 				elapsed: 0,
 				sessionFile: makeSessionFile(id),
-				turnCount: 1,
+				turnCount: 0,
 				model: "",
 				thinking: pi.getThinkingLevel(),
 			};
@@ -764,8 +775,8 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			}
 
 			spawnAgent(state, args.prompt, ctx, { model: args.model, thinking: args.thinking, skills: skillResolution.paths, writeAccess: args.writeAccess, isContinuation: true });
-			if (state.status === "error") {
-				return { isError: true, content: [{ type: "text", text: state.error ?? `Could not continue subagent #${args.id}.` }] };
+			if (state.continueError) {
+				return { isError: true, content: [{ type: "text", text: state.continueError }] };
 			}
 			ctx.ui.notify(`Continuing Subagent #${args.id} (Turn ${state.turnCount})…`, "info");
 
@@ -804,9 +815,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				return { content: [{ type: "text", text: "No active subagents." }] };
 			}
 
-			const list = Array.from(agents.values()).map(s =>
-				`#${s.id} [${s.status.toUpperCase()}] (Turn ${s.turnCount}, ${s.model}, ${s.thinking}) - ${s.task}`
-			).join("\n");
+			const list = Array.from(agents.values()).map(s => {
+				const continueNote = s.continueError ? ` [last continue failed: ${s.continueError}]` : "";
+				return `#${s.id} [${s.status.toUpperCase()}] (Turn ${s.turnCount}, ${s.model}, ${s.thinking}) - ${s.task}${continueNote}`;
+			}).join("\n");
 
 			return {
 				content: [{ type: "text", text: `Subagents:\n${list}` }],
@@ -850,7 +862,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				toolCount: 0,
 				elapsed: 0,
 				sessionFile: makeSessionFile(id),
-				turnCount: 1,
+				turnCount: 0,
 				model: "",
 				thinking: pi.getThinkingLevel(),
 			};
@@ -913,8 +925,8 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 			// Resume: update state for a new turn
 			spawnAgent(state, prompt, ctx, { model: parsed.options.model, thinking: parsed.options.thinking, skills: skillResolution.paths, writeAccess: parsed.options.writeAccess, isContinuation: true });
-			if (state.status === "error") {
-				ctx.ui.notify(state.error ?? `Could not continue subagent #${num}.`, "error");
+			if (state.continueError) {
+				ctx.ui.notify(state.continueError, "error");
 				return;
 			}
 			ctx.ui.notify(`Continuing Subagent #${num} (Turn ${state.turnCount})…`, "info");
