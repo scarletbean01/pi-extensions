@@ -457,22 +457,23 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		const def = available.find(agent => agent.name.toLowerCase() === requested.toLowerCase());
 		if (!def) {
 			return {
-				error: `Unknown persona "${requested}". Searched ${projectAgentsDir} and ${globalAgentsDir}. Available: ${available.map(agent => agent.name).join(", ") || "none"}.`,
+				error: `Unknown persona "${sanitizePersonaMetadataPart(requested)}". Searched ${sanitizePersonaMetadataPart(projectAgentsDir)} and ${sanitizePersonaMetadataPart(globalAgentsDir)}. Available: ${available.map(agent => sanitizePersonaMetadataPart(agent.name)).join(", ") || "none"}.`,
 			};
 		}
+		const personaFile = sanitizePersonaMetadataPart(def.file);
 		if (PERSONA_FIELD_CONTROL_RE.test(def.name)) {
-			return { error: `${def.file} ("name"): persona name must not contain control characters.` };
+			return { error: `${personaFile} ("name"): persona name must not contain control characters.` };
 		}
 		if (def.model && PERSONA_FIELD_CONTROL_RE.test(def.model)) {
-			return { error: `${def.file} ("model"): persona model must not contain control characters.` };
+			return { error: `${personaFile} ("model"): persona model must not contain control characters.` };
 		}
 		if (def.systemPrompt.includes("\0")) {
-			return { error: `${def.file} ("body"): persona instructions must not contain NUL characters.` };
+			return { error: `${personaFile} ("body"): persona instructions must not contain NUL characters.` };
 		}
 		const bodyBytes = Buffer.byteLength(def.systemPrompt, "utf8");
 		if (bodyBytes > MAX_PERSONA_BODY_BYTES) {
 			return {
-				error: `${def.file} ("body"): persona instructions are ${bodyBytes} bytes, exceeding the ${MAX_PERSONA_BODY_BYTES}-byte (100 KiB) limit.`,
+				error: `${personaFile} ("body"): persona instructions are ${bodyBytes} bytes, exceeding the ${MAX_PERSONA_BODY_BYTES}-byte (100 KiB) limit.`,
 			};
 		}
 		const slash = parentModel.indexOf("/");
@@ -489,9 +490,15 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				...readModelAliases(projectConfigPath, projectConfig),
 			]);
 			const resolvedModel = resolveModel(def, ctxModel, aliases);
+			if (PERSONA_FIELD_CONTROL_RE.test(resolvedModel.model)) {
+				return { error: `${personaFile} ("model"): resolved persona model must not contain control characters.` };
+			}
+			if (!sanitizePersonaMetadataPart(def.name).trim()) {
+				return { error: `${personaFile} ("name"): persona name must contain visible characters.` };
+			}
 			const personaSkills = resolveSkillPaths(def.allowedSkills, cwd);
 			if (personaSkills.error) {
-				return { error: `Persona "${def.name}" in ${def.file} has an invalid skills entry: ${personaSkills.error}` };
+				return { error: sanitizePersonaMetadataPart(`Persona "${def.name}" in ${def.file} has an invalid skills entry: ${personaSkills.error}`) };
 			}
 			return {
 				persona: {
@@ -508,7 +515,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				},
 			};
 		} catch (error) {
-			return { error: error instanceof Error ? error.message : String(error) };
+			return { error: sanitizePersonaMetadataPart(error instanceof Error ? error.message : String(error)) };
 		}
 	}
 
@@ -516,7 +523,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		if (!persona) return undefined;
 		for (const skill of persona.skills) {
 			if (skill.checkExists && !fs.existsSync(skill.path)) {
-				return `Persona "${persona.name}" in ${persona.file} references missing skill path "${skill.path}".`;
+				return sanitizePersonaMetadataPart(`Persona "${persona.name}" in ${persona.file} references missing skill path "${skill.path}".`);
 			}
 		}
 		return undefined;
@@ -617,7 +624,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		return sanitizeDisplayText(text.replace(/[\r\n\t]+/g, " ")).replace(/\x1b\[[0-9;]*m/g, "");
 	}
 
-	function formatPersonaMetadata(state: SubState, nameWidth?: number, includeModel = true): string | undefined {
+	function formatPersonaMetadata(state: SubState, nameWidth?: number, includeModel = true, modelWidth?: number): string | undefined {
 		if (!state.persona?.name) return undefined;
 		const name = sanitizePersonaMetadataPart(state.persona.name);
 		if (!name) return undefined;
@@ -629,12 +636,17 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		const model = sanitizePersonaMetadataPart(queuedOrRunningModel || state.persona.model || "");
 		if (!model) return displayName;
 		const thinking = sanitizePersonaMetadataPart(state.queuedThinking ?? state.thinking);
-		return `${displayName} · ${model} (${thinking})`;
+		const displayModel = modelWidth === undefined
+			? model
+			: truncateToWidth(model, modelWidth, modelWidth < 4 ? "" : "…");
+		return `${displayName} · ${displayModel} (${thinking})`;
 	}
 
 	function formatSubagentInfo(state: SubState): string {
 		const metadata = formatPersonaMetadata(state);
-		if (metadata) return `Subagent #${state.id} ${metadata}`;
+		if (state.persona) {
+			return `Subagent #${state.id} ${metadata ?? (sanitizePersonaMetadataPart(state.persona.name) || "persona")}`;
+		}
 		return `Subagent #${state.id}: ${state.model} (${state.thinking} thinking)`;
 	}
 
@@ -665,8 +677,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			? truncateToWidth(plainTask, taskBudget, "").replace(/\x1b\[0m$/g, "")
 			: "";
 		const lastLine = state.lastLine ? sanitizeDisplayText(state.lastLine.replace(/\t/g, " ")) : "";
-		const personaNameWidth = width <= 24 ? 4 : width <= 40 ? 8 : width < 80 ? 8 : 16;
-		const metadata = formatPersonaMetadata(state, personaNameWidth, width > 40);
+		const personaNameWidth = width <= 24 ? 4 : width < 80 ? 8 : 16;
+		const includePersonaModel = width >= 80;
+		const personaModelWidth = width < 100 ? 16 : undefined;
+		const metadata = formatPersonaMetadata(state, personaNameWidth, includePersonaModel, personaModelWidth);
 		const personaMetadata = metadata ? theme.fg("dim", ` ${metadata}`) : "";
 
 		let prefix: string;
