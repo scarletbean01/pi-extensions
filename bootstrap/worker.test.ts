@@ -968,6 +968,22 @@ test("bootstrap_complete returns terminate: true on saved team/chain completions
 		assert.equal(lostRace.details.status, "cancelled");
 		assert.equal("terminate" in lostRace, false);
 	}
+
+	// Catch-block "already persisted and delivered" path when shutdown throws after writing delivery: "sent".
+	{
+		const f = fixture(t, { topology: "chain", successor: "a2-second" });
+		atomicJson(readyPath(f.root, "a2-second"), { task_id: f.config.task_id, token: f.config.token, instance_id: "a2-second", session_id: "successor-session" });
+		await f.start();
+		f.context.shutdown = () => {
+			assert.equal(readJson<WorkerCompletion>(resultPath(f.root, f.config.instance_id)).delivery, "sent");
+			throw new Error("shutdown failed after save");
+		};
+		const res = await f.complete({ status: "success", summary: "Saved before shutdown error", detail: "OK" });
+		assert.equal(res.terminate, true);
+		assert.equal(res.details.status, "saved");
+		assert.equal(res.content[0].text, "Result already persisted and delivered.");
+		assert.equal(readJson<WorkerCompletion>(resultPath(f.root, f.config.instance_id)).delivery, "sent");
+	}
 });
 
 test("runtime-composed system prompt tells worker to call bootstrap_complete on its own as a separate step without altering task input hash", async t => {
@@ -979,11 +995,13 @@ test("runtime-composed system prompt tells worker to call bootstrap_complete on 
 		roster: [{ instance_id: f.config.instance_id, node_id: f.config.node_id, persona_name: f.config.persona_name, sub_task: f.config.sub_task }],
 		created_at: "2026-01-01T00:00:00.000Z",
 	});
+	// Fixed SHA-256 computed on parent commit dae5ccc for these exact inputs; catches any accidental inclusion of the prompt sentence in TaskInputRecord.
+	assert.equal(inputRecord.input_hash, "fbcc17e2e3473c7724ea7c9e3f3887f9920dfd299f017a5f47254dc00446753f");
 	atomicJson(taskInputPath(f.root, f.config.instance_id), inputRecord);
 	await f.start();
 	const { systemPrompt } = await f.hooks.get("before_agent_start")!({ systemPrompt: "BASE" });
 	assert.match(systemPrompt, /Call bootstrap_complete on its own as a separate step/i);
 	const persisted = parseTaskInput(readJson<unknown>(taskInputPath(f.root, f.config.instance_id)), { run_id: f.config.task_id, instance_id: f.config.instance_id });
-	assert.equal(persisted.input_hash, inputRecord.input_hash);
+	assert.equal(persisted.input_hash, "fbcc17e2e3473c7724ea7c9e3f3887f9920dfd299f017a5f47254dc00446753f");
 	assert.doesNotMatch(JSON.stringify(persisted), /separate step/i);
 });

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { ownershipPath, publishFailFast } from "./ownership.ts";
 import { claimOutcome, outcomeClaimPath, writeCancelRecord } from "./cancellation.ts";
 import { createGraphWidgets } from "./graph-widget.ts";
-import { handoffClaimPath } from "./handoff.ts";
+import { handoffClaimPath, handoffOfferPath } from "./handoff.ts";
 import { claimRevisionTransition, finalizeReview, readFinalization, readLoopTransition, reserveRevision, reviewRoutes } from "./review-loop.ts";
 import { atomicJson, dispositionPath, dispositionRecord, readJson, resultPath, withRunLock, type ReportEntry, type WorkerCompletion } from "./session-store.ts";
 import { buildMarkdownReport, formatAgentStates, formatCancelResult, formatPlan, formatRecovery, formatReportDigest, formatRunOutcome } from "./reporting.ts";
@@ -3136,5 +3136,9 @@ test("review-loop completions terminate on queued feedback, approval, exhausted 
 		const r2Exhausted = await rEx.complete(complete("R2 exhausted", "revise"));
 		assert.equal(r2Exhausted.terminate, true);
 		assert.equal(r2Exhausted.details.status, "saved");
+		assert.equal(fs.existsSync(handoffOfferPath(fEx.run.session_dir, "a3-n3", "a2-n2")), false);
+		assert.equal(fs.existsSync(handoffOfferPath(fEx.run.session_dir, "a3-n3")), false);
+		const finalization = readFinalization(fEx.run.session_dir, fEx.run.task_id, fEx.run.review_plan!.loops[0], "a2-n2");
+		assert.equal(finalization?.exhausted?.state, onExhausted);
 	}
 });

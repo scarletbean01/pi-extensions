@@ -163,6 +163,7 @@ test("graph fan-out delivers one source-scoped handoff per outbound edge and sho
 	const branchA = run.nodes.get("branch-a")!;
 	const branchB = run.nodes.get("branch-b")!;
 
+
 	// Before root completes, inbound edges to branches are pending and outbound handoffs are keyed by destination as not offered.
 	const initialStatus = run.status();
 	assert.equal(initialStatus.agents.find(a => a.node_id === "branch-a")?.edge_states?.root, "pending");
@@ -233,6 +234,7 @@ test("retried bootstrap_complete in a fan-out re-sends only undelivered edges fr
 	const root = run.nodes.get("root")!;
 	const branchA = run.nodes.get("branch-a")!;
 	const branchB = run.nodes.get("branch-b")!;
+
 
 	const firstAttempt = await root.complete({ status: "success", summary: "Saved once", detail: "original" });
 	assert.equal(firstAttempt.isError, true);
@@ -311,6 +313,7 @@ test("crash between edge A and edge B persists edge A delivery; reloaded worker 
 	const root = run.nodes.get("root")!;
 	const branchA = run.nodes.get("branch-a")!;
 	const branchB = run.nodes.get("branch-b")!;
+
 	sessionDir = run.run.session_dir;
 	rootInstanceId = root.config.instance_id;
 
@@ -363,6 +366,7 @@ test("reloaded worker treats an existing claim on edge A as already sent and sen
 	const branchA = run.nodes.get("branch-a")!;
 	const branchB = run.nodes.get("branch-b")!;
 
+
 	await root.complete({ status: "success", summary: "Scouted", detail: "" });
 	await branchA.deliverNotification(root);
 	await root.shutdown("reload");
@@ -401,6 +405,7 @@ test("blocked propagation blocks all downstream fan-out branches", async t => {
 	const root = run.nodes.get("root")!;
 	const branchA = run.nodes.get("branch-a")!;
 	const branchB = run.nodes.get("branch-b")!;
+
 	await root.complete({ status: "failure", summary: "Root failed", detail: "" });
 	await branchA.deliverNotification(root);
 	await branchB.deliverNotification(root);
@@ -466,6 +471,7 @@ test("bootstrap_recover retry_delivery repairs a single failed graph fan-out edg
 	const root = run.nodes.get("root")!;
 	const branchA = run.nodes.get("branch-a")!;
 	const branchB = run.nodes.get("branch-b")!;
+
 
 	const res = await root.complete({ status: "success", summary: "Scouted", detail: "" });
 	assert.equal(res.isError, true);
@@ -834,6 +840,11 @@ test("graph completions terminate when all edges queue or no route exists, keep 
 	const branchA = run.nodes.get("branch-a")!;
 	const branchB = run.nodes.get("branch-b")!;
 
+
+	// Runtime-composed prompt includes the separate-step sentence before completion.
+	const rootPrompt = await root.beforeStart();
+	assert.match(rootPrompt?.systemPrompt ?? "", /Call bootstrap_complete on its own as a separate step/i);
+
 	// Partial fan-out failure keeps turn open and does not shut down.
 	const partialFail = await root.complete({ status: "success", summary: "Root done", detail: "original" });
 	assert.equal(partialFail.isError, true);
@@ -861,19 +872,24 @@ test("graph completions terminate when all edges queue or no route exists, keep 
 	assert.equal(bRes.details.status, "saved");
 	assert.equal(branchB.shutdowns, 1);
 
-	// Identical request_id replay succeeds and preserves persisted task input hashes.
-	const rootInputBefore = readJson<{ input_hash: string }>(join(run.run.session_dir, "a1-root.input.json"));
-	const replay = await run.service.generate({
-		topology: "graph",
+	// Identical plans across separate launches share the same plan fingerprint and omit the prompt sentence from persisted task input records.
+	const planRequest = {
+		topology: "graph" as const,
 		task: "Graph terminate contract",
-		request_id: "graph-term-1",
 		project_cwd: run.cwd,
 		agents: [
 			{ node_id: "root", persona: "first", sub_task: "Scout" },
 			{ node_id: "branch-a", persona: "second", sub_task: "Branch A", depends_on: ["root"] },
 			{ node_id: "branch-b", persona: "second", sub_task: "Branch B", depends_on: ["root"] },
 		],
-	}, model);
-	assert.equal(replay.task_id, run.run.task_id);
-	assert.equal(readJson<{ input_hash: string }>(join(run.run.session_dir, "a1-root.input.json")).input_hash, rootInputBefore.input_hash);
+	};
+	const secondRun = await run.service.generate({ ...planRequest, request_id: "graph-term-2" }, model);
+	assert.equal(run.service.plan(planRequest, model).fingerprint, run.service.plan({ ...planRequest, request_id: "graph-term-2" }, model).fingerprint);
+	for (const inst of ["a1-root", "a2-branch-a", "a3-branch-b"]) {
+		const inputA = readFileSync(join(run.run.session_dir, `${inst}.input.json`), "utf8");
+		const inputB = readFileSync(join(secondRun.session_dir, `${inst}.input.json`), "utf8");
+		assert.doesNotMatch(inputA, /separate step/i);
+		assert.doesNotMatch(inputB, /separate step/i);
+		assert.equal(JSON.parse(inputA).input_hash === JSON.parse(inputB).input_hash, false, "distinct task_ids yield distinct input_hashes");
+	}
 });
