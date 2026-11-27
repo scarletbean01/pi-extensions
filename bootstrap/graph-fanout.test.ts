@@ -808,3 +808,81 @@ for (const failFast of [false, true]) {
 		assert.match(status.agents[2].execution_reason ?? "", failFast ? /fail-fast policy after other.*Independent failure/ : /Stop the follower/);
 	});
 }
+
+test("graph completions terminate when all edges queue or no route exists, keep turn open on partial failure, and terminate on retry", async t => {
+	let failEdgeB = true;
+	const run = await runFixture(t, {
+		topology: "graph",
+		task: "Graph terminate contract",
+		request_id: "graph-term-1",
+		agents: [
+			{ node_id: "root", persona: "first", sub_task: "Scout" },
+			{ node_id: "branch-a", persona: "second", sub_task: "Branch A", depends_on: ["root"] },
+			{ node_id: "branch-b", persona: "second", sub_task: "Branch B", depends_on: ["root"] },
+		],
+	}, new Map([
+		["root", {
+			executeTool: async (name, params) => {
+				if (name === "coms_send" && failEdgeB && String((params as { target?: string }).target) === "session-a3-branch-b") {
+					return { isError: true, content: [{ type: "text" as const, text: "edge b unreachable" }] };
+				}
+				return { content: [{ type: "text" as const, text: "queued" }] };
+			},
+		}],
+	]));
+	const root = run.nodes.get("root")!;
+	const branchA = run.nodes.get("branch-a")!;
+	const branchB = run.nodes.get("branch-b")!;
+
+	// Runtime-composed prompt includes the separate-step sentence before completion.
+	const rootPrompt = await root.beforeStart();
+	assert.match(rootPrompt?.systemPrompt ?? "", /Call bootstrap_complete on its own as a separate step/i);
+
+	// Partial fan-out failure keeps turn open and does not shut down.
+	const partialFail = await root.complete({ status: "success", summary: "Root done", detail: "original" });
+	assert.equal(partialFail.isError, true);
+	assert.equal(partialFail.details.status, "error");
+	assert.equal("terminate" in partialFail, false);
+	assert.equal(root.shutdowns, 0);
+
+	// Retry sends only undelivered edge B and terminates.
+	failEdgeB = false;
+	const retried = await root.complete({ status: "success", summary: "Ignored", detail: "Ignored" });
+	assert.equal(retried.terminate, true);
+	assert.equal(retried.details.status, "saved");
+	assert.equal(root.shutdowns, 1);
+
+	// Terminal graph nodes (no outbound edges) also terminate for partial and failure statuses.
+	await branchA.deliverNotification(root);
+	const aRes = await branchA.complete({ status: "partial", summary: "A partial", detail: "" });
+	assert.equal(aRes.terminate, true);
+	assert.equal(aRes.details.status, "saved");
+	assert.equal(branchA.shutdowns, 1);
+
+	await branchB.deliverNotification(root);
+	const bRes = await branchB.complete({ status: "failure", summary: "B failed", detail: "" });
+	assert.equal(bRes.terminate, true);
+	assert.equal(bRes.details.status, "saved");
+	assert.equal(branchB.shutdowns, 1);
+
+	// Identical plans across separate launches share the same plan fingerprint and omit the prompt sentence from persisted task input records.
+	const planRequest = {
+		topology: "graph" as const,
+		task: "Graph terminate contract",
+		project_cwd: run.cwd,
+		agents: [
+			{ node_id: "root", persona: "first", sub_task: "Scout" },
+			{ node_id: "branch-a", persona: "second", sub_task: "Branch A", depends_on: ["root"] },
+			{ node_id: "branch-b", persona: "second", sub_task: "Branch B", depends_on: ["root"] },
+		],
+	};
+	const secondRun = await run.service.generate({ ...planRequest, request_id: "graph-term-2" }, model);
+	assert.equal(run.service.plan(planRequest, model).fingerprint, run.service.plan({ ...planRequest, request_id: "graph-term-2" }, model).fingerprint);
+	for (const inst of ["a1-root", "a2-branch-a", "a3-branch-b"]) {
+		const inputA = readFileSync(join(run.run.session_dir, `${inst}.input.json`), "utf8");
+		const inputB = readFileSync(join(secondRun.session_dir, `${inst}.input.json`), "utf8");
+		assert.doesNotMatch(inputA, /separate step/i);
+		assert.doesNotMatch(inputB, /separate step/i);
+		assert.equal(JSON.parse(inputA).input_hash === JSON.parse(inputB).input_hash, false, "distinct task_ids yield distinct input_hashes");
+	}
+});

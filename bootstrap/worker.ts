@@ -2007,6 +2007,7 @@ export default function (pi: ExtensionAPI, options: WorkerExtensionOptions = {})
 					" Once selected, a route cannot change within this attempt; you may still ask for clarification.\n" : "") +
 				`Report status honestly: success means the task is done; partial means gaps remain (a dependant that requires success will not start); failure means you could not do it. ` +
 				`Call bootstrap_complete exactly once${attemptScope} with status, summary, detail, and optional outputs/artifacts/metrics/warnings/next_steps. ` +
+				`Call bootstrap_complete on its own as a separate step, not alongside other tool calls. ` +
 				`That tool persists your result and routes chain input automatically. ` +
 				(config.predecessor ? `The handoff notification only wakes you: your input${attemptScope} was accepted durably (the accepted handoff ID above) before this turn, so a repeated notification for the same handoff will not restart this attempt. ` : "") +
 				`Do not manually forward results or wait via coms_await. ` +
@@ -2059,7 +2060,7 @@ export default function (pi: ExtensionAPI, options: WorkerExtensionOptions = {})
 		async execute(_id, params, signal, _update, ctx) {
 			if (config?.review_plan && !admitted) throw new Error("Bootstrap worker is parked or has no admitted work");
 			if (!config || !released) { completionRequested = completed; throw new Error("Bootstrap worker is not ready"); }
-			if (delivered) return { content: [{ type: "text", text: "Result already persisted and delivered." }], details: { status: "saved" } };
+			if (delivered) return { content: [{ type: "text", text: "Result already persisted and delivered." }], details: { status: "saved" }, terminate: true };
 			if (completing) throw new Error("Completion is already in progress");
 			completing = true;
 			const durableReview = Boolean(config.factory_managed && ownLoop(config));
@@ -2074,7 +2075,7 @@ export default function (pi: ExtensionAPI, options: WorkerExtensionOptions = {})
 					completed = true; delivered = true;
 					if (ownLoop(config)) park();
 					else ctx.shutdown();
-					return { content: [{ type: "text", text: "Result already persisted and delivered." }], details: { status: "saved" } };
+					return { content: [{ type: "text", text: "Result already persisted and delivered." }], details: { status: "saved" }, terminate: true };
 				}
 				if (!existing) {
 					const cancel = readCancellation();
@@ -2469,7 +2470,7 @@ export default function (pi: ExtensionAPI, options: WorkerExtensionOptions = {})
 						completion.delivery = "not_required";
 						saveCompletion(path, completion);
 						finishDelivery();
-						return { content: [{ type: "text", text: "Result persisted; graph handoff complete." }], details: { status: "saved" } };
+						return { content: [{ type: "text", text: "Result persisted; graph handoff complete." }], details: { status: "saved" }, terminate: true };
 					}
 					const edgeDeliveries: Record<string, EdgeDeliveryState> = { ...(completion.edge_deliveries ?? {}) };
 					const queuedOffers: HandoffOffer[] = [];
@@ -2564,6 +2565,7 @@ export default function (pi: ExtensionAPI, options: WorkerExtensionOptions = {})
 					return {
 						content: [{ type: "text", text: completionText }],
 						details: { status: "saved", edge_deliveries: edgeDeliveries },
+						terminate: true,
 					};
 				}
 				const successor = config.successor;
@@ -2587,6 +2589,7 @@ export default function (pi: ExtensionAPI, options: WorkerExtensionOptions = {})
 				return {
 					content: [{ type: "text", text: handoffOffer ? `Result persisted; handoff ${handoffOffer.handoff_id} queued for ${handoffOffer.destination.instance_id} (${transportSummary}). It is not accepted until the successor records its claim; you are done and need not wait.` : "Result persisted; chain handoff complete." }],
 					details: { status: "saved", ...(handoffOffer ? { handoff_id: handoffOffer.handoff_id, handoff_state: handoffOffer.state, ...(handoffOffer.transport ? { transport: handoffOffer.transport } : {}) } : {}) },
+					terminate: true,
 				};
 			} catch (error) {
 				// Nothing was persisted: the worker may keep working instead of being locked out of its tools.
@@ -2596,7 +2599,7 @@ export default function (pi: ExtensionAPI, options: WorkerExtensionOptions = {})
 					const completion = readJson<WorkerCompletion>(path);
 					// A shutdown or park failure after the final delivery write must not reopen delivery.
 					if (completion.delivery === "sent" || completion.delivery === "not_required") {
-						return { content: [{ type: "text", text: "Result already persisted and delivered." }], details: { status: "saved" } };
+						return { content: [{ type: "text", text: "Result already persisted and delivered." }], details: { status: "saved" }, terminate: true };
 					}
 					completion.delivery = "failed"; completion.delivery_error = errorMessage(error); saveCompletion(path, completion);
 					return { isError: true, content: [{ type: "text", text: `Result retained, but chain delivery failed: ${errorMessage(error)}. You may retry bootstrap_complete. If you cannot, the dispatcher can repair delivery from the saved result (bootstrap_recover); do not redo your task.` }], details: { status: "error" } };

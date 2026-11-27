@@ -203,12 +203,15 @@ export interface FakeProvider {
 
 const REDACTED_HEADERS = new Set(["authorization", "x-api-key", "api-key", "cookie", "proxy-authorization"]);
 
+export interface FakeProviderToolCall { id?: string; name: string; arguments: unknown }
+export type FakeProviderReply = string | { toolCalls: FakeProviderToolCall[] };
+
 /**
  * Local OpenAI-compatible (chat completions) provider. Calls are served from `replies` in order; any call with no scripted reply is
  * recorded as unexpected and refused with 503, so a test that must never reach a model can prove it did not, and a test that needs a
  * deterministic successful run scripts exactly the replies it expects. Credentials in request headers are not retained.
  */
-export async function startFakeProvider(options: { replies?: string[] } = {}): Promise<FakeProvider> {
+export async function startFakeProvider(options: { replies?: FakeProviderReply[] } = {}): Promise<FakeProvider> {
 	const queue = [...(options.replies ?? [])];
 	const calls: RecordedModelCall[] = [];
 	const server = createServer((request, response) => {
@@ -226,9 +229,23 @@ export async function startFakeProvider(options: { replies?: string[] } = {}): P
 			}
 			const chunk = (delta: object, finish: string | null) => `data: ${JSON.stringify({ id: "chatcmpl-fake", object: "chat.completion.chunk", created: 0, model: "model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
 			response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-			response.write(chunk({ role: "assistant", content: "" }, null));
-			response.write(chunk({ content: reply }, null));
-			response.write(chunk({}, "stop"));
+			if (typeof reply === "string") {
+				response.write(chunk({ role: "assistant", content: "" }, null));
+				response.write(chunk({ content: reply }, null));
+				response.write(chunk({}, "stop"));
+			} else {
+				const toolCalls = reply.toolCalls.map((call, index) => ({
+					index,
+					id: call.id ?? `call_fake_${calls.length}_${index}`,
+					type: "function",
+					function: {
+						name: call.name,
+						arguments: typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments),
+					},
+				}));
+				response.write(chunk({ role: "assistant", tool_calls: toolCalls }, null));
+				response.write(chunk({}, "tool_calls"));
+			}
 			response.write(`data: ${JSON.stringify({ id: "chatcmpl-fake", object: "chat.completion.chunk", created: 0, model: "model", choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`);
 			response.end("data: [DONE]\n\n");
 		});

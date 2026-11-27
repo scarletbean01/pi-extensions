@@ -173,6 +173,22 @@ test("fake provider streams scripted replies deterministically, in order, and fl
 	assert.equal(provider.unexpectedCalls().length, 1, "only the call beyond the script is unexpected");
 });
 
+test("fake provider streams scripted tool calls and rejects calls beyond the script", async t => {
+	const provider = await startFakeProvider({
+		replies: [{ toolCalls: [{ id: "call_1", name: "bootstrap_complete", arguments: { status: "success", summary: "Done", detail: "OK" } }] }],
+	});
+	t.after(() => provider.close());
+	const response = await chat(provider.baseUrl);
+	assert.equal(response.status, 200);
+	const text = await response.text();
+	const chunks = text.split("\n").filter(line => line.startsWith("data: ") && !line.includes("[DONE]")).map(line => JSON.parse(line.slice(6))).filter(c => c.choices.length > 0);
+	assert.equal(chunks[0].choices[0].delta.tool_calls[0].function.name, "bootstrap_complete");
+	assert.deepEqual(JSON.parse(chunks[0].choices[0].delta.tool_calls[0].function.arguments), { status: "success", summary: "Done", detail: "OK" });
+	assert.equal(chunks.at(-1).choices[0].finish_reason, "tool_calls");
+	assert.equal((await chat(provider.baseUrl)).status, 503);
+	assert.equal(provider.unexpectedCalls().length, 1);
+});
+
 test("fake provider extension registers an offline model pointing at the local server", async t => {
 	const provider = await startFakeProvider();
 	t.after(() => provider.close());
