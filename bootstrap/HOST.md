@@ -22,6 +22,9 @@ passed through as written; absent or empty tools keep the read-only set. Its
 listed `skills:` names are loaded (none when omitted or empty), and `--skills`
 adds skills for that launch or turn. `extensions:`, `color` and `description`
 are ignored, and `--write` cannot be combined with a Persona.
+The subagent widget row and `/sub` and `/subcont` info lines show the Persona
+name with its resolved model and thinking level; the result and notify-only
+notice do not include the Persona name.
 
 ## Operations
 

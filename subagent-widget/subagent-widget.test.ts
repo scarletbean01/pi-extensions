@@ -2593,3 +2593,73 @@ test("queued persona launch delivers snapshotted persona instructions even if th
 	assert.equal(inv.docsFilteredPrompt, "- Original snapshotted instruction.\n\nbase instructions\n\nother context");
 	await host.commands.get("subclear").handler("", host.ctx);
 });
+
+test("persona widget rows show the persona, model, and thinking level while persona-less rows stay unchanged", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("same result")] });
+	t.after(() => fake.cleanup());
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "reviewer.md", "---\nmodel: openai/gpt-5\nthinking: high\n---\nReview carefully.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--persona reviewer inspect the change", host.ctx));
+	await waitFor(() => host.sentMessages[0], "persona subagent result");
+	const widget = host.getWidgetFactory("subagents")({}, { fg: (_color: string, text: string) => text });
+	const personaRow = widget.render(120).find((line: string) => line.includes("#1"))!;
+	assert.ok(personaRow.includes("#1 reviewer · openai/gpt-5 (high)"), personaRow);
+	assert.ok(host.notifications.some(item => item.message === "Subagent #1 reviewer · openai/gpt-5 (high)"));
+
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 follow-up task", host.ctx));
+	await waitFor(() => host.sentMessages[1], "persona continuation result");
+	assert.ok(host.notifications.some(item => item.message === "Subagent #1 reviewer · openai/gpt-5 (high)"));
+
+	const plainHost = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, () => plainHost.commands.get("sub").handler("--model openai/gpt-5 --thinking high inspect the change", plainHost.ctx));
+	await waitFor(() => plainHost.sentMessages[0], "persona-less subagent result");
+	assert.ok(plainHost.notifications.some(item => item.message === "Subagent #1: openai/gpt-5 (high thinking)"));
+	const plainWidget = plainHost.getWidgetFactory("subagents")({}, { fg: (_color: string, text: string) => text });
+	const plainRow = plainWidget.render(120).find((line: string) => line.includes("#1"))!;
+	assert.equal(plainRow, "✓ #1 done 0s inspect the change Tools: 0 [-]");
+	await withFakePiEnvironment(fake, () => plainHost.commands.get("subcont").handler("1 follow-up task", plainHost.ctx));
+	await waitFor(() => plainHost.sentMessages[1], "persona-less continuation result");
+	assert.ok(plainHost.notifications.some(item => item.message === "Subagent #1: openai/gpt-5 (high thinking)"));
+});
+
+test("persona widget rows truncate long wide persona names within the terminal width", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("done")] });
+	t.after(() => fake.cleanup());
+	const personaName = "界レビュー担当".repeat(8);
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), `${personaName}.md`, "---\nmodel: vendor/m\nthinking: max\n---\nLong persona.");
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler(`--persona ${personaName} long-name task`, host.ctx));
+	await waitFor(() => host.sentMessages[0], "long persona subagent result");
+	const widget = host.getWidgetFactory("subagents")({}, { fg: (_color: string, text: string) => text });
+	const mediumRow = widget.render(60).find((line: string) => line.includes("#1"))!;
+	assert.ok(mediumRow.includes("#1 界"), mediumRow);
+	for (const width of [12, 24, 40, 60, 120]) {
+		for (const line of widget.render(width)) {
+			assert.ok(await getVisibleWidth(line) <= width, `row exceeded ${width} columns: ${line}`);
+		}
+	}
+});
+
+test("persona names do not change result text or notify-only notice content", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("shared answer")] });
+	t.after(() => fake.cleanup());
+	writePersonaFile(join(fake.cwd, ".pi", "agents"), "reviewer.md", "---\nmodel: vendor/m\nthinking: high\n---\nReview carefully.");
+	const personaHost = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	const plainHost = createFakeHost(await loadSubagentWidget(), fake.cwd);
+
+	await withFakePiEnvironment(fake, () => personaHost.commands.get("sub").handler("--persona reviewer same task", personaHost.ctx));
+	await withFakePiEnvironment(fake, () => plainHost.commands.get("sub").handler("--model vendor/m --thinking high same task", plainHost.ctx));
+	const personaResult = await waitFor(() => personaHost.sentMessages[0], "persona result delivered to parent");
+	const plainResult = await waitFor(() => plainHost.sentMessages[0], "persona-less result delivered to parent");
+	assert.equal(personaResult.message.content, plainResult.message.content);
+	assert.doesNotMatch(personaResult.message.content, /reviewer/);
+
+	await withFakePiEnvironment(fake, () => personaHost.commands.get("sub").handler("--persona reviewer --notify-only same private task", personaHost.ctx));
+	await withFakePiEnvironment(fake, () => plainHost.commands.get("sub").handler("--model vendor/m --thinking high --notify-only same private task", plainHost.ctx));
+	const personaNotice = await waitFor(() => personaHost.entries[0], "persona notify-only notice");
+	const plainNotice = await waitFor(() => plainHost.entries[0], "persona-less notify-only notice");
+	assert.equal(personaNotice.data.text, plainNotice.data.text);
+	assert.doesNotMatch(personaNotice.data.text, /reviewer/);
+	assert.equal(personaHost.sentMessages.length, 1);
+	assert.equal(plainHost.sentMessages.length, 1);
+});

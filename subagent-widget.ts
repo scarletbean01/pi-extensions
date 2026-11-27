@@ -577,6 +577,14 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		);
 	}
 
+	function formatSubagentInfo(state: SubState): string {
+		if (state.persona?.name) {
+			const name = sanitizeDisplayText(state.persona.name).replace(/\x1b\[[0-9;]*m/g, "");
+			return `Subagent #${state.id} ${name} · ${state.model} (${state.thinking})`;
+		}
+		return `Subagent #${state.id}: ${state.model} (${state.thinking} thinking)`;
+	}
+
 	function fitToWidth(text: string, width: number): string {
 		if (width <= 0) return "";
 		const ellipsis = width < 4 ? "" : "...";
@@ -604,18 +612,23 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			? truncateToWidth(plainTask, taskBudget, "").replace(/\x1b\[0m$/g, "")
 			: "";
 		const lastLine = state.lastLine ? sanitizeDisplayText(state.lastLine.replace(/\t/g, " ")) : "";
+		const personaMetadata = state.persona?.name
+			? theme.fg("dim", ` ${sanitizeDisplayText(`${state.persona.name} · ${state.model} (${state.thinking})`).replace(/\x1b\[[0-9;]*m/g, "")}`)
+			: "";
 
 		let prefix: string;
 		if (width <= 24) {
 			const narrowTool = truncateToWidth(toolLabel, 6, "").replace(/\x1b\[0m$/g, "");
 			prefix =
 				theme.fg(statusColor, `${statusIcon}#${state.id}`) +
+				personaMetadata +
 				(taskLabel ? " " + theme.fg("dim", taskLabel) : "") +
 				" " +
 				theme.fg("dim", narrowTool);
 		} else if (width <= 40) {
 			prefix =
 				theme.fg(statusColor, `${statusIcon} #${state.id}`) +
+				personaMetadata +
 				(turnLabel ? theme.fg("dim", turnLabel) : "") +
 				theme.fg("dim", ` ${elapsedLabel}`) +
 				(taskLabel ? " " + theme.fg("dim", taskLabel) : "") +
@@ -623,6 +636,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		} else {
 			prefix =
 				theme.fg(statusColor, `${statusIcon} #${state.id}`) +
+				personaMetadata +
 				(turnLabel ? theme.fg("dim", turnLabel) : "") +
 				" " +
 				theme.fg(statusColor, status) +
@@ -1512,7 +1526,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				ctx.ui.notify(state.error ?? `Could not launch subagent #${id}.`, "error");
 				return;
 			}
-			ctx.ui.notify(`Subagent #${id}: ${state.model} (${state.thinking} thinking)`, "info");
+			ctx.ui.notify(formatSubagentInfo(state), "info");
 		},
 	});
 
@@ -1584,7 +1598,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				return;
 			}
 			ctx.ui.notify(`Continuing Subagent #${num} (Turn ${state.turnCount})…`, "info");
-			ctx.ui.notify(`Subagent #${num}: ${state.model} (${state.thinking} thinking)`, "info");
+			ctx.ui.notify(formatSubagentInfo(state), "info");
 		},
 	});
 
