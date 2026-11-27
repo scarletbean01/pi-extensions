@@ -20,8 +20,10 @@ Spec: `../spec.md` (user stories 25–27; Implementation Decisions: Lifecycle).
 ## Verification
 
 - Rebased on `main` after ticket 06. Shutdown also syncs the management tools to the empty-subagent state while preserving other extensions' active and inactive tools, and skips redundant active-set writes.
-- `timeout 300 node --test --experimental-strip-types --test-force-exit --test-timeout=60000 subagent-widget.test.ts` passed three consecutive runs with `HOME` set to a throwaway probe home (50 tests per run).
+- `timeout 300 node --test --experimental-strip-types --test-force-exit --test-timeout=60000 subagent-widget.test.ts` passed three consecutive runs with `HOME` set to a throwaway probe home (54 tests per run).
 - A 10-day-old `subagent-0-0.jsonl` in the probe home survived all three runs. The real `~/.pi/agent/sessions/subagents` `ls -la --time-style=full-iso` listing matched before and after; the probe home was removed after verification.
 - Every harness host injects a fake sessions directory, and session lifecycle emits run with the fake Pi environment. Shutdown exits on child `exit`/`close` and has a `killGraceMs + 1000ms` upper bound; the background stdout-holder regression passed.
+- A quit or reload can wait through the SIGTERM grace period (5 seconds by default) for a child that ignores SIGTERM.
+- Regression tests cover concurrent create/removal, continuation removal during directory setup, cancellation before deferred pruning, and pruning symlinks without following their targets.
 - `pgrep -af '[f]ake-pi'` returned no child processes; `ls /tmp | grep subagent-widget` returned no entries after removing the intentional probe home.
 - `git diff --check` passed.

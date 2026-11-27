@@ -41,9 +41,11 @@ export interface SubagentWidgetOptions {
 	/** Test seam to override the session-file retention period (defaults to seven days). */
 	sessionFileMaxAgeMs?: number;
 	/** Override the subagent session directory; used by isolated harnesses. */
-	sessionsDirectory?: string;
+	sessionsDirectory?: string | (() => string);
 	/** Test seam for session-directory setup failures and delays. */
 	createSessionsDirectory?: (dir: string) => Promise<void>;
+	/** Test seam for controlling startup pruning. */
+	pruneSessionFiles?: (dir: string, maxAgeMs: number) => Promise<void>;
 	createChildDocsDirectory?: () => string;
 }
 
@@ -363,7 +365,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	// ── Session file helpers ──────────────────────────────────────────────────
 
 	function sessionsDirectory(): string {
-		return path.resolve(options.sessionsDirectory ?? path.join(os.homedir(), ".pi", "agent", "sessions", "subagents"));
+		const configured = typeof options.sessionsDirectory === "function"
+			? options.sessionsDirectory()
+			: options.sessionsDirectory;
+		return path.resolve(configured ?? path.join(os.homedir(), ".pi", "agent", "sessions", "subagents"));
 	}
 
 	function ensureSessionsDirectory(): Promise<string> {
@@ -393,8 +398,8 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		await Promise.all(names.filter(name => /^subagent-.*\.jsonl$/.test(name)).map(async name => {
 			const file = path.join(dir, name);
 			try {
-				const info = await fs.promises.stat(file);
-				if (info.isFile() && info.mtimeMs < cutoff) await fs.promises.rm(file, { force: true });
+				const info = await fs.promises.lstat(file);
+				if ((info.isFile() || info.isSymbolicLink()) && info.mtimeMs < cutoff) await fs.promises.unlink(file);
 			} catch {}
 		}));
 	}
@@ -674,7 +679,6 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	}
 
 	function removeSubagent(id: number, ctx: any): { found: boolean; wasRunning: boolean } {
-		lifecycleGeneration++;
 		const state = agents.get(id);
 		if (!state) return { found: false, wasRunning: false };
 		const wasRunning = state.status === "running";
@@ -1138,7 +1142,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		}),
 		execute: async (callId, args, _signal, _onUpdate, ctx) => {
 			widgetCtx = ctx;
-			const { found } = await removeSubagent(args.id, ctx);
+			const { found } = removeSubagent(args.id, ctx);
 			if (!found) {
 				return { content: [{ type: "text", text: `Error: No subagent #${args.id} found.` }] };
 			}
@@ -1307,7 +1311,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				return;
 			}
 
-			const { found, wasRunning } = await removeSubagent(num, ctx);
+			const { found, wasRunning } = removeSubagent(num, ctx);
 			if (!found) {
 				ctx.ui.notify(`No subagent #${num} found.`, "error");
 				return;
@@ -1369,7 +1373,6 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		lifecycleGeneration++;
 		shuttingDown = false;
 		applyExtensionDefaults(import.meta.url, ctx);
-		await pruneSessionFiles(sessionsDirectory());
 		for (const [, state] of Array.from(agents.entries())) {
 			cancelSubagent(state);
 		}
@@ -1380,14 +1383,16 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		nextId = 1;
 		widgetCtx = ctx;
 		clearWidget(ctx);
+		await (options.pruneSessionFiles?.(sessionsDirectory(), sessionFileMaxAgeMs) ?? pruneSessionFiles(sessionsDirectory()));
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		shuttingDown = true;
 		lifecycleGeneration++;
 		const stopping = Array.from(agents.values()).map(state => cancelSubagent(state));
+		const hadSubagents = agents.size > 0;
 		agents.clear();
-		syncManagementTools();
+		if (hadSubagents) syncManagementTools();
 		pendingResults = [];
 		clearWidget(ctx);
 		// A SIGTERM-ignoring child delays quit through the grace period; descendants holding stdio cannot delay it indefinitely.

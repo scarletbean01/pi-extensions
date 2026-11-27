@@ -1,6 +1,6 @@
 # Read-only token benchmark
 
-Subagent session files are deleted when their subagent is removed and pruned after seven days. Copy any transcript needed as evidence out of the sessions directory first, for example: `mkdir -p docs/token-benchmark/evidence && cp "$HOME"/.pi/agent/sessions/subagents/subagent-*.jsonl docs/token-benchmark/evidence/`.
+Subagent session files are deleted when their subagent is removed and pruned after seven days. Copy any transcript needed as evidence out of the sessions directory first, for example: `mkdir -p docs/token-benchmark/evidence && cp "$HOME"/.pi/agent/sessions/subagents/subagent-*.jsonl docs/token-benchmark/evidence/ 2>/dev/null || true`.
 
 This note records the pre-ticket-01 Bootstrap baseline and one post-ticket-01 rerun of each graph workload. The rerun uses the installed extensions, which include commit `91bf201`. Baseline manifests were created from 09:26–09:29Z, before `ccb44d6` (09:59Z) and the `91bf201` merge (10:15Z); rerun manifests were created from 10:27–10:28Z. All workloads were read-only and used `openai/gpt-6.1-terra` with low thinking.
 
