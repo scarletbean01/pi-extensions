@@ -725,6 +725,43 @@ test("session_shutdown cancels children, clears the widget and timer, and is ide
 	assert.equal(host.notifications.some(item => /Subagent #1 (done|error)/.test(item.message)), false);
 });
 
+test("session_shutdown disables only management tools and avoids redundant tool-set writes", async t => {
+	const fake = createFakePi({ events: [], delayMs: 30000 });
+	t.after(() => fake.cleanup());
+	const extension = await loadSubagentWidget();
+	const host = createFakeHost(extension, fake.cwd);
+	const managementTools = ["subagent_continue", "subagent_remove", "subagent_list"];
+	host.registerTool({ name: "other-active", description: "Active extension tool", parameters: {} });
+	host.registerTool({ name: "other-inactive", description: "Inactive extension tool", parameters: {}, defaultActive: false });
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("shutdown active tools", host.ctx));
+	const invocation = await waitFor(() => fake.invocations()[0], "shutdown active-tools child");
+	assert.ok(managementTools.every(name => host.getActiveTools().includes(name)));
+	assert.ok(host.getActiveTools().includes("other-active"));
+	assert.equal(host.getActiveTools().includes("other-inactive"), false);
+	const setCallsBeforeShutdown = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
+	await withFakePiEnvironment(fake, () => host.emit("session_shutdown", { reason: "quit" }));
+	assert.deepEqual(host.getActiveTools(), ["subagent_create", "other-active"]);
+	assert.ok(host.tools.has("other-inactive"), "inactive tools from other extensions remain registered");
+	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, setCallsBeforeShutdown + 1);
+	await withFakePiEnvironment(fake, () => host.emit("session_shutdown", { reason: "quit" }));
+	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, setCallsBeforeShutdown + 1);
+	await waitFor(() => { try { process.kill(invocation.pid, 0); return undefined; } catch { return true; } }, "shutdown active-tools child exit");
+	await waitFor(() => !existsSync(dirname(getOption(invocation.argv, "--extension")!)) ? true : undefined, "shutdown active-tools extension cleanup");
+
+	const emptyFake = createFakePi({ events: [] });
+	t.after(() => emptyFake.cleanup());
+	const emptyExtension = await loadSubagentWidget();
+	const emptyHost = createFakeHost(emptyExtension, emptyFake.cwd);
+	emptyHost.registerTool({ name: "other-active", description: "Active extension tool", parameters: {} });
+	emptyHost.registerTool({ name: "other-inactive", description: "Inactive extension tool", parameters: {}, defaultActive: false });
+	emptyHost.setActiveTools(["subagent_create", "other-active"]);
+	const setCallsBeforeEmptyShutdown = emptyHost.activeToolCalls.filter(call => call.method === "setActiveTools").length;
+	await withFakePiEnvironment(emptyFake, () => emptyHost.emit("session_shutdown", { reason: "quit" }));
+	await withFakePiEnvironment(emptyFake, () => emptyHost.emit("session_shutdown", { reason: "quit" }));
+	assert.deepEqual(emptyHost.getActiveTools(), ["subagent_create", "other-active"]);
+	assert.equal(emptyHost.activeToolCalls.filter(call => call.method === "setActiveTools").length, setCallsBeforeEmptyShutdown);
+});
+
 test("remove paths delete only removed session files and clear does not reuse a session path", async t => {
 	const fake = createFakePi({ events: [], delayMs: 30000 });
 	t.after(() => fake.cleanup());
@@ -1648,10 +1685,10 @@ test("management tools are active only while subagents exist and preserve the ho
 	assert.match(host.tools.get("subagent_continue").parameters.properties.writeAccess.description, /turn only/i);
 
 	host.setActiveTools(["subagent_create", "other-active"]);
-	await host.emit("session_start", { reason: "startup" });
+	await withFakePiEnvironment(fake, () => host.emit("session_start", { reason: "startup" }));
 	assert.deepEqual(host.getActiveTools(), ["subagent_create", "other-active"]);
 	const callsBeforeNoopStart = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
-	await host.emit("session_start", { reason: "reload" });
+	await withFakePiEnvironment(fake, () => host.emit("session_start", { reason: "reload" }));
 	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, callsBeforeNoopStart);
 
 	// A synchronous launch failure still leaves an error subagent, so it activates management tools.
@@ -1704,7 +1741,7 @@ test("a new session resets management tools even when a subagent existed", async
 	assert.equal(host.widgets.has("subagents"), true);
 	assert.ok(managementTools.every(name => host.getActiveTools().includes(name)));
 	const callsBeforeReset = host.activeToolCalls.filter(call => call.method === "setActiveTools").length;
-	await host.emit("session_start", { reason: "new" });
+	await withFakePiEnvironment(fake, () => host.emit("session_start", { reason: "new" }));
 	assert.equal(host.widgets.has("subagents"), false, "session_start clears the combined widget");
 	assert.deepEqual(host.getActiveTools(), ["subagent_create", "extension-tool", ...managementTools, "late-session-tool"]);
 	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, callsBeforeReset);

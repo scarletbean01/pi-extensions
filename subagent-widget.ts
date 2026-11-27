@@ -1387,6 +1387,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		lifecycleGeneration++;
 		const stopping = Array.from(agents.values()).map(state => cancelSubagent(state));
 		agents.clear();
+		syncManagementTools();
 		pendingResults = [];
 		clearWidget(ctx);
 		// A SIGTERM-ignoring child delays quit through the grace period; descendants holding stdio cannot delay it indefinitely.
