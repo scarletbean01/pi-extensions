@@ -1,0 +1,1626 @@
+{
+  "a. Send wrapping and reach": {},
+  "b. OSC 7501 status reports": {
+    "capabilityQueries": {
+      "query BEL": {
+        "wire": {
+          "hex": "1b5d373530313b3f07",
+          "utf8": "\u001b]7501;?\u0007"
+        },
+        "reply": {
+          "hex": "1b5d373530313b3f3a7374617465733d69646c652c776f726b696e672c646f6e652c626c6f636b65642c6572726f723a6b696e64733d7065726d697373696f6e2c7175657374696f6e2c6175746807",
+          "utf8": "\u001b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\u0007"
+        }
+      },
+      "query ST": {
+        "wire": {
+          "hex": "1b5d373530313b3f1b5c",
+          "utf8": "\u001b]7501;?\u001b\\"
+        },
+        "reply": {
+          "hex": "1b5d373530313b3f3a7374617465733d69646c652c776f726b696e672c646f6e652c626c6f636b65642c6572726f723a6b696e64733d7065726d697373696f6e2c7175657374696f6e2c617574681b5c",
+          "utf8": "\u001b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\u001b\\"
+        }
+      },
+      "query-with-caps BEL": {
+        "wire": {
+          "hex": "1b5d373530313b3f3a7374617465733d69646c652c776f726b696e672c646f6e652c626c6f636b65642c6572726f723a6b696e64733d7065726d697373696f6e2c7175657374696f6e2c6175746807",
+          "utf8": "\u001b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\u0007"
+        },
+        "reply": {
+          "hex": "",
+          "utf8": ""
+        }
+      },
+      "query-with-caps ST": {
+        "wire": {
+          "hex": "1b5d373530313b3f3a7374617465733d69646c652c776f726b696e672c646f6e652c626c6f636b65642c6572726f723a6b696e64733d7065726d697373696f6e2c7175657374696f6e2c617574681b5c",
+          "utf8": "\u001b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\u001b\\"
+        },
+        "reply": {
+          "hex": "",
+          "utf8": ""
+        }
+      }
+    },
+    "candidateAttempts": {
+      "colon-kv-state ST": {
+        "wire": {
+          "hex": "1b5d373530313b73746174653d776f726b696e671b5c",
+          "utf8": "\u001b]7501;state=working\u001b\\"
+        },
+        "get": {
+          "address": "t1",
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cols": 200,
+          "created_ms": 1795732533549,
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "die_with_parent": false,
+          "exit_code": null,
+          "finished_ms": null,
+          "foreground": {
+            "argv": [
+              "/usr/bin/node",
+              "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+              "status",
+              "read"
+            ],
+            "cwd": "/tmp/bootstrap-hc-dHU55m",
+            "name": "node-MainThread",
+            "pid": 511234
+          },
+          "identity": "ghostty",
+          "keep": false,
+          "labels": {},
+          "name": "status",
+          "notify": false,
+          "parent": null,
+          "pid": 511234,
+          "reason": null,
+          "reported": true,
+          "rm": false,
+          "rows": 120,
+          "screen": "exact",
+          "signal": null,
+          "state": "live",
+          "status": {
+            "state": "working"
+          },
+          "status_ms": 1795732534459,
+          "template": null,
+          "title": "",
+          "turn": 0
+        },
+        "ls": {
+          "code": 0,
+          "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+          "stderr": "",
+          "timedOut": false
+        },
+        "accepted": true,
+        "acceptedAny": true
+      }
+    },
+    "acceptedCandidate": "colon-kv-state ST",
+    "coreLog": {
+      "files": [
+        "/tmp/bootstrap-hc-dHU55m/state/herdr-core/bootstrap-hc-dHU55m/core.log"
+      ],
+      "tail": [],
+      "osc7501Lines": []
+    },
+    "idle": {
+      "wire": {
+        "hex": "1b5d373530313b73746174653d69646c653a6170703d7370696b653a6d73673d706c61696e3a7469746c653d5370696b651b5c",
+        "utf8": "\u001b]7501;state=idle:app=spike:msg=plain:title=Spike\u001b\\"
+      },
+      "get": {
+        "address": "t1",
+        "argv": [
+          "/usr/bin/node",
+          "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+          "status",
+          "read"
+        ],
+        "cols": 200,
+        "created_ms": 1795732533549,
+        "cwd": "/tmp/bootstrap-hc-dHU55m",
+        "die_with_parent": false,
+        "exit_code": null,
+        "finished_ms": null,
+        "foreground": {
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "name": "node-MainThread",
+          "pid": 511234
+        },
+        "identity": "ghostty",
+        "keep": false,
+        "labels": {},
+        "name": "status",
+        "notify": false,
+        "parent": null,
+        "pid": 511234,
+        "reason": null,
+        "reported": true,
+        "rm": false,
+        "rows": 120,
+        "screen": "exact",
+        "signal": null,
+        "state": "live",
+        "status": {
+          "state": "working"
+        },
+        "status_ms": 1795732534459,
+        "template": null,
+        "title": "",
+        "turn": 0
+      },
+      "ls": {
+        "code": 0,
+        "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+        "stderr": "",
+        "timedOut": false
+      },
+      "accepted": false,
+      "acceptedAny": true
+    },
+    "working": {
+      "wire": {
+        "hex": "1b5d373530313b73746174653d776f726b696e673a6170703d7370696b653a70726f67726573733d33373a6d73673d706c61696e3a7469746c653d5370696b651b5c",
+        "utf8": "\u001b]7501;state=working:app=spike:progress=37:msg=plain:title=Spike\u001b\\"
+      },
+      "get": {
+        "address": "t1",
+        "argv": [
+          "/usr/bin/node",
+          "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+          "status",
+          "read"
+        ],
+        "cols": 200,
+        "created_ms": 1795732533549,
+        "cwd": "/tmp/bootstrap-hc-dHU55m",
+        "die_with_parent": false,
+        "exit_code": null,
+        "finished_ms": null,
+        "foreground": {
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "name": "node-MainThread",
+          "pid": 511234
+        },
+        "identity": "ghostty",
+        "keep": false,
+        "labels": {},
+        "name": "status",
+        "notify": false,
+        "parent": null,
+        "pid": 511234,
+        "reason": null,
+        "reported": true,
+        "rm": false,
+        "rows": 120,
+        "screen": "exact",
+        "signal": null,
+        "state": "live",
+        "status": {
+          "state": "working"
+        },
+        "status_ms": 1795732534459,
+        "template": null,
+        "title": "",
+        "turn": 0
+      },
+      "ls": {
+        "code": 0,
+        "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+        "stderr": "",
+        "timedOut": false
+      },
+      "accepted": true,
+      "acceptedAny": true
+    },
+    "done": {
+      "wire": {
+        "hex": "1b5d373530313b73746174653d646f6e653a6170703d7370696b653a6d73673d706c61696e3a7469746c653d5370696b651b5c",
+        "utf8": "\u001b]7501;state=done:app=spike:msg=plain:title=Spike\u001b\\"
+      },
+      "get": {
+        "address": "t1",
+        "argv": [
+          "/usr/bin/node",
+          "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+          "status",
+          "read"
+        ],
+        "cols": 200,
+        "created_ms": 1795732533549,
+        "cwd": "/tmp/bootstrap-hc-dHU55m",
+        "die_with_parent": false,
+        "exit_code": null,
+        "finished_ms": null,
+        "foreground": {
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "name": "node-MainThread",
+          "pid": 511234
+        },
+        "identity": "ghostty",
+        "keep": false,
+        "labels": {},
+        "name": "status",
+        "notify": false,
+        "parent": null,
+        "pid": 511234,
+        "reason": null,
+        "reported": true,
+        "rm": false,
+        "rows": 120,
+        "screen": "exact",
+        "signal": null,
+        "state": "live",
+        "status": {
+          "state": "working"
+        },
+        "status_ms": 1795732534459,
+        "template": null,
+        "title": "",
+        "turn": 0
+      },
+      "ls": {
+        "code": 0,
+        "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+        "stderr": "",
+        "timedOut": false
+      },
+      "accepted": false,
+      "acceptedAny": true
+    },
+    "error": {
+      "wire": {
+        "hex": "1b5d373530313b73746174653d6572726f723a6170703d7370696b653a6d73673d706c61696e3a7469746c653d5370696b651b5c",
+        "utf8": "\u001b]7501;state=error:app=spike:msg=plain:title=Spike\u001b\\"
+      },
+      "get": {
+        "address": "t1",
+        "argv": [
+          "/usr/bin/node",
+          "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+          "status",
+          "read"
+        ],
+        "cols": 200,
+        "created_ms": 1795732533549,
+        "cwd": "/tmp/bootstrap-hc-dHU55m",
+        "die_with_parent": false,
+        "exit_code": null,
+        "finished_ms": null,
+        "foreground": {
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "name": "node-MainThread",
+          "pid": 511234
+        },
+        "identity": "ghostty",
+        "keep": false,
+        "labels": {},
+        "name": "status",
+        "notify": false,
+        "parent": null,
+        "pid": 511234,
+        "reason": null,
+        "reported": true,
+        "rm": false,
+        "rows": 120,
+        "screen": "exact",
+        "signal": null,
+        "state": "live",
+        "status": {
+          "state": "working"
+        },
+        "status_ms": 1795732534459,
+        "template": null,
+        "title": "",
+        "turn": 0
+      },
+      "ls": {
+        "code": 0,
+        "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+        "stderr": "",
+        "timedOut": false
+      },
+      "accepted": false,
+      "acceptedAny": true
+    },
+    "blocked": {
+      "wire": {
+        "hex": "1b5d373530313b73746174653d626c6f636b65643a6170703d7370696b653a6b696e643d7065726d697373696f6e3a70726f67726573733d33373a6d73673d706c61696e3a7469746c653d5370696b651b5c",
+        "utf8": "\u001b]7501;state=blocked:app=spike:kind=permission:progress=37:msg=plain:title=Spike\u001b\\"
+      },
+      "get": {
+        "address": "t1",
+        "argv": [
+          "/usr/bin/node",
+          "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+          "status",
+          "read"
+        ],
+        "cols": 200,
+        "created_ms": 1795732533549,
+        "cwd": "/tmp/bootstrap-hc-dHU55m",
+        "die_with_parent": false,
+        "exit_code": null,
+        "finished_ms": null,
+        "foreground": {
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "name": "node-MainThread",
+          "pid": 511234
+        },
+        "identity": "ghostty",
+        "keep": false,
+        "labels": {},
+        "name": "status",
+        "notify": false,
+        "parent": null,
+        "pid": 511234,
+        "reason": null,
+        "reported": true,
+        "rm": false,
+        "rows": 120,
+        "screen": "exact",
+        "signal": null,
+        "state": "live",
+        "status": {
+          "state": "working"
+        },
+        "status_ms": 1795732534459,
+        "template": null,
+        "title": "",
+        "turn": 0
+      },
+      "ls": {
+        "code": 0,
+        "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+        "stderr": "",
+        "timedOut": false
+      },
+      "accepted": false,
+      "acceptedAny": true
+    },
+    "blockedKinds": {
+      "permission": {
+        "wire": {
+          "hex": "1b5d373530313b73746174653d626c6f636b65643a6170703d7370696b653a6b696e643d7065726d697373696f6e3a70726f67726573733d35303a6d73673d706c61696e3a7469746c653d5370696b651b5c",
+          "utf8": "\u001b]7501;state=blocked:app=spike:kind=permission:progress=50:msg=plain:title=Spike\u001b\\"
+        },
+        "get": {
+          "address": "t1",
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cols": 200,
+          "created_ms": 1795732533549,
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "die_with_parent": false,
+          "exit_code": null,
+          "finished_ms": null,
+          "foreground": {
+            "argv": [
+              "/usr/bin/node",
+              "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+              "status",
+              "read"
+            ],
+            "cwd": "/tmp/bootstrap-hc-dHU55m",
+            "name": "node-MainThread",
+            "pid": 511234
+          },
+          "identity": "ghostty",
+          "keep": false,
+          "labels": {},
+          "name": "status",
+          "notify": false,
+          "parent": null,
+          "pid": 511234,
+          "reason": null,
+          "reported": true,
+          "rm": false,
+          "rows": 120,
+          "screen": "exact",
+          "signal": null,
+          "state": "live",
+          "status": {
+            "state": "working"
+          },
+          "status_ms": 1795732534459,
+          "template": null,
+          "title": "",
+          "turn": 0
+        },
+        "ls": {
+          "code": 0,
+          "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+          "stderr": "",
+          "timedOut": false
+        },
+        "accepted": false,
+        "acceptedAny": true
+      },
+      "question": {
+        "wire": {
+          "hex": "1b5d373530313b73746174653d626c6f636b65643a6170703d7370696b653a6b696e643d7175657374696f6e3a70726f67726573733d35303a6d73673d706c61696e3a7469746c653d5370696b651b5c",
+          "utf8": "\u001b]7501;state=blocked:app=spike:kind=question:progress=50:msg=plain:title=Spike\u001b\\"
+        },
+        "get": {
+          "address": "t1",
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cols": 200,
+          "created_ms": 1795732533549,
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "die_with_parent": false,
+          "exit_code": null,
+          "finished_ms": null,
+          "foreground": {
+            "argv": [
+              "/usr/bin/node",
+              "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+              "status",
+              "read"
+            ],
+            "cwd": "/tmp/bootstrap-hc-dHU55m",
+            "name": "node-MainThread",
+            "pid": 511234
+          },
+          "identity": "ghostty",
+          "keep": false,
+          "labels": {},
+          "name": "status",
+          "notify": false,
+          "parent": null,
+          "pid": 511234,
+          "reason": null,
+          "reported": true,
+          "rm": false,
+          "rows": 120,
+          "screen": "exact",
+          "signal": null,
+          "state": "live",
+          "status": {
+            "state": "working"
+          },
+          "status_ms": 1795732534459,
+          "template": null,
+          "title": "",
+          "turn": 0
+        },
+        "ls": {
+          "code": 0,
+          "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+          "stderr": "",
+          "timedOut": false
+        },
+        "accepted": false,
+        "acceptedAny": true
+      },
+      "auth": {
+        "wire": {
+          "hex": "1b5d373530313b73746174653d626c6f636b65643a6170703d7370696b653a6b696e643d617574683a70726f67726573733d35303a6d73673d706c61696e3a7469746c653d5370696b651b5c",
+          "utf8": "\u001b]7501;state=blocked:app=spike:kind=auth:progress=50:msg=plain:title=Spike\u001b\\"
+        },
+        "get": {
+          "address": "t1",
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cols": 200,
+          "created_ms": 1795732533549,
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "die_with_parent": false,
+          "exit_code": null,
+          "finished_ms": null,
+          "foreground": {
+            "argv": [
+              "/usr/bin/node",
+              "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+              "status",
+              "read"
+            ],
+            "cwd": "/tmp/bootstrap-hc-dHU55m",
+            "name": "node-MainThread",
+            "pid": 511234
+          },
+          "identity": "ghostty",
+          "keep": false,
+          "labels": {},
+          "name": "status",
+          "notify": false,
+          "parent": null,
+          "pid": 511234,
+          "reason": null,
+          "reported": true,
+          "rm": false,
+          "rows": 120,
+          "screen": "exact",
+          "signal": null,
+          "state": "live",
+          "status": {
+            "state": "working"
+          },
+          "status_ms": 1795732534459,
+          "template": null,
+          "title": "",
+          "turn": 0
+        },
+        "ls": {
+          "code": 0,
+          "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+          "stderr": "",
+          "timedOut": false
+        },
+        "accepted": false,
+        "acceptedAny": true
+      }
+    },
+    "progressProbes": {
+      "working-0": {
+        "wire": {
+          "hex": "1b5d373530313b73746174653d776f726b696e673a6170703d7370696b653a70726f67726573733d303a6d73673d706c61696e3a7469746c653d5370696b651b5c",
+          "utf8": "\u001b]7501;state=working:app=spike:progress=0:msg=plain:title=Spike\u001b\\"
+        },
+        "get": {
+          "address": "t1",
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cols": 200,
+          "created_ms": 1795732533549,
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "die_with_parent": false,
+          "exit_code": null,
+          "finished_ms": null,
+          "foreground": {
+            "argv": [
+              "/usr/bin/node",
+              "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+              "status",
+              "read"
+            ],
+            "cwd": "/tmp/bootstrap-hc-dHU55m",
+            "name": "node-MainThread",
+            "pid": 511234
+          },
+          "identity": "ghostty",
+          "keep": false,
+          "labels": {},
+          "name": "status",
+          "notify": false,
+          "parent": null,
+          "pid": 511234,
+          "reason": null,
+          "reported": true,
+          "rm": false,
+          "rows": 120,
+          "screen": "exact",
+          "signal": null,
+          "state": "live",
+          "status": {
+            "state": "working"
+          },
+          "status_ms": 1795732534459,
+          "template": null,
+          "title": "",
+          "turn": 0
+        },
+        "ls": {
+          "code": 0,
+          "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+          "stderr": "",
+          "timedOut": false
+        },
+        "accepted": true,
+        "acceptedAny": true
+      },
+      "working-50": {
+        "wire": {
+          "hex": "1b5d373530313b73746174653d776f726b696e673a6170703d7370696b653a70726f67726573733d35303a6d73673d706c61696e3a7469746c653d5370696b651b5c",
+          "utf8": "\u001b]7501;state=working:app=spike:progress=50:msg=plain:title=Spike\u001b\\"
+        },
+        "get": {
+          "address": "t1",
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cols": 200,
+          "created_ms": 1795732533549,
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "die_with_parent": false,
+          "exit_code": null,
+          "finished_ms": null,
+          "foreground": {
+            "argv": [
+              "/usr/bin/node",
+              "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+              "status",
+              "read"
+            ],
+            "cwd": "/tmp/bootstrap-hc-dHU55m",
+            "name": "node-MainThread",
+            "pid": 511234
+          },
+          "identity": "ghostty",
+          "keep": false,
+          "labels": {},
+          "name": "status",
+          "notify": false,
+          "parent": null,
+          "pid": 511234,
+          "reason": null,
+          "reported": true,
+          "rm": false,
+          "rows": 120,
+          "screen": "exact",
+          "signal": null,
+          "state": "live",
+          "status": {
+            "state": "working"
+          },
+          "status_ms": 1795732534459,
+          "template": null,
+          "title": "",
+          "turn": 0
+        },
+        "ls": {
+          "code": 0,
+          "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+          "stderr": "",
+          "timedOut": false
+        },
+        "accepted": true,
+        "acceptedAny": true
+      },
+      "working-100": {
+        "wire": {
+          "hex": "1b5d373530313b73746174653d776f726b696e673a6170703d7370696b653a70726f67726573733d3130303a6d73673d706c61696e3a7469746c653d5370696b651b5c",
+          "utf8": "\u001b]7501;state=working:app=spike:progress=100:msg=plain:title=Spike\u001b\\"
+        },
+        "get": {
+          "address": "t1",
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cols": 200,
+          "created_ms": 1795732533549,
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "die_with_parent": false,
+          "exit_code": null,
+          "finished_ms": null,
+          "foreground": {
+            "argv": [
+              "/usr/bin/node",
+              "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+              "status",
+              "read"
+            ],
+            "cwd": "/tmp/bootstrap-hc-dHU55m",
+            "name": "node-MainThread",
+            "pid": 511234
+          },
+          "identity": "ghostty",
+          "keep": false,
+          "labels": {},
+          "name": "status",
+          "notify": false,
+          "parent": null,
+          "pid": 511234,
+          "reason": null,
+          "reported": true,
+          "rm": false,
+          "rows": 120,
+          "screen": "exact",
+          "signal": null,
+          "state": "live",
+          "status": {
+            "state": "working"
+          },
+          "status_ms": 1795732534459,
+          "template": null,
+          "title": "",
+          "turn": 0
+        },
+        "ls": {
+          "code": 0,
+          "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+          "stderr": "",
+          "timedOut": false
+        },
+        "accepted": true,
+        "acceptedAny": true
+      }
+    },
+    "escaping ascii": {
+      "wire": {
+        "hex": "1b5d373530313b73746174653d69646c653a6170703d7370696b653a6d73673d706c61696e2d61736369693a7469746c653d5370696b651b5c",
+        "utf8": "\u001b]7501;state=idle:app=spike:msg=plain-ascii:title=Spike\u001b\\"
+      },
+      "get": {
+        "address": "t1",
+        "argv": [
+          "/usr/bin/node",
+          "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+          "status",
+          "read"
+        ],
+        "cols": 200,
+        "created_ms": 1795732533549,
+        "cwd": "/tmp/bootstrap-hc-dHU55m",
+        "die_with_parent": false,
+        "exit_code": null,
+        "finished_ms": null,
+        "foreground": {
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "name": "node-MainThread",
+          "pid": 511234
+        },
+        "identity": "ghostty",
+        "keep": false,
+        "labels": {},
+        "name": "status",
+        "notify": false,
+        "parent": null,
+        "pid": 511234,
+        "reason": null,
+        "reported": true,
+        "rm": false,
+        "rows": 120,
+        "screen": "exact",
+        "signal": null,
+        "state": "live",
+        "status": {
+          "state": "working"
+        },
+        "status_ms": 1795732534459,
+        "template": null,
+        "title": "",
+        "turn": 0
+      },
+      "ls": {
+        "code": 0,
+        "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+        "stderr": "",
+        "timedOut": false
+      },
+      "accepted": false,
+      "acceptedAny": true
+    },
+    "escaping spaces": {
+      "wire": {
+        "hex": "1b5d373530313b73746174653d776f726b696e673a6170703d7370696b653a70726f67726573733d33373a6d73673d706c61696e206d6573736167653a7469746c653d5370696b651b5c",
+        "utf8": "\u001b]7501;state=working:app=spike:progress=37:msg=plain message:title=Spike\u001b\\"
+      },
+      "get": {
+        "address": "t1",
+        "argv": [
+          "/usr/bin/node",
+          "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+          "status",
+          "read"
+        ],
+        "cols": 200,
+        "created_ms": 1795732533549,
+        "cwd": "/tmp/bootstrap-hc-dHU55m",
+        "die_with_parent": false,
+        "exit_code": null,
+        "finished_ms": null,
+        "foreground": {
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "name": "node-MainThread",
+          "pid": 511234
+        },
+        "identity": "ghostty",
+        "keep": false,
+        "labels": {},
+        "name": "status",
+        "notify": false,
+        "parent": null,
+        "pid": 511234,
+        "reason": null,
+        "reported": true,
+        "rm": false,
+        "rows": 120,
+        "screen": "exact",
+        "signal": null,
+        "state": "live",
+        "status": {
+          "state": "working"
+        },
+        "status_ms": 1795732534459,
+        "template": null,
+        "title": "",
+        "turn": 0
+      },
+      "ls": {
+        "code": 0,
+        "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+        "stderr": "",
+        "timedOut": false
+      },
+      "accepted": true,
+      "acceptedAny": true
+    },
+    "escaping colon": {
+      "wire": {
+        "hex": "1b5d373530313b73746174653d69646c653a6170703d7370696b653a6d73673d737465703a2064657461696c3a7469746c653d5370696b651b5c",
+        "utf8": "\u001b]7501;state=idle:app=spike:msg=step: detail:title=Spike\u001b\\"
+      },
+      "get": {
+        "address": "t1",
+        "argv": [
+          "/usr/bin/node",
+          "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+          "status",
+          "read"
+        ],
+        "cols": 200,
+        "created_ms": 1795732533549,
+        "cwd": "/tmp/bootstrap-hc-dHU55m",
+        "die_with_parent": false,
+        "exit_code": null,
+        "finished_ms": null,
+        "foreground": {
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "name": "node-MainThread",
+          "pid": 511234
+        },
+        "identity": "ghostty",
+        "keep": false,
+        "labels": {},
+        "name": "status",
+        "notify": false,
+        "parent": null,
+        "pid": 511234,
+        "reason": null,
+        "reported": true,
+        "rm": false,
+        "rows": 120,
+        "screen": "exact",
+        "signal": null,
+        "state": "live",
+        "status": {
+          "state": "working"
+        },
+        "status_ms": 1795732534459,
+        "template": null,
+        "title": "",
+        "turn": 0
+      },
+      "ls": {
+        "code": 0,
+        "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+        "stderr": "",
+        "timedOut": false
+      },
+      "accepted": false,
+      "acceptedAny": true
+    },
+    "escaping unicode": {
+      "wire": {
+        "hex": "1b5d373530313b73746174653d776f726b696e673a6170703d7370696b653a70726f67726573733d33373a6d73673d636166c3a920e29c9320e2809420746573743a7469746c653d5370696b651b5c",
+        "utf8": "\u001b]7501;state=working:app=spike:progress=37:msg=café ✓ — test:title=Spike\u001b\\"
+      },
+      "get": {
+        "address": "t1",
+        "argv": [
+          "/usr/bin/node",
+          "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+          "status",
+          "read"
+        ],
+        "cols": 200,
+        "created_ms": 1795732533549,
+        "cwd": "/tmp/bootstrap-hc-dHU55m",
+        "die_with_parent": false,
+        "exit_code": null,
+        "finished_ms": null,
+        "foreground": {
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "name": "node-MainThread",
+          "pid": 511234
+        },
+        "identity": "ghostty",
+        "keep": false,
+        "labels": {},
+        "name": "status",
+        "notify": false,
+        "parent": null,
+        "pid": 511234,
+        "reason": null,
+        "reported": true,
+        "rm": false,
+        "rows": 120,
+        "screen": "exact",
+        "signal": null,
+        "state": "live",
+        "status": {
+          "state": "working"
+        },
+        "status_ms": 1795732534459,
+        "template": null,
+        "title": "",
+        "turn": 0
+      },
+      "ls": {
+        "code": 0,
+        "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+        "stderr": "",
+        "timedOut": false
+      },
+      "accepted": true,
+      "acceptedAny": true
+    },
+    "escaping literal": {
+      "wire": {
+        "hex": "1b5d373530313b73746174653d69646c653a6170703d7370696b653a6d73673d73656d693b20636f6c6f6e3a20657175616c733d2070657263656e74252071756f74652220736c6173685c20636166c3a93a7469746c653d5370696b651b5c",
+        "utf8": "\u001b]7501;state=idle:app=spike:msg=semi; colon: equals= percent% quote\" slash\\ café:title=Spike\u001b\\"
+      },
+      "get": {
+        "address": "t1",
+        "argv": [
+          "/usr/bin/node",
+          "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+          "status",
+          "read"
+        ],
+        "cols": 200,
+        "created_ms": 1795732533549,
+        "cwd": "/tmp/bootstrap-hc-dHU55m",
+        "die_with_parent": false,
+        "exit_code": null,
+        "finished_ms": null,
+        "foreground": {
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "name": "node-MainThread",
+          "pid": 511234
+        },
+        "identity": "ghostty",
+        "keep": false,
+        "labels": {},
+        "name": "status",
+        "notify": false,
+        "parent": null,
+        "pid": 511234,
+        "reason": null,
+        "reported": true,
+        "rm": false,
+        "rows": 120,
+        "screen": "exact",
+        "signal": null,
+        "state": "live",
+        "status": {
+          "state": "working"
+        },
+        "status_ms": 1795732534459,
+        "template": null,
+        "title": "",
+        "turn": 0
+      },
+      "ls": {
+        "code": 0,
+        "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+        "stderr": "",
+        "timedOut": false
+      },
+      "accepted": false,
+      "acceptedAny": true
+    },
+    "escaping percent-encoded": {
+      "wire": {
+        "hex": "1b5d373530313b73746174653d776f726b696e673a6170703d7370696b653a70726f67726573733d33373a6d73673d73656d69253342253230636f6c6f6e253341253230657175616c7325334425323070657263656e7425323525323071756f7465253232253230736c6173682535432532306361662543332541393a7469746c653d5370696b651b5c",
+        "utf8": "\u001b]7501;state=working:app=spike:progress=37:msg=semi%3B%20colon%3A%20equals%3D%20percent%25%20quote%22%20slash%5C%20caf%C3%A9:title=Spike\u001b\\"
+      },
+      "get": {
+        "address": "t1",
+        "argv": [
+          "/usr/bin/node",
+          "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+          "status",
+          "read"
+        ],
+        "cols": 200,
+        "created_ms": 1795732533549,
+        "cwd": "/tmp/bootstrap-hc-dHU55m",
+        "die_with_parent": false,
+        "exit_code": null,
+        "finished_ms": null,
+        "foreground": {
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "name": "node-MainThread",
+          "pid": 511234
+        },
+        "identity": "ghostty",
+        "keep": false,
+        "labels": {},
+        "name": "status",
+        "notify": false,
+        "parent": null,
+        "pid": 511234,
+        "reason": null,
+        "reported": true,
+        "rm": false,
+        "rows": 120,
+        "screen": "exact",
+        "signal": null,
+        "state": "live",
+        "status": {
+          "state": "working"
+        },
+        "status_ms": 1795732534459,
+        "template": null,
+        "title": "",
+        "turn": 0
+      },
+      "ls": {
+        "code": 0,
+        "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+        "stderr": "",
+        "timedOut": false
+      },
+      "accepted": true,
+      "acceptedAny": true
+    },
+    "escaping colon-safe": {
+      "wire": {
+        "hex": "1b5d373530313b73746174653d69646c653a6170703d7370696b653a6d73673d73656d693b20657175616c733d2070657263656e74252071756f74652220736c6173685c20636166c3a93a7469746c653d5370696b651b5c",
+        "utf8": "\u001b]7501;state=idle:app=spike:msg=semi; equals= percent% quote\" slash\\ café:title=Spike\u001b\\"
+      },
+      "get": {
+        "address": "t1",
+        "argv": [
+          "/usr/bin/node",
+          "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+          "status",
+          "read"
+        ],
+        "cols": 200,
+        "created_ms": 1795732533549,
+        "cwd": "/tmp/bootstrap-hc-dHU55m",
+        "die_with_parent": false,
+        "exit_code": null,
+        "finished_ms": null,
+        "foreground": {
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "name": "node-MainThread",
+          "pid": 511234
+        },
+        "identity": "ghostty",
+        "keep": false,
+        "labels": {},
+        "name": "status",
+        "notify": false,
+        "parent": null,
+        "pid": 511234,
+        "reason": null,
+        "reported": true,
+        "rm": false,
+        "rows": 120,
+        "screen": "exact",
+        "signal": null,
+        "state": "live",
+        "status": {
+          "state": "working"
+        },
+        "status_ms": 1795732534459,
+        "template": null,
+        "title": "",
+        "turn": 0
+      },
+      "ls": {
+        "code": 0,
+        "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+        "stderr": "",
+        "timedOut": false
+      },
+      "accepted": false,
+      "acceptedAny": true
+    },
+    "recordsById": {
+      "state-first-id": {
+        "wire": {
+          "hex": "1b5d373530313b73746174653d776f726b696e673a69643d776f726b6572311b5c",
+          "utf8": "\u001b]7501;state=working:id=worker1\u001b\\"
+        },
+        "get": {
+          "address": "t1",
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cols": 200,
+          "created_ms": 1795732533549,
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "die_with_parent": false,
+          "exit_code": null,
+          "finished_ms": null,
+          "foreground": {
+            "argv": [
+              "/usr/bin/node",
+              "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+              "status",
+              "read"
+            ],
+            "cwd": "/tmp/bootstrap-hc-dHU55m",
+            "name": "node-MainThread",
+            "pid": 511234
+          },
+          "identity": "ghostty",
+          "keep": false,
+          "labels": {},
+          "name": "status",
+          "notify": false,
+          "parent": null,
+          "pid": 511234,
+          "reason": null,
+          "records": {
+            "worker1": {
+              "state": "working"
+            }
+          },
+          "reported": true,
+          "rm": false,
+          "rows": 120,
+          "screen": "exact",
+          "signal": null,
+          "state": "live",
+          "status": {
+            "state": "working"
+          },
+          "status_ms": 1795732534459,
+          "template": null,
+          "title": "",
+          "turn": 0
+        },
+        "ls": {
+          "code": 0,
+          "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+          "stderr": "",
+          "timedOut": false
+        },
+        "accepted": true,
+        "acceptedAny": true
+      },
+      "id-first-state": {
+        "wire": {
+          "hex": "1b5d373530313b69643d776f726b6572323a73746174653d776f726b696e671b5c",
+          "utf8": "\u001b]7501;id=worker2:state=working\u001b\\"
+        },
+        "get": {
+          "address": "t1",
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cols": 200,
+          "created_ms": 1795732533549,
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "die_with_parent": false,
+          "exit_code": null,
+          "finished_ms": null,
+          "foreground": {
+            "argv": [
+              "/usr/bin/node",
+              "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+              "status",
+              "read"
+            ],
+            "cwd": "/tmp/bootstrap-hc-dHU55m",
+            "name": "node-MainThread",
+            "pid": 511234
+          },
+          "identity": "ghostty",
+          "keep": false,
+          "labels": {},
+          "name": "status",
+          "notify": false,
+          "parent": null,
+          "pid": 511234,
+          "reason": null,
+          "records": {
+            "worker1": {
+              "state": "working"
+            },
+            "worker2": {
+              "state": "working"
+            }
+          },
+          "reported": true,
+          "rm": false,
+          "rows": 120,
+          "screen": "exact",
+          "signal": null,
+          "state": "live",
+          "status": {
+            "state": "working"
+          },
+          "status_ms": 1795732534459,
+          "template": null,
+          "title": "",
+          "turn": 0
+        },
+        "ls": {
+          "code": 0,
+          "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+          "stderr": "",
+          "timedOut": false
+        },
+        "accepted": true,
+        "acceptedAny": true
+      },
+      "positional-id": {
+        "wire": {
+          "hex": "1b5d373530313b776f726b6572333a73746174653d776f726b696e673a6d73673d7375627461736b1b5c",
+          "utf8": "\u001b]7501;worker3:state=working:msg=subtask\u001b\\"
+        },
+        "get": {
+          "address": "t1",
+          "argv": [
+            "/usr/bin/node",
+            "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+            "status",
+            "read"
+          ],
+          "cols": 200,
+          "created_ms": 1795732533549,
+          "cwd": "/tmp/bootstrap-hc-dHU55m",
+          "die_with_parent": false,
+          "exit_code": null,
+          "finished_ms": null,
+          "foreground": {
+            "argv": [
+              "/usr/bin/node",
+              "/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts",
+              "status",
+              "read"
+            ],
+            "cwd": "/tmp/bootstrap-hc-dHU55m",
+            "name": "node-MainThread",
+            "pid": 511234
+          },
+          "identity": "ghostty",
+          "keep": false,
+          "labels": {},
+          "name": "status",
+          "notify": false,
+          "parent": null,
+          "pid": 511234,
+          "reason": null,
+          "records": {
+            "worker1": {
+              "state": "working"
+            },
+            "worker2": {
+              "state": "working"
+            }
+          },
+          "reported": true,
+          "rm": false,
+          "rows": 120,
+          "screen": "exact",
+          "signal": null,
+          "state": "live",
+          "status": {
+            "state": "working"
+          },
+          "status_ms": 1795732534459,
+          "template": null,
+          "title": "",
+          "turn": 0
+        },
+        "ls": {
+          "code": 0,
+          "stdout": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"node\",\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"name\":\"status\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+          "stderr": "",
+          "timedOut": false
+        },
+        "accepted": false,
+        "acceptedAny": true
+      }
+    },
+    "failure": "AssertionError [ERR_ASSERTION]: hc must expose all five OSC status words\n+ actual - expected\n\n+ [\n+   'idle',\n+   'done',\n+   'error',\n+   'blocked'\n+ ]\n- []\n"
+  },
+  "c. Core isolation and teardown": {
+    "root": "/tmp/bootstrap-hc-dHU55m",
+    "env": {
+      "LANG": "en_US.UTF-8",
+      "HOME": "/tmp/bootstrap-hc-dHU55m/home",
+      "TMPDIR": "/tmp/bootstrap-hc-dHU55m/tmp",
+      "HC_SESSION": "bootstrap-hc-dHU55m",
+      "HC_SOCKET": "/tmp/bootstrap-hc-dHU55m/runtime/core.sock",
+      "XDG_CONFIG_HOME": "/tmp/bootstrap-hc-dHU55m/config",
+      "XDG_CACHE_HOME": "/tmp/bootstrap-hc-dHU55m/cache",
+      "XDG_DATA_HOME": "/tmp/bootstrap-hc-dHU55m/data",
+      "XDG_STATE_HOME": "/tmp/bootstrap-hc-dHU55m/state",
+      "XDG_RUNTIME_DIR": "/tmp/bootstrap-hc-dHU55m/runtime",
+      "PATH": "/tmp/bootstrap-hc-dHU55m/bin:/home/deplague/.local/bin:/usr/bin:/bin",
+      "SHELL": "/bin/sh",
+      "TERM": "xterm-256color"
+    },
+    "shimDir": "/tmp/bootstrap-hc-dHU55m/bin",
+    "shimLogPath": "/tmp/bootstrap-hc-dHU55m/shim-calls.log",
+    "stopCommand": "env -i HC_SESSION='bootstrap-hc-dHU55m' HC_SOCKET='/tmp/bootstrap-hc-dHU55m/runtime/core.sock' HOME='/tmp/bootstrap-hc-dHU55m/home' LANG='en_US.UTF-8' PATH='/tmp/bootstrap-hc-dHU55m/bin:/home/deplague/.local/bin:/usr/bin:/bin' SHELL='/bin/sh' TERM='xterm-256color' TMPDIR='/tmp/bootstrap-hc-dHU55m/tmp' XDG_CACHE_HOME='/tmp/bootstrap-hc-dHU55m/cache' XDG_CONFIG_HOME='/tmp/bootstrap-hc-dHU55m/config' XDG_DATA_HOME='/tmp/bootstrap-hc-dHU55m/data' XDG_RUNTIME_DIR='/tmp/bootstrap-hc-dHU55m/runtime' XDG_STATE_HOME='/tmp/bootstrap-hc-dHU55m/state' hc server stop --json",
+    "selectedQuestions": [
+      "b",
+      "h"
+    ],
+    "start": [
+      "server",
+      "start",
+      "--json"
+    ],
+    "stop": [
+      "server",
+      "stop",
+      "--json"
+    ],
+    "ownership": "Fresh Unix socket, inode, core id, systemd shims, /proc/<pid>/environ (allowing HC_RUNTIME=1) + /proc/<pid>/cgroup checks",
+    "terminalEnvs": {
+      "status": {
+        "COLORTERM": "truecolor",
+        "HC_SCOPE": "4893157-8457b3b584c207bd1c4891ba0ebf1806",
+        "HC_SESSION": "bootstrap-hc-dHU55m",
+        "HC_SOCKET": "/tmp/bootstrap-hc-dHU55m/runtime/core.sock",
+        "HC_TERMINAL_ID": "t1",
+        "HC_TERMINAL_SOCKET": "/tmp/bootstrap-hc-dHU55m/runtime/core.sock",
+        "HOME": "/tmp/bootstrap-hc-dHU55m/home",
+        "LANG": "en_US.UTF-8",
+        "PATH": "/tmp/bootstrap-hc-dHU55m/bin:/home/deplague/.local/bin:/usr/bin:/bin",
+        "SHELL": "/bin/sh",
+        "TERM": "xterm-256color",
+        "TERM_PROGRAM": "ghostty",
+        "TMPDIR": "/tmp/bootstrap-hc-dHU55m/tmp",
+        "XDG_CACHE_HOME": "/tmp/bootstrap-hc-dHU55m/cache",
+        "XDG_CONFIG_HOME": "/tmp/bootstrap-hc-dHU55m/config",
+        "XDG_DATA_HOME": "/tmp/bootstrap-hc-dHU55m/data",
+        "XDG_RUNTIME_DIR": "/tmp/bootstrap-hc-dHU55m/runtime",
+        "XDG_STATE_HOME": "/tmp/bootstrap-hc-dHU55m/state"
+      }
+    },
+    "startResult": {
+      "code": 0,
+      "stdout": "{\"core\":{\"id\":\"efe4909cc69d4dd7c25f4c1863187bc2\",\"name\":\"cachyos-x8664\"},\"finished\":0,\"holder\":null,\"holders\":[],\"installed_by\":null,\"keeps_running_after_logout\":null,\"live\":0,\"logout_linger_user\":null,\"pid\":511213,\"uptime_ms\":9,\"version\":\"0.1.22\"}\n",
+      "stderr": "",
+      "timedOut": false
+    },
+    "startPid": 511213,
+    "identity": {
+      "socket": "/tmp/bootstrap-hc-dHU55m/runtime/core.sock",
+      "device": 57,
+      "inode": 4846030,
+      "id": "efe4909cc69d4dd7c25f4c1863187bc2",
+      "pid": 511213
+    },
+    "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-ghostty-surface-transient-8460.scope",
+    "hasRuntimeMarker": true,
+    "observedCoreRuntimeEnv": "1",
+    "cleanup": [
+      {
+        "address": "t1",
+        "kill": {
+          "code": 0,
+          "stdout": "{\"address\":\"t1\",\"argv\":[\"/usr/bin/node\",\"/home/deplague/.cache/host-backends-work/integration/bootstrap/test-support/hc-live-terminal.ts\",\"status\",\"read\"],\"cols\":200,\"created_ms\":1795732533549,\"cwd\":\"/tmp/bootstrap-hc-dHU55m\",\"die_with_parent\":false,\"exit_code\":null,\"finished_ms\":1795732541697,\"identity\":\"ghostty\",\"keep\":false,\"labels\":{},\"name\":\"status\",\"notify\":false,\"parent\":null,\"pid\":511234,\"reason\":\"killed\",\"reported\":true,\"rm\":false,\"rows\":120,\"screen\":\"exact\",\"signal\":1,\"state\":\"finished\",\"status\":null,\"status_ms\":1795732541697,\"template\":null,\"title\":\"\",\"turn\":1}\n",
+          "stderr": "",
+          "timedOut": false
+        }
+      },
+      {
+        "address": "t1",
+        "rm": {
+          "code": 0,
+          "stdout": "{\"removed\":\"t1\"}\n",
+          "stderr": "",
+          "timedOut": false
+        }
+      },
+      {
+        "stopResult": {
+          "mode": "verified",
+          "stop": {
+            "code": 0,
+            "stdout": "{\"stopped\":true}\n",
+            "stderr": "",
+            "timedOut": false
+          },
+          "corePid": 511213,
+          "holderPids": [
+            511227
+          ],
+          "remainingCoreAlive": false,
+          "remainingHolderPids": [],
+          "socketRemaining": false,
+          "stopped": true
+        }
+      }
+    ],
+    "corePid": 511213,
+    "holderPids": [
+      511227
+    ],
+    "teardownPids": {
+      "mode": "verified",
+      "corePid": 511213,
+      "holderPids": [
+        511227
+      ],
+      "remainingCoreAlive": false,
+      "remainingHolderPids": [],
+      "socketRemaining": false
+    },
+    "coreLog": {
+      "files": [
+        "/tmp/bootstrap-hc-dHU55m/state/herdr-core/bootstrap-hc-dHU55m/core.log"
+      ],
+      "tail": [],
+      "osc7501Lines": []
+    },
+    "shimCalls": [],
+    "shimCallCount": 0
+  },
+  "d. Send before stdin is read": {},
+  "e. Label filtering, inspection, and RunResult": {},
+  "f. Name reuse": {},
+  "g. Server status shape": {
+    "startTopLevelKeys": [
+      "core",
+      "finished",
+      "holder",
+      "holders",
+      "installed_by",
+      "keeps_running_after_logout",
+      "live",
+      "logout_linger_user",
+      "pid",
+      "uptime_ms",
+      "version"
+    ],
+    "raw": {
+      "code": 0,
+      "stdout": "{\"core\":{\"id\":\"efe4909cc69d4dd7c25f4c1863187bc2\",\"name\":\"cachyos-x8664\"},\"finished\":0,\"holder\":null,\"holders\":[],\"installed_by\":null,\"keeps_running_after_logout\":null,\"live\":0,\"logout_linger_user\":null,\"pid\":511213,\"uptime_ms\":12,\"version\":\"0.1.22\"}\n",
+      "stderr": "",
+      "timedOut": false
+    },
+    "topLevelKeys": [
+      "core",
+      "finished",
+      "holder",
+      "holders",
+      "installed_by",
+      "keeps_running_after_logout",
+      "live",
+      "logout_linger_user",
+      "pid",
+      "uptime_ms",
+      "version"
+    ],
+    "coreKeys": [
+      "id",
+      "name"
+    ],
+    "expectedTopLevelKeys": [
+      "core",
+      "version",
+      "pid",
+      "uptime_ms",
+      "live",
+      "finished",
+      "holder",
+      "holders",
+      "installed_by",
+      "keeps_running_after_logout",
+      "logout_linger_user"
+    ],
+    "expectedCoreKeys": [
+      "id",
+      "name"
+    ],
+    "expectedKeysPresent": true,
+    "ticket03ProbeMatches": true
+  },
+  "h. Blocked send": {},
+  "i. Kill on an already-finished terminal": {}
+}
