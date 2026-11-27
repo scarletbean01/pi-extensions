@@ -429,22 +429,98 @@ export function buildRun4RecordByIdProbes(terminator: "\x1b\\" | "\x07" = "\x1b\
 	];
 }
 
+const PI_ST = "\x1b\\";
+
+interface PiProgramStatusSpec extends OscProbeSpec {
+	expectedApp?: string;
+	expectedKind?: string;
+	expectedMsg?: string | null;
+}
+
+const b64Utf8 = (message: string) => Buffer.from(message, "utf8").toString("base64");
+
+const PI_PROGRAM_STATUS_SPECS: readonly PiProgramStatusSpec[] = [
+	{
+		key: "blocked",
+		terminalName: "osc-pi-blocked",
+		wire: `\x1b]7501;state=blocked:app=pi:kind=auth:msg=${b64Utf8("Log in to x")}${PI_ST}`,
+		expectedState: "blocked",
+		expectedApp: "pi",
+		expectedKind: "auth",
+		expectedMsg: "Log in to x",
+	},
+	{
+		key: "blocked-permission",
+		terminalName: "osc-pi-blocked-permission",
+		wire: `\x1b]7501;state=blocked:app=pi:kind=permission:msg=${b64Utf8("Confirm action")}${PI_ST}`,
+		expectedState: "blocked",
+		expectedApp: "pi",
+		expectedKind: "permission",
+		expectedMsg: "Confirm action",
+	},
+	{
+		key: "blocked-question",
+		terminalName: "osc-pi-blocked-question",
+		wire: `\x1b]7501;state=blocked:app=pi:kind=question:msg=${b64Utf8("Choose an option")}${PI_ST}`,
+		expectedState: "blocked",
+		expectedApp: "pi",
+		expectedKind: "question",
+		expectedMsg: "Choose an option",
+	},
+	{
+		key: "working",
+		terminalName: "osc-pi-working",
+		wire: `\x1b]7501;state=working:app=pi:msg=${b64Utf8("Pi session")}${PI_ST}`,
+		expectedState: "working",
+		expectedApp: "pi",
+		expectedMsg: "Pi session",
+	},
+	{
+		key: "done",
+		terminalName: "osc-pi-done",
+		wire: `\x1b]7501;state=done:app=pi:msg=${b64Utf8("Pi session")}${PI_ST}`,
+		expectedState: "done",
+		expectedApp: "pi",
+		expectedMsg: "Pi session",
+	},
+	{
+		key: "error",
+		terminalName: "osc-pi-error",
+		wire: `\x1b]7501;state=error:app=pi:msg=${b64Utf8("Failed once")}${PI_ST}`,
+		expectedState: "error",
+		expectedApp: "pi",
+		expectedMsg: "Failed once",
+	},
+	{
+		key: "idle",
+		terminalName: "osc-pi-idle",
+		wire: `\x1b]7501;state=idle:app=pi${PI_ST}`,
+		expectedState: "idle",
+		expectedApp: "pi",
+		expectedMsg: null,
+	},
+	{
+		key: "clear",
+		terminalName: "osc-pi-clear",
+		wire: `\x1b]7501;state=clear${PI_ST}`,
+		expectedState: "clear",
+	},
+];
+
 /**
- * Pi 1.6.1's formatProgramStatus emits state, app, optional blocked kind, then
- * base64 msg; idle has no msg and TUI shutdown emits only state=clear. These
- * fixtures use messages without control characters so their exact wire bytes
- * match that formatter's output.
+ * Pi 1.6.1's formatProgramStatus emits state, app, blocked kind (when
+ * blocked), then base64 msg, always terminated with ST (ESC \). Idle has no
+ * msg and TUI shutdown emits only state=clear. These fixtures use messages
+ * without control characters so their exact wire bytes match that formatter's
+ * output.
  */
-export function buildPiProgramStatusProbes(terminator: "\x1b\\" | "\x07" = "\x1b\\"): OscProbeSpec[] {
-	const b64 = (message: string) => Buffer.from(message, "utf8").toString("base64");
-	return [
-		{ key: "blocked", terminalName: "osc-pi-blocked", wire: `\x1b]7501;state=blocked:app=pi:msg=${b64("Log in to x")}${terminator}`, expectedState: "blocked" },
-		{ key: "working", terminalName: "osc-pi-working", wire: `\x1b]7501;state=working:app=pi:msg=${b64("Pi session")}${terminator}`, expectedState: "working" },
-		{ key: "done", terminalName: "osc-pi-done", wire: `\x1b]7501;state=done:app=pi:msg=${b64("Pi session")}${terminator}`, expectedState: "done" },
-		{ key: "error", terminalName: "osc-pi-error", wire: `\x1b]7501;state=error:app=pi:msg=${b64("Failed once")}${terminator}`, expectedState: "error" },
-		{ key: "idle", terminalName: "osc-pi-idle", wire: `\x1b]7501;state=idle:app=pi${terminator}`, expectedState: "idle" },
-		{ key: "clear", terminalName: "osc-pi-clear", wire: `\x1b]7501;state=clear${terminator}`, expectedState: "clear" },
-	];
+export function buildPiProgramStatusProbes(): OscProbeSpec[] {
+	return PI_PROGRAM_STATUS_SPECS.map(({ key, terminalName, wire, expectedState }) => ({
+		key,
+		terminalName,
+		wire,
+		expectedState,
+	}));
 }
 
 export async function runIsolatedOscProbe(
@@ -614,7 +690,7 @@ export async function runOscProbeSuite(
 	for (const spec of buildRun4RecordByIdProbes(term)) {
 		recordsById[spec.key] = await runIsolatedOscProbe(ops, spec, options);
 	}
-	const piProgramStatus = await runPiProgramStatusProbeSuite(ops, { ...options, terminator: term });
+	const piProgramStatus = await runPiProgramStatusProbeSuite(ops, options);
 
 	return {
 		capabilityQueries,
@@ -631,10 +707,10 @@ export async function runOscProbeSuite(
 
 export async function runPiProgramStatusProbeSuite(
 	ops: OscProbeOps,
-	options: { pollMs?: number; intervalMs?: number; terminator?: "\x1b\\" | "\x07" } = {},
+	options: { pollMs?: number; intervalMs?: number } = {},
 ): Promise<Record<string, any>> {
 	const reports: Record<string, any> = {};
-	const specs = buildPiProgramStatusProbes(options.terminator);
+	const specs = buildPiProgramStatusProbes();
 	for (const spec of specs.filter(spec => spec.key !== "clear")) {
 		reports[spec.key] = await runIsolatedOscProbe(ops, spec, options);
 	}
@@ -659,10 +735,16 @@ export async function runPiProgramStatusProbeSuite(
 			get: () => ops.get(address),
 			isDone: terminal => terminal?.reported === true && (terminal?.status == null || terminal?.status?.state === "clear"),
 		});
+		const clearMatch: "null_status" | "state_clear" | null = cleared.after?.reported === true
+			? cleared.after?.status == null
+				? "null_status"
+				: cleared.after?.status?.state === "clear"
+					? "state_clear"
+					: null
+			: null;
 		const statusCleared = seed.after?.reported === true
 			&& seed.after?.status?.state === "idle"
-			&& cleared.after?.reported === true
-			&& (cleared.after?.status == null || cleared.after?.status?.state === "clear");
+			&& clearMatch !== null;
 		reports.clear = {
 			address,
 			terminalName: clearSpec.terminalName,
@@ -674,6 +756,7 @@ export async function runPiProgramStatusProbeSuite(
 			elapsedMs: cleared.elapsedMs,
 			statusChanged: JSON.stringify(seed.after?.status ?? null) !== JSON.stringify(cleared.after?.status ?? null),
 			accepted: statusCleared,
+			clearMatch,
 			acceptedAny: cleared.after?.reported === true,
 			representation: {
 				reported: cleared.after?.reported ?? null,
@@ -690,7 +773,7 @@ export async function runPiProgramStatusProbeSuite(
 			seedAccepted: seed.after?.reported === true && seed.after?.status?.state === "idle",
 		};
 	} catch (error) {
-		reports.clear = { terminalName: clearSpec.terminalName, wire: wireBytes(clearSpec.wire), accepted: false, error: String(error) };
+		reports.clear = { terminalName: clearSpec.terminalName, wire: wireBytes(clearSpec.wire), accepted: false, clearMatch: null, error: String(error) };
 	} finally {
 		if (created) await ops.cleanupTerminal(created.address).catch(() => {});
 	}
@@ -794,12 +877,12 @@ export async function runBlockedSendSuite(
 		}
 	}
 
-	// Pi's blocked report includes app=pi and a valid base64 message. Keep this
-	// separate from the bare blocked probe above so the send result is attributable
-	// to the exact report shape that Pi emits.
+	// Pi's blocked report includes app=pi, kind=auth, and a valid base64 message
+	// terminated with ST. Keep this separate from the bare blocked probe above
+	// so the send result is attributable to the exact report shape that Pi emits.
 	let piBlockedTerminal: { address: string; name: string } | undefined;
 	try {
-		const piBlockedSpec = buildPiProgramStatusProbes(term).find(spec => spec.key === "blocked")!;
+		const piBlockedSpec = buildPiProgramStatusProbes().find(spec => spec.key === "blocked")!;
 		piBlockedTerminal = await ops.createTerminal("send-pi-blocked");
 		const address = piBlockedTerminal.address;
 		const before = await ops.get(address);
@@ -896,16 +979,71 @@ export function evaluateLiveBhRequirements(input: {
 		}
 
 		const piReports = input.osc.piProgramStatus ?? {};
-		oscObservations.piProgramStatus = Object.fromEntries(
-			["blocked", "working", "done", "error", "idle", "clear"].map(key => {
-				const entry = piReports[key];
-				return [key, {
+		const piObservations: Record<string, any> = {};
+		for (const spec of PI_PROGRAM_STATUS_SPECS) {
+			const entry = piReports[spec.key];
+			if (spec.key === "clear") {
+				const clearMatch = entry?.clearMatch ?? null;
+				const clearObserved = entry?.seedAccepted === true
+					&& entry?.accepted === true
+					&& entry?.representation?.reported === true
+					&& entry?.representation?.status === null
+					&& (clearMatch === "null_status" || clearMatch === null && entry?.clearMatch === undefined);
+				piObservations.clear = {
+					observed: clearObserved,
+					seedAccepted: entry?.seedAccepted === true,
 					accepted: entry?.accepted === true,
+					clearMatch,
 					reported: entry?.representation?.reported ?? null,
 					status: entry?.representation?.status ?? null,
-				}];
-			}),
-		);
+				};
+				if (!clearObserved) {
+					missing.push("b: Pi-shaped state=clear did not clear seeded idle status to reported=true, status=null");
+				}
+				continue;
+			}
+			const fields = entry?.observedFields ?? {};
+			const msgMatches = spec.expectedMsg === null
+				? fields.msg == null
+				: spec.expectedMsg === undefined || fields.msg === spec.expectedMsg;
+			const kindMatches = spec.expectedKind === undefined || fields.kind === spec.expectedKind;
+			const appMatches = spec.expectedApp === undefined || fields.app === spec.expectedApp;
+			const probeObserved = entry?.accepted === true
+				&& entry?.representation?.reported === true
+				&& fields.state === spec.expectedState
+				&& appMatches
+				&& kindMatches
+				&& msgMatches;
+			piObservations[spec.key] = {
+				observed: probeObserved,
+				accepted: entry?.accepted === true,
+				reported: entry?.representation?.reported ?? null,
+				status: entry?.representation?.status ?? null,
+				observedFields: entry?.observedFields ?? null,
+			};
+			if (!probeObserved) {
+				missing.push(`b: Pi-shaped ${spec.key} probe did not match expected fields`);
+			}
+		}
+		oscObservations.piProgramStatus = piObservations;
+
+		const realPi = input.osc.realPi;
+		const realPiStatus = realPi?.terminal?.status;
+		const realPiObserved = realPi?.reported === true
+			&& realPi?.terminal?.reported === true
+			&& realPiStatus?.app === "pi"
+			&& realPiStatus?.state === "idle"
+			&& realPi?.piStatusObserved === true;
+		oscObservations.realPi = {
+			observed: realPiObserved,
+			reported: realPi?.terminal?.reported ?? realPi?.reported ?? null,
+			app: realPiStatus?.app ?? null,
+			state: realPiStatus?.state ?? null,
+			piStatusObserved: realPi?.piStatusObserved === true,
+		};
+		if (!realPiObserved) {
+			missing.push('b: real Pi process did not report status {app: "pi", state: "idle"}');
+		}
 	}
 
 	if (input.selected.has("h")) {
@@ -922,7 +1060,22 @@ export function evaluateLiveBhRequirements(input: {
 			missing.push("h: blocked send did not refuse with exit 9 / error.kind=blocked and 0 delivered bytes");
 		}
 		const piBlocked = input.blocked.piBlocked;
+		const piBlockedDeliveredBytes = piBlocked?.input?.hex !== undefined
+			? Buffer.from(piBlocked.input.hex, "hex").length
+			: (piBlocked?.input?.utf8?.length ?? null);
+		const piBlockedRefused = piBlocked?.statusObserved === true
+			&& piBlocked?.after?.reported === true
+			&& piBlocked?.statusAfter?.state === "blocked"
+			&& piBlocked?.statusAfter?.app === "pi"
+			&& piBlocked?.statusAfter?.kind === "auth"
+			&& piBlocked?.statusAfter?.msg === "Log in to x"
+			&& piBlocked?.sendAttempted === true
+			&& piBlocked?.matchesContract === true
+			&& piBlocked?.result?.code === 9
+			&& piBlocked?.errorKind === "blocked"
+			&& piBlockedDeliveredBytes === 0;
 		blockedObservations.piBlockedReport = {
+			observed: piBlockedRefused,
 			statusObserved: piBlocked?.statusObserved === true,
 			reported: piBlocked?.after?.reported ?? null,
 			status: piBlocked?.statusAfter ?? null,
@@ -930,8 +1083,12 @@ export function evaluateLiveBhRequirements(input: {
 			code: piBlocked?.result?.code ?? null,
 			errorKind: piBlocked?.errorKind ?? null,
 			delivered: piBlocked?.delivered ?? null,
+			deliveredBytes: piBlockedDeliveredBytes,
 			refused: piBlocked?.matchesContract === true,
 		};
+		if (!piBlockedRefused) {
+			missing.push("h: piBlocked send did not refuse with exit 9 / error.kind=blocked and 0 delivered bytes");
+		}
 
 		const w = input.blocked.working;
 		const d = input.blocked.done;

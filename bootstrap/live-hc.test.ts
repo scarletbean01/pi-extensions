@@ -347,7 +347,11 @@ test("live hc spike (a–i)", {
 					} while (Date.now() < deadline);
 					realPi.terminal = terminal;
 					realPi.reported = terminal?.reported === true;
-					realPi.piStatusObserved = terminal?.reported === true && terminal?.status?.app === "pi";
+					realPi.state = terminal?.status?.state ?? null;
+					realPi.app = terminal?.status?.app ?? null;
+					realPi.piStatusObserved = terminal?.reported === true
+						&& terminal?.status?.app === "pi"
+						&& terminal?.status?.state === "idle";
 					realPi.note = "Fresh isolated HOME/XDG paths; no PI_PROGRAM_STATUS override or user input; terminal is cleaned up with the isolated core.";
 				} catch (error) {
 					realPi.error = String(error);

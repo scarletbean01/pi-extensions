@@ -1220,14 +1220,18 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 	]);
 	assert.equal(singleKeySpecs.find(s => s.key === "kind")!.wire, "\x1b]7501;state=blocked:kind=permission\x1b\\");
 	assert.equal(singleKeySpecs.find(s => s.key === "id")!.expectedRecordId, "worker1");
-	const piStatusSpecs = buildPiProgramStatusProbes("\x1b\\");
-	assert.deepEqual(piStatusSpecs.map(s => s.key), ["blocked", "working", "done", "error", "idle", "clear"]);
-	assert.equal(piStatusSpecs[0]!.wire, "\x1b]7501;state=blocked:app=pi:msg=TG9nIGluIHRvIHg=\x1b\\");
-	assert.equal(piStatusSpecs[1]!.wire, "\x1b]7501;state=working:app=pi:msg=UGkgc2Vzc2lvbg==\x1b\\");
-	assert.equal(piStatusSpecs[2]!.wire, "\x1b]7501;state=done:app=pi:msg=UGkgc2Vzc2lvbg==\x1b\\");
-	assert.equal(piStatusSpecs[3]!.wire, "\x1b]7501;state=error:app=pi:msg=RmFpbGVkIG9uY2U=\x1b\\");
-	assert.equal(piStatusSpecs[4]!.wire, "\x1b]7501;state=idle:app=pi\x1b\\");
-	assert.equal(piStatusSpecs[5]!.wire, "\x1b]7501;state=clear\x1b\\");
+	const piStatusSpecs = buildPiProgramStatusProbes();
+	assert.deepEqual(piStatusSpecs.map(s => s.key), [
+		"blocked", "blocked-permission", "blocked-question", "working", "done", "error", "idle", "clear",
+	]);
+	assert.equal(piStatusSpecs[0]!.wire, "\x1b]7501;state=blocked:app=pi:kind=auth:msg=TG9nIGluIHRvIHg=\x1b\\");
+	assert.equal(piStatusSpecs[1]!.wire, "\x1b]7501;state=blocked:app=pi:kind=permission:msg=Q29uZmlybSBhY3Rpb24=\x1b\\");
+	assert.equal(piStatusSpecs[2]!.wire, "\x1b]7501;state=blocked:app=pi:kind=question:msg=Q2hvb3NlIGFuIG9wdGlvbg==\x1b\\");
+	assert.equal(piStatusSpecs[3]!.wire, "\x1b]7501;state=working:app=pi:msg=UGkgc2Vzc2lvbg==\x1b\\");
+	assert.equal(piStatusSpecs[4]!.wire, "\x1b]7501;state=done:app=pi:msg=UGkgc2Vzc2lvbg==\x1b\\");
+	assert.equal(piStatusSpecs[5]!.wire, "\x1b]7501;state=error:app=pi:msg=RmFpbGVkIG9uY2U=\x1b\\");
+	assert.equal(piStatusSpecs[6]!.wire, "\x1b]7501;state=idle:app=pi\x1b\\");
+	assert.equal(piStatusSpecs[7]!.wire, "\x1b]7501;state=clear\x1b\\");
 
 	const escapingSpecs = buildRun4EscapingProbes("message", "\x1b\\");
 	assert.deepEqual(escapingSpecs.map(s => s.key), ["spaces", "colon", "unicode", "percent-encoding"]);
@@ -1239,7 +1243,12 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 	// Stateful fake terminal simulator: each fresh terminal starts unreported (status=null),
 	// tracks emitted OSC wires, rejects `title=` and `done`, accepts minimal states + `app`/`msg`/`id`,
 	// and enforces blocked send refusal without --force.
-	const makeFakeProbeOps = (options: { rejectStates?: Set<string>; rejectKeys?: Set<string>; acceptMsgKey?: "msg" | "message" | null } = {}) => {
+	const makeFakeProbeOps = (options: {
+		rejectStates?: Set<string>;
+		rejectKeys?: Set<string>;
+		acceptMsgKey?: "msg" | "message" | null;
+		clearMode?: "null" | "state_clear" | "ignore";
+	} = {}) => {
 		let nextId = 1;
 		const terminals = new Map<string, {
 			address: string;
@@ -1305,8 +1314,9 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 						if ((k === "msg" || k === "message") && options.acceptMsgKey !== undefined && k !== options.acceptMsgKey) return "";
 					}
 					if (f.state === "clear") {
+						if (options.clearMode === "ignore") return "";
 						tState.reported = true;
-						tState.status = null;
+						tState.status = options.clearMode === "state_clear" ? { state: "clear" } : null;
 						tState.status_ms = 1000 + nextId;
 						return "";
 					}
@@ -1315,8 +1325,21 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 						tState.records[f.id] = { state: f.state };
 						return "";
 					}
+					const decodeMaybeBase64 = (value: string) => {
+						if (value.length > 0 && value.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+							const decoded = Buffer.from(value, "base64");
+							if (decoded.toString("base64") === value) return decoded.toString("utf8");
+						}
+						return value;
+					};
 					tState.reported = true;
-					tState.status = { state: f.state, ...(f.app ? { app: f.app } : {}), ...(f.msg ? { msg: f.msg } : {}), ...(f.message ? { msg: f.message } : {}) };
+					tState.status = {
+						state: f.state,
+						...(f.app ? { app: f.app } : {}),
+						...(f.kind ? { kind: f.kind } : {}),
+						...(f.msg ? { msg: decodeMaybeBase64(f.msg) } : {}),
+						...(f.message ? { msg: f.message } : {}),
+					};
 					tState.status_ms = 1000 + nextId;
 					return "";
 				},
@@ -1401,18 +1424,26 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 		assert.equal((oscRes.singleKeys as any).title.accepted, false);
 		assert.equal((oscRes.singleKeys as any).app.accepted, true);
 		assert.equal(oscRes.escapingMsgKey, "msg");
-		assert.deepEqual(Object.keys(piStatuses), ["blocked", "working", "done", "error", "idle", "clear"]);
+		assert.deepEqual(Object.keys(piStatuses), [
+			"blocked", "blocked-permission", "blocked-question", "working", "done", "error", "idle", "clear",
+		]);
 		assert.equal((piStatuses.blocked as any).accepted, true);
 		assert.equal((piStatuses.blocked as any).observedFields.app, "pi");
-		assert.equal((piStatuses.blocked as any).observedFields.msg, "TG9nIGluIHRvIHg=");
+		assert.equal((piStatuses.blocked as any).observedFields.kind, "auth");
+		assert.equal((piStatuses.blocked as any).observedFields.msg, "Log in to x");
+		assert.equal((piStatuses["blocked-permission"] as any).observedFields.kind, "permission");
+		assert.equal((piStatuses["blocked-permission"] as any).observedFields.msg, "Confirm action");
+		assert.equal((piStatuses["blocked-question"] as any).observedFields.kind, "question");
+		assert.equal((piStatuses["blocked-question"] as any).observedFields.msg, "Choose an option");
 		assert.equal((piStatuses.clear as any).wire.utf8, "\x1b]7501;state=clear\x1b\\");
 		assert.equal((piStatuses.clear as any).seedAccepted, true);
+		assert.equal((piStatuses.clear as any).clearMatch, "null_status");
 		assert.equal((piStatuses.clear as any).accepted, true);
 		assert.equal((oscRes.escaping as any).spaces.accepted, true);
 		assert.equal((oscRes.recordsById as any)["state-first-id"].accepted, true);
 		assert.equal((blockedRes.blocked as any).matchesContract, true);
 		assert.equal((blockedRes.piBlocked as any).statusObserved, true);
-		assert.equal((blockedRes.piBlocked as any).wire.utf8, "\x1b]7501;state=blocked:app=pi:msg=TG9nIGluIHRvIHg=\x1b\\");
+		assert.equal((blockedRes.piBlocked as any).wire.utf8, "\x1b]7501;state=blocked:app=pi:kind=auth:msg=TG9nIGluIHRvIHg=\x1b\\");
 		assert.equal((blockedRes.piBlocked as any).matchesContract, true);
 		assert.equal((blockedRes.working as any).delivered, true);
 		assert.equal((blockedRes.done as any).statusObserved, false);
@@ -1428,6 +1459,7 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 		assert.equal(evaluated.blockedObservations.blockedRefused.observed, true);
 		assert.equal(evaluated.oscObservations.piProgramStatus.blocked.accepted, true);
 		assert.equal(evaluated.oscObservations.piProgramStatus.clear.accepted, true);
+		assert.equal(evaluated.oscObservations.piProgramStatus.clear.clearMatch, "null_status");
 		assert.equal(evaluated.blockedObservations.piBlockedReport.refused, true);
 		assert.ok(evaluated.missing.some(msg => /\bdone\b/.test(msg)), "end-of-run policy must flag missing 'done' state");
 	}
@@ -1449,6 +1481,8 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 		});
 		assert.equal(oscRes.escapingMsgKey, null);
 		assert.equal((piStatuses.blocked as any).accepted, false);
+		assert.equal((piStatuses["blocked-permission"] as any).accepted, false);
+		assert.equal((piStatuses["blocked-question"] as any).accepted, false);
 		assert.equal((piStatuses.idle as any).accepted, true);
 		assert.equal((piStatuses.clear as any).accepted, true);
 		assert.match(String((oscRes.escaping as any).skippedReason), /neither msg= nor message=/i);
@@ -1479,7 +1513,12 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 			sim.sendCalls.push({ address, args: ["send", "--json", address, text] });
 			return { code: 0, stdout: JSON.stringify({ started: null, status: "blocked", turn: 0 }), stderr: "", timedOut: false };
 		};
-		const oscRes = await runOscProbeSuite(sim.ops, { pollMs: 210, intervalMs: 10 });
+		const oscRes: Record<string, any> = await runOscProbeSuite(sim.ops, { pollMs: 210, intervalMs: 10 });
+		oscRes.realPi = {
+			reported: true,
+			piStatusObserved: true,
+			terminal: { reported: true, status: { app: "pi", state: "idle" } },
+		};
 		const blockedRes = await runBlockedSendSuite(sim.ops, {
 			pollMs: 210,
 			intervalMs: 10,
@@ -1492,10 +1531,59 @@ test("live hc question selector, OSC 7501 candidate probing/stop condition, and 
 			blocked: blockedRes,
 		});
 		assert.equal(evaluated.oscObservations.minimalStates.observed, true);
+		assert.equal(evaluated.oscObservations.realPi.observed, true);
 		assert.equal(evaluated.blockedObservations.blockedRefused.observed, false);
+		assert.equal(evaluated.blockedObservations.piBlockedReport.observed, false);
 		assert.deepEqual(evaluated.missing, [
 			"h: blocked send did not refuse with exit 9 / error.kind=blocked and 0 delivered bytes",
+			"h: piBlocked send did not refuse with exit 9 / error.kind=blocked and 0 delivered bytes",
 		]);
+	}
+
+	// Case E: `hc` ignores `state=clear` (status remains idle) or leaves `status: { state: "clear" }` instead of null,
+	// and real Pi does not report {app: "pi", state: "idle"} -> evaluateLiveBhRequirements flags each gap.
+	{
+		const simIgnoreClear = makeFakeProbeOps({ clearMode: "ignore" });
+		const oscIgnore: Record<string, any> = await runOscProbeSuite(simIgnoreClear.ops, { pollMs: 210, intervalMs: 10 });
+		oscIgnore.realPi = {
+			reported: true,
+			piStatusObserved: false,
+			terminal: { reported: true, status: { app: "pi", state: "working" } },
+		};
+		assert.equal((oscIgnore.piProgramStatus as any).clear.seedAccepted, true);
+		assert.equal((oscIgnore.piProgramStatus as any).clear.accepted, false);
+		assert.equal((oscIgnore.piProgramStatus as any).clear.clearMatch, null);
+		assert.deepEqual((oscIgnore.piProgramStatus as any).clear.representation.status, { state: "idle", app: "pi" });
+		const evalIgnore = evaluateLiveBhRequirements({
+			selected: new Set(["b"]),
+			osc: oscIgnore,
+			blocked: {},
+		});
+		assert.equal(evalIgnore.oscObservations.piProgramStatus.clear.accepted, false);
+		assert.equal(evalIgnore.oscObservations.piProgramStatus.clear.observed, false);
+		assert.equal(evalIgnore.oscObservations.piProgramStatus.clear.clearMatch, null);
+		assert.equal(evalIgnore.oscObservations.realPi.observed, false);
+		assert.ok(evalIgnore.missing.some(msg => /state=clear/i.test(msg)));
+		assert.ok(evalIgnore.missing.some(msg => /real Pi/i.test(msg)));
+
+		const simStateClear = makeFakeProbeOps({ clearMode: "state_clear" });
+		const oscStateClear: Record<string, any> = await runOscProbeSuite(simStateClear.ops, { pollMs: 210, intervalMs: 10 });
+		oscStateClear.realPi = {
+			reported: true,
+			piStatusObserved: true,
+			terminal: { reported: true, status: { app: "pi", state: "idle" } },
+		};
+		assert.equal((oscStateClear.piProgramStatus as any).clear.accepted, true);
+		assert.equal((oscStateClear.piProgramStatus as any).clear.clearMatch, "state_clear");
+		const evalStateClear = evaluateLiveBhRequirements({
+			selected: new Set(["b"]),
+			osc: oscStateClear,
+			blocked: {},
+		});
+		assert.equal(evalStateClear.oscObservations.piProgramStatus.clear.accepted, true);
+		assert.equal(evalStateClear.oscObservations.piProgramStatus.clear.clearMatch, "state_clear");
+		assert.equal(evalStateClear.oscObservations.piProgramStatus.clear.observed, false);
+		assert.ok(evalStateClear.missing.some(msg => /state=clear/i.test(msg)));
 	}
 
 	// Case C: Throwing probe does not stop later probes.
