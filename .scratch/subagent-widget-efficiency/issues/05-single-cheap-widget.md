@@ -4,7 +4,7 @@
 
 Spec: `../spec.md` (user stories 22–24; Implementation Decisions: One widget).
 
-**Blocked by:** 03 (settled and queued states), 04 (shared timer is cleared at shutdown)
+**Blocked by:** 02 (launch code settled). Relaxed 2026-11-27 to run in parallel with 03 on a branch stacked on 02; it renders the existing subagent states, so it does not need 03's queue or cancellation. Merge after 03 and resolve conflicts then. Ticket 04 clears the shared timer at shutdown and so follows both.
 
 **Status:** ready-for-agent
 
