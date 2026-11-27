@@ -96,7 +96,7 @@ export async function loadSubagentWidget() {
 		});
 		hooksInstalled = true;
 	}
-	return (await import(`./subagent-widget.ts?test=${++moduleCounter}`)).default;
+	return (await import(`../subagent-widget.ts?test=${++moduleCounter}`)).default;
 }
 
 export interface FakeInvocation {
@@ -129,6 +129,8 @@ export interface FakeScenario {
 	stderr?: string;
 	exitCode?: number;
 	delayMs?: number;
+	/** Gap between emitted chunks (default 5 ms). */
+	chunkGapMs?: number;
 	ignoreSigterm?: boolean;
 	writeSessionOnSigterm?: boolean;
 	backgroundHoldMs?: number;
@@ -141,6 +143,7 @@ const fakeRunner = (fixture: {
 	stderr: string;
 	exitCode: number;
 	delayMs: number;
+	chunkGapMs: number;
 	ignoreSigterm: boolean;
 	writeSessionOnSigterm?: boolean;
 	backgroundHoldMs?: number;
@@ -200,7 +203,7 @@ function emitChunk(index) {
     return;
   }
   process.stdout.write(chunks[index]);
-  setTimeout(() => emitChunk(index + 1), 5);
+  setTimeout(() => emitChunk(index + 1), activeScenario.chunkGapMs);
 }
 emitChunk(0);
 `;
@@ -225,6 +228,7 @@ export function createFakePi(options: FakeScenario & { scenariosByPrompt?: Recor
 		stderr: options.stderr ?? "",
 		exitCode: options.exitCode ?? 0,
 		delayMs: options.delayMs ?? 10,
+		chunkGapMs: options.chunkGapMs ?? 5,
 		ignoreSigterm: options.ignoreSigterm ?? false,
 		writeSessionOnSigterm: options.writeSessionOnSigterm,
 		backgroundHoldMs: options.backgroundHoldMs,
@@ -320,6 +324,8 @@ export function createFakeHost(extension: (pi: any, options?: any) => void, cwd 
 	const commands = new Map<string, any>();
 	const handlers = new Map<string, Function[]>();
 	const sentMessages: Array<{ message: any; options: any }> = [];
+	const entries: Array<{ customType: string; data: any }> = [];
+	const entryRenderers = new Map<string, Function>();
 	const notifications: Array<{ message: string; level: string }> = [];
 	const widgets = new Map<string, any>();
 	const widgetCalls: Array<{ key: string; widget: any }> = [];
@@ -334,6 +340,8 @@ export function createFakeHost(extension: (pi: any, options?: any) => void, cwd 
 			if (tool.defaultActive !== false && !activeTools.includes(tool.name)) activeTools.push(tool.name);
 		},
 		getAllTools() { return [...tools.values()].filter(tool => !excludedTools.has(tool.name)); },
+		appendEntry(customType: string, data: any) { entries.push({ customType, data }); },
+		registerEntryRenderer(type: string, renderer: Function) { entryRenderers.set(type, renderer); },
 		registerCommand(name: string, command: any) { commands.set(name, command); },
 		on(event: string, handler: Function) { handlers.set(event, [...(handlers.get(event) ?? []), handler]); },
 		sendMessage(message: any, options: any) { sentMessages.push({ message, options }); },
@@ -357,7 +365,7 @@ export function createFakeHost(extension: (pi: any, options?: any) => void, cwd 
 		},
 	};
 	return {
-		tools, commands, handlers, sentMessages, notifications, widgets, widgetCalls, activeToolCalls,
+		tools, commands, handlers, sentMessages, entries, entryRenderers, notifications, widgets, widgetCalls, activeToolCalls,
 		get thinkingLevelCalls() { return thinkingLevelCalls; },
 		getActiveTools: () => pi.getActiveTools(),
 		registerTool: (tool: any) => pi.registerTool(tool),

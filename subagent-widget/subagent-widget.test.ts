@@ -1,12 +1,14 @@
 /**
- * Run with: timeout 300 node --test --experimental-strip-types --test-force-exit --test-timeout=60000 subagent-widget.test.ts
+ * Run with: timeout 300 node --test --experimental-strip-types --test-force-exit --test-timeout=60000 subagent-widget/subagent-widget.test.ts
  * These tests cross the extension entry point; Pi packages are stubbed, while the extension and fake executable are real.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { mkdir as mkdirAsync } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+const helperPath = fileURLToPath(new URL("./strip-pi-docs.mjs", import.meta.url));
 import { createFakeHost, createFakePi, getOption, getVisibleWidth, loadSubagentWidget, waitFor, withFakePiEnvironment } from "./subagent-widget.test-helpers.ts";
 
 const textEvent = (delta: string) => ({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta } });
@@ -46,8 +48,7 @@ test("/sub launches the fake pi and delivers final assistant message after norma
 	assert.equal(invocation.argv.includes("--no-prompt-templates"), true);
 	assert.equal(invocation.argv.includes("--no-themes"), true);
 	assert.equal(invocation.argv.includes("--no-context-files"), false, "project AGENTS.md and CLAUDE.md files remain available");
-	assert.match(getOption(invocation.argv, "--extension") ?? "", /subagent-widget-child-/);
-	assert.equal(existsSync(dirname(getOption(invocation.argv, "--extension")!)), false, "the private child extension directory is removed after exit");
+	assert.equal(getOption(invocation.argv, "--extension"), helperPath, "load the shipped helper, not a new temporary extension");
 	assert.match(invocation.childExtension ?? "", /<docs>/);
 	assert.match(invocation.childExtension ?? "", /before_agent_start/);
 	assert.equal(invocation.docsFilteredPrompt, "base instructions\n\nother context");
@@ -112,17 +113,10 @@ test("subagent_create launches the fake pi, returns terminate: true, and include
 	assert.deepEqual(sent.options, { deliverAs: "followUp", triggerTurn: true });
 });
 
-test("subagent_create reports a synchronous spawn failure and removes its temp directory", async t => {
+test("subagent_create reports a synchronous spawn failure",  async t => {
 	const fake = createFakePi({ events: [] });
 	t.after(() => fake.cleanup());
-	const createWidget = await loadSubagentWidget();
-	let childDocsDirectory = "";
-	const extension = (pi: any) => createWidget(pi, {
-		createChildDocsDirectory: () => {
-			childDocsDirectory = mkdtempSync(join(fake.root, "spawn-failure-"));
-			return childDocsDirectory;
-		},
-	});
+	const extension = await loadSubagentWidget();
 	const host = createFakeHost(extension, fake.cwd);
 	const create = host.tools.get("subagent_create");
 	const result = await withFakePiEnvironment(fake, () => create.execute("nul-task", {
@@ -130,7 +124,6 @@ test("subagent_create reports a synchronous spawn failure and removes its temp d
 	}, undefined, undefined, host.ctx));
 	assert.equal(result.isError, true);
 	assert.match(result.content[0].text, /Could not launch subagent.*(?:ERR_INVALID_ARG_VALUE|null bytes)/);
-	assert.equal(existsSync(childDocsDirectory), false, "spawn failure removes the private child-docs directory");
 	const widgetFactory = host.getWidgetFactory("subagents");
 	const widget = widgetFactory({}, { fg: (_color: string, text: string) => text });
 	assert.ok(widget.render(80).some((line: string) => line.includes("✗")));
@@ -207,6 +200,19 @@ test("launches keep prompts literal and add only requested skills and write tool
 	await waitFor(() => fake.exits().length >= 3 && host.sentMessages[0] ? true : undefined, "all literal-prompt children to exit cleanly");
 });
 
+test("notify-only is per command turn and never sends its answer to the model", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("private answer")] });
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("--notify-only private task", host.ctx));
+	const entry = await waitFor(() => host.entries[0], "transcript-only entry");
+	assert.match(host.entryRenderers.get(entry.customType)!({ data: entry.data }, { expanded: false }).render(80), /private answer/);
+	assert.equal(host.sentMessages.length, 0);
+	await withFakePiEnvironment(fake, () => host.tools.get("subagent_continue").execute("continue", { id: 1, prompt: "follow up" }, undefined, undefined, host.ctx));
+	await waitFor(() => host.sentMessages[0], "normal model-dispatched continuation");
+	assert.equal(host.entries.length, 1);
+});
+
 test("unknown skills return errors before tool or command launches", async t => {
 	const fake = createFakePi({ events: [] });
 	t.after(() => fake.cleanup());
@@ -273,18 +279,16 @@ test("/sub rejects values attached to the --write flag", async t => {
 	assert.deepEqual(fake.invocations(), []);
 });
 
-test("child-extension temp failures mark create and continuation launches as errors", async t => {
+test("child-extension preparation failures mark create and continuation launches as errors", async t => {
 	const fake = createFakePi({ events: [] });
 	t.after(() => fake.cleanup());
 	const createWidget = await loadSubagentWidget();
 	let failSetup = true;
-	const childDocsDirectories: string[] = [];
-	const extension = (pi: any) => createWidget(pi, {
-		createChildDocsDirectory: () => {
-			const directory = mkdtempSync(join(fake.root, "blocked-child-docs-"));
-			childDocsDirectories.push(directory);
-			if (failSetup) mkdirSync(join(directory, "strip-pi-docs.mjs"));
-			return directory;
+	const extension = (pi: any, options: any) => createWidget(pi, {
+		...options,
+		resolveChildDocsExtension: () => {
+			if (failSetup) throw new Error("EISDIR fixture");
+			return helperPath;
 		},
 	});
 	const host = createFakeHost(extension, fake.cwd);
@@ -317,7 +321,6 @@ test("child-extension temp failures mark create and continuation launches as err
 	assert.ok(continuationWidget.render(80).some((line: string) => line.includes("#3") && line.includes("✓")));
 	const listed = await host.tools.get("subagent_list").execute("l1", {}, undefined, undefined, host.ctx);
 	assert.match(listed.content[0].text, /#3 \[DONE\].*\[last continue failed: Could not prepare subagent launch/);
-	assert.ok(childDocsDirectories.every(directory => !existsSync(directory)), "all temporary child-docs directories are removed");
 });
 
 test("/subcont starts another turn with the original session file", async t => {
@@ -498,11 +501,10 @@ test("usage totals are summed across messages and stderr is attached only on non
 	await withFakePiEnvironment(fake, () => create.execute("c1", { task: "ok-task", thinking: "low" }, undefined, undefined, host.ctx));
 	const okSent = await waitFor(() => host.sentMessages[0], "ok result");
 	assert.match(okSent.message.content, /all done/);
-	assert.match(okSent.message.content, /input 310/);
-	assert.match(okSent.message.content, /cacheRead 105/);
-	assert.match(okSent.message.content, /cacheWrite 42/);
-	assert.match(okSent.message.content, /output 55/);
-	assert.match(okSent.message.content, /\$0\.0040/);
+	assert.doesNotMatch(okSent.message.content, /Usage:|ok-task/);
+	const details = (await host.tools.get("subagent_list").execute("details", { id: 1 })).content[0].text;
+	assert.match(details, /input 310, cacheRead 105, cacheWrite 42, output 55, cost \$0\.0040/);
+	assert.ok(details.includes(getOption(fake.invocations()[0].argv, "--session")!));
 	assert.doesNotMatch(okSent.message.content, /harmless warning on stderr/);
 	assert.doesNotMatch(okSent.message.content, /Stderr:/);
 
@@ -510,6 +512,159 @@ test("usage totals are summed across messages and stderr is attached only on non
 	const failSent = await waitFor(() => host.sentMessages[1], "fail result");
 	assert.match(failSent.message.content, /failed midway/);
 	assert.match(failSent.message.content, /Stderr:\nfatal crash reason/);
+});
+
+test("FIFO cap holds queued siblings, skips removed launches, and separates parent turns", async t => {
+	const fake = createFakePi({ scenariosByPrompt: { slow: { delayMs: 30000 } } });
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd, { maxConcurrent: 2 });
+	const create = (task: string) => host.tools.get("subagent_create").execute(task, { task, thinking: "low" }, undefined, undefined, host.ctx);
+	await withFakePiEnvironment(fake, async () => {
+		await create("slow");
+		await host.emit("turn_start", {});
+		await create("fast");
+		assert.match((await create("remove-me")).content[0].text, /queued/);
+		assert.match((await create("next")).content[0].text, /queued/);
+		await host.commands.get("subrm").handler("3", host.ctx);
+	});
+	const msg = await waitFor(() => host.sentMessages[0], "second turn without slow worker");
+	assert.match(msg.message.content, /#2 finished/);
+	assert.match(msg.message.content, /#4 finished/);
+	assert.doesNotMatch(msg.message.content, /#1|#3/);
+	assert.equal(fake.invocations().length, 3);
+	assert.equal(fake.invocations().some(inv => inv.argv.at(-1) === "remove-me"), false);
+	await host.commands.get("subclear").handler("", host.ctx);
+});
+
+test("a child that exits while a background process holds its pipes still settles and frees its slot", async t => {
+	const fake = createFakePi({
+		scenariosByPrompt: {
+			holder: { events: [assistantMessageEnd("held")], backgroundHoldMs: 3000 },
+			next: { events: [assistantMessageEnd("after")] },
+		},
+	});
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd, { maxConcurrent: 1, drainGraceMs: 80 });
+	const create = (task: string) => host.tools.get("subagent_create").execute(task, { task, thinking: "low" }, undefined, undefined, host.ctx);
+	await withFakePiEnvironment(fake, async () => {
+		await create("holder");
+		assert.match((await create("next")).content[0].text, /queued/);
+	});
+	const msg = await waitFor(() => host.sentMessages[0], "held child settles after exit grace", 2500);
+	assert.match(msg.message.content, /#1 finished/);
+	assert.match(msg.message.content, /#2 finished/);
+	await host.commands.get("subclear").handler("", host.ctx);
+});
+
+test("queued launch reports its frozen model and turn in the list, and surfaces a dequeue failure", async t => {
+	const fake = createFakePi({ scenariosByPrompt: { slow: { delayMs: 30000 } } });
+	t.after(() => fake.cleanup());
+	let failDocs = false;
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd, {
+		maxConcurrent: 1,
+		resolveChildDocsExtension: () => { if (failDocs) throw new Error("docs helper missing"); return fileURLToPath(new URL("./strip-pi-docs.mjs", import.meta.url)); },
+	});
+	const create = (task: string) => host.tools.get("subagent_create").execute(task, { task, thinking: "low" }, undefined, undefined, host.ctx);
+	await withFakePiEnvironment(fake, async () => {
+		await create("slow");
+		await create("queued-first");
+	});
+	const list = (await host.tools.get("subagent_list").execute("list", {}, undefined, undefined, host.ctx)).content[0].text;
+	const queuedRow = list.split("\n").find((l: string) => l.startsWith("#2"))!;
+	assert.match(queuedRow, /QUEUED\] \(Turn 1, \S+, low\)/);
+	failDocs = true;
+	await host.commands.get("subrm").handler("1", host.ctx);
+	await waitFor(() => host.notifications.find(n => n.level === "error" && /docs helper missing/.test(n.message)), "queued launch failure notification");
+	await host.commands.get("subclear").handler("", host.ctx);
+});
+
+test("queued launches are removed without a kill message and never report a previous turn's result", async t => {
+	const fake = createFakePi({ scenariosByPrompt: { slow: { delayMs: 30000 }, again: { delayMs: 30000 } } });
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd, { maxConcurrent: 1 });
+	const create = (task: string) => host.tools.get("subagent_create").execute(task, { task, thinking: "low" }, undefined, undefined, host.ctx);
+	const list = async (id?: number) => (await host.tools.get("subagent_list").execute("list", id === undefined ? {} : { id }, undefined, undefined, host.ctx)).content[0].text as string;
+	await withFakePiEnvironment(fake, async () => {
+		await create("slow");
+		await create("queued-one");
+		const busy = await host.tools.get("subagent_continue").execute("c", { id: 2, prompt: "x" }, undefined, undefined, host.ctx);
+		assert.match(busy.content[0].text, /queued/);
+		assert.doesNotMatch(busy.content[0].text, /still running/);
+	});
+	assert.equal(await list(2), "#2: queued");
+	await host.commands.get("subrm").handler("2", host.ctx);
+	assert.equal(host.notifications.some(n => /#2 killed/.test(n.message)), false);
+	assert.ok(host.notifications.some(n => /#2 removed/.test(n.message)));
+	await host.commands.get("subclear").handler("", host.ctx);
+});
+
+test("subagent_list {id} hides the previous turn's result while a continuation runs", async t => {
+	const fake = createFakePi({ scenariosByPrompt: { again: { delayMs: 30000 } } });
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("first", host.ctx));
+	await waitFor(() => host.sentMessages[0], "first result");
+	const text = async () => (await host.tools.get("subagent_list").execute("list", { id: 1 }, undefined, undefined, host.ctx)).content[0].text as string;
+	assert.match(await text(), /Transcript:/);
+	await withFakePiEnvironment(fake, () => host.commands.get("subcont").handler("1 again", host.ctx));
+	assert.equal(await text(), "#1: running");
+	await host.commands.get("subclear").handler("", host.ctx);
+});
+
+test("truncated results point at subagent_list for the full transcript", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("x".repeat(6000))] });
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("long", host.ctx));
+	const msg = await waitFor(() => host.sentMessages[0], "long result");
+	assert.match(msg.message.content, /\[truncated; subagent_list \{id:1\}/);
+});
+
+test("list keeps one line per agent and details bound stderr", async t => {
+	const fake = createFakePi({ events: [assistantMessageEnd("bad")], exitCode: 1, stderr: "e".repeat(12000) });
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("line one\nline two", host.ctx));
+	await waitFor(() => host.sentMessages[0], "failed result");
+	const list = async (args: object) => (await host.tools.get("subagent_list").execute("list", args, undefined, undefined, host.ctx)).content[0].text as string;
+	assert.equal((await list({})).split("\n").filter((l: string) => l.startsWith("#1")).length, 1);
+	assert.doesNotMatch(await list({}), /line one\nline two/);
+	assert.ok(Buffer.byteLength(await list({ id: 1 })) < 4500);
+});
+
+test("a failed queued continuation leaves an error row, not a green one", async t => {
+	const fake = createFakePi({ scenariosByPrompt: { slow: { delayMs: 30000 } } });
+	t.after(() => fake.cleanup());
+	let failDocs = false;
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd, {
+		maxConcurrent: 1,
+		resolveChildDocsExtension: () => { if (failDocs) throw new Error("docs helper missing"); return fileURLToPath(new URL("./strip-pi-docs.mjs", import.meta.url)); },
+	});
+	const create = (task: string) => host.tools.get("subagent_create").execute(task, { task, thinking: "low" }, undefined, undefined, host.ctx);
+	await withFakePiEnvironment(fake, () => create("first"));
+	await waitFor(() => host.sentMessages[0], "first result");
+	await withFakePiEnvironment(fake, async () => {
+		await create("slow");
+		await host.tools.get("subagent_continue").execute("c", { id: 1, prompt: "again" }, undefined, undefined, host.ctx);
+	});
+	failDocs = true;
+	await host.commands.get("subrm").handler("2", host.ctx);
+	await waitFor(() => host.sentMessages[1], "queued continuation failure result");
+	assert.match(host.sentMessages[1].message.content, /Launch failed/);
+	assert.match((await host.tools.get("subagent_list").execute("list", {}, undefined, undefined, host.ctx)).content[0].text, /#1 \[ERROR\]/);
+	await host.commands.get("subclear").handler("", host.ctx);
+});
+
+test("simultaneous continuations cannot spawn twice against the same session", async t => {
+	const fake = createFakePi();
+	t.after(() => fake.cleanup());
+	const host = createFakeHost(await loadSubagentWidget(), fake.cwd);
+	await withFakePiEnvironment(fake, () => host.commands.get("sub").handler("initial", host.ctx));
+	await waitFor(() => host.sentMessages[0], "first result");
+	const { results } = await withFakePiEnvironment(fake, () => host.runToolBatch([1, 2].map(n => ({ name: "subagent_continue", callId: `cont-${n}`, args: { id: 1, prompt: `next-${n}` } }))));
+	assert.equal(results.filter(r => r.terminate).length, 1);
+	await waitFor(() => host.sentMessages[1], "continuation result");
+	assert.equal(fake.invocations().length, 2);
 });
 
 test("three parallel subagents produce one coalesced wake-up after the last settles", async t => {
@@ -746,7 +901,6 @@ test("session_shutdown disables only management tools and avoids redundant tool-
 	await withFakePiEnvironment(fake, () => host.emit("session_shutdown", { reason: "quit" }));
 	assert.equal(host.activeToolCalls.filter(call => call.method === "setActiveTools").length, setCallsBeforeShutdown + 1);
 	await waitFor(() => { try { process.kill(invocation.pid, 0); return undefined; } catch { return true; } }, "shutdown active-tools child exit");
-	await waitFor(() => !existsSync(dirname(getOption(invocation.argv, "--extension")!)) ? true : undefined, "shutdown active-tools extension cleanup");
 
 	const emptyFake = createFakePi({ events: [] });
 	t.after(() => emptyFake.cleanup());
@@ -811,7 +965,7 @@ test("remove paths delete only removed session files and clear does not reuse a 
 	await host.commands.get("subrm").handler("1", host.ctx);
 	const reusedIdPid = fake.invocations()[4].pid;
 	await waitFor(() => { try { process.kill(reusedIdPid, 0); return undefined; } catch { return true; } }, "post-clear child exit");
-	await waitFor(() => fake.invocations().every(inv => !existsSync(dirname(getOption(inv.argv, "--extension")!))) ? true : undefined, "child extension cleanup");
+	assert.ok(fake.invocations().every(inv => getOption(inv.argv, "--extension") === helperPath));
 });
 
 test("session_start prunes only old subagent session files", async t => {
@@ -993,7 +1147,6 @@ test("removal deletes a session file after the child flushes during SIGTERM", as
 	await host.tools.get("subagent_remove").execute("remove", { id: 1 }, undefined, undefined, host.ctx);
 	await waitFor(() => !existsSync(sessionFile) ? true : undefined, "session file deletion after child exit");
 	await waitFor(() => { try { process.kill(invocation.pid, 0); return undefined; } catch { return true; } }, "flush-on-stop child exit");
-	await waitFor(() => !existsSync(dirname(getOption(invocation.argv, "--extension")!)) ? true : undefined, "flush-on-stop extension cleanup");
 });
 
 test("shutdown is bounded when a killed child has a background process holding stdout", async t => {
@@ -1011,7 +1164,6 @@ test("shutdown is bounded when a killed child has a background process holding s
 	assert.ok(elapsed < killGraceMs + 1000, `shutdown took ${elapsed}ms`);
 	await waitFor(() => { try { process.kill(invocation.pid, 0); return undefined; } catch { return true; } }, "killed parent process exit");
 	await waitFor(() => { try { process.kill(holderPid, 0); return undefined; } catch { return true; } }, "background holder exit", 4000);
-	await waitFor(() => !existsSync(dirname(getOption(invocation.argv, "--extension")!)) ? true : undefined, "background-holder extension cleanup");
 });
 
 test("launch waiting on directory creation is cancelled by clear or shutdown", async t => {
@@ -1154,11 +1306,11 @@ test("synchronous launch/setup failures do not wake parent, mark terminate, or h
 	t.after(() => fake.cleanup());
 	const createWidget = await loadSubagentWidget();
 	let failSetup = false;
-	const extension = (pi: any) => createWidget(pi, {
-		createChildDocsDirectory: () => {
-			const directory = mkdtempSync(join(fake.root, "interplay-docs-"));
-			if (failSetup) mkdirSync(join(directory, "strip-pi-docs.mjs"));
-			return directory;
+	const extension = (pi: any, options: any) => createWidget(pi, {
+		...options,
+		resolveChildDocsExtension: () => {
+			if (failSetup) throw new Error("helper unavailable");
+			return helperPath;
 		},
 	});
 	const host = createFakeHost(extension, fake.cwd);
@@ -1396,11 +1548,7 @@ test("combined widget registers once for N subagents, caches unchanged renders, 
 	await host.commands.get("subclear").handler("", host.ctx);
 	assert.equal(host.widgets.has("subagents"), false, "clearing all subagents removes the combined widget");
 	assert.equal(host.sentMessages.length, 0, "clearing running subagents never wakes the parent");
-	await waitFor(() => {
-		const invs = fake.invocations();
-		return invs.length >= 3 && invs.every(inv => !existsSync(dirname(getOption(inv.argv, "--extension")!)))
-			? true : undefined;
-	}, "killed children close cleanup");
+	assert.equal(fake.exits().length, 3);
 });
 
 test("finished and errored subagent rows persist until removed and widget removes on last removal", async t => {
@@ -1525,11 +1673,7 @@ test("one shared 1-second timer runs only while at least one subagent is running
 	assert.equal(host.widgets.has("subagents"), false);
 
 	t.mock.timers.reset();
-	await waitFor(() => {
-		const invs = slowFake.invocations();
-		return invs.length >= 3 && invs.every(inv => !existsSync(dirname(getOption(inv.argv, "--extension")!)))
-			? true : undefined;
-	}, "all child close handlers to finish cleanup");
+	await waitFor(() => slowFake.exits().length >= 3 || undefined, "old workers to exit");
 });
 
 test("paragraph breaks and whitespace-only deltas do not hang and keep the last non-empty line", async t => {
@@ -1561,7 +1705,8 @@ test("paragraph breaks and whitespace-only deltas do not hang and keep the last 
 		{ type: "tool_execution_start", toolName: "t5" },
 		textEvent("omega"),
 	];
-	const stepFake = createFakePi({ events: stepEvents });
+	// Paints are coalesced to ~10 Hz, so space events beyond the paint window to observe each frame.
+	const stepFake = createFakePi({ events: stepEvents, chunkGapMs: 130 });
 	t.after(() => stepFake.cleanup());
 	const stepHost = createFakeHost(extension, stepFake.cwd);
 	const snapshots: string[] = [];
@@ -1660,11 +1805,7 @@ test("rendering at narrow and wide widths with wide chars and ANSI colors never 
 	}
 
 	await host.commands.get("subclear").handler("", host.ctx);
-	await waitFor(() => {
-		const invs = fake.invocations();
-		return invs.length >= 1 && invs.every(inv => !existsSync(dirname(getOption(inv.argv, "--extension")!)))
-			? true : undefined;
-	}, "killed child close cleanup");
+	await waitFor(() => fake.exits()[0], "child exit");
 });
 
 test("narrow widths shrink task label so tool and last line remain visible without dim reset leaks", async t => {
@@ -1710,11 +1851,7 @@ test("narrow widths shrink task label so tool and last line remain visible witho
 	assert.ok(dimTaskMatch, `expected unbroken dim span for truncated task label in: ${JSON.stringify(wideRow)}`);
 
 	await host.commands.get("subclear").handler("", host.ctx);
-	await waitFor(() => {
-		const invs = fake.invocations();
-		return invs.length >= 1 && invs.every(inv => !existsSync(dirname(getOption(inv.argv, "--extension")!)))
-			? true : undefined;
-	}, "narrow width child close cleanup");
+	await waitFor(() => fake.exits()[0], "narrow-width child exit");
 });
 
 test("512-character last-line cap never splits surrogate pairs, ZWJ sequences, or escape sequences", async t => {

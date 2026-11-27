@@ -15,13 +15,15 @@
 
 import { StringEnum, type ThinkingLevel } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 const { spawn } = require("child_process") as any;
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { ResultBatches, WorkerPool } from "./subagent-widget/scheduling.ts";
 import { applyExtensionDefaults } from "./themeMap.ts";
 
 const FALLBACK_MODEL = "openrouter/google/gemini-3.5-flash";
@@ -29,15 +31,22 @@ const THINKING_OVERRIDES = ["low", "medium", "high", "xhigh"] as const;
 const MAX_LAST_LINE_CHARS = 512;
 type ThinkingOverride = (typeof THINKING_OVERRIDES)[number];
 const MAX_RESULT_BYTES = 8000;
+const MAX_BATCH_BYTES = 8192;
+const MAX_BATCH_TURNS = 32;
+const NOTICE_TYPE = "subagent-notice";
 const MAX_STDERR_BYTES = 16 * 1024;
 const DEFAULT_KILL_GRACE_MS = 5000;
+const DEFAULT_DRAIN_GRACE_MS = 5000;
 const DEFAULT_SESSION_FILE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const MANAGEMENT_TOOL_NAMES = ["subagent_continue", "subagent_remove", "subagent_list"];
 
 export interface SubagentWidgetOptions {
+	maxConcurrent?: number;
 	/** Test seam to override the SIGTERM-to-SIGKILL grace period (defaults to 5000 ms). */
 	killGraceMs?: number;
+	/** Test seam: how long after child exit to wait for stdio to close before settling anyway (defaults to 5000 ms). */
+	drainGraceMs?: number;
 	/** Test seam to override the session-file retention period (defaults to seven days). */
 	sessionFileMaxAgeMs?: number;
 	/** Override the subagent session directory; used by isolated harnesses. */
@@ -46,7 +55,7 @@ export interface SubagentWidgetOptions {
 	createSessionsDirectory?: (dir: string) => Promise<void>;
 	/** Test seam for controlling startup pruning. */
 	pruneSessionFiles?: (dir: string, maxAgeMs: number) => Promise<void>;
-	createChildDocsDirectory?: () => string;
+	resolveChildDocsExtension?: () => string;
 }
 
 interface SpawnOptions {
@@ -55,6 +64,7 @@ interface SpawnOptions {
 	skills?: string[];
 	writeAccess?: boolean;
 	isContinuation?: boolean;
+	notifyOnly?: boolean;
 }
 
 interface SubUsage {
@@ -88,6 +98,10 @@ interface SubState {
 	thinking: ThinkingLevel;
 	error?: string;
 	continueError?: string;
+	queuedTask?: string;
+	queuedModel?: string;
+	queuedThinking?: ThinkingLevel;
+	latestResult?: SettledResult;
 	proc?: any;            // active ChildProcess ref (for kill on /subrm)
 	cancelled?: boolean;
 	killTimer?: ReturnType<typeof setTimeout>;
@@ -96,7 +110,7 @@ interface SubState {
 interface SettledResult {
 	id: number;
 	turnCount: number;
-	prompt: string;
+	sessionFile: string;
 	elapsedMs: number;
 	status: "done" | "error";
 	exitCode: number | null;
@@ -188,27 +202,59 @@ function formatUsage(usage: SubUsage): string {
 	return `Usage: input ${usage.input}, cacheRead ${usage.cacheRead}, cacheWrite ${usage.cacheWrite}, output ${usage.output}, cost ${formatCost(usage.cost)}`;
 }
 
-function formatSettledResult(result: SettledResult): string {
+function resultHeader(result: SettledResult): string {
 	const turnLabel = result.turnCount > 1 ? ` (Turn ${result.turnCount})` : "";
 	const statusLabel = result.status === "done"
 		? "finished"
 		: `failed${result.exitCode !== null ? ` (exit ${result.exitCode})` : ""}`;
-	const header = `Subagent #${result.id}${turnLabel} ${statusLabel} "${result.prompt}" in ${Math.round(result.elapsedMs / 1000)}s.`;
-	const bodyText = result.finalText
-		? truncateTailText(result.finalText)
-		: "(the subagent produced no final message)";
-	const sections = [header, formatUsage(result.usage), `Result:\n${bodyText}`];
-	if (result.status === "error" && result.errorMessage) {
-		sections.push(`Error:\n${result.errorMessage}`);
-	}
-	if (result.exitCode !== 0 && result.stderr.trim()) {
-		sections.push(`Stderr:\n${truncateTailText(result.stderr.trim())}`);
-	}
-	return sections.join("\n\n");
+	return `Subagent #${result.id}${turnLabel} ${statusLabel}`;
+}
+
+// Budget includes the marker. Keep the tail on a UTF-8 boundary, including on errors.
+function compactTail(text: string, bytes: number, marker = "[truncated] "): string {
+	if (Buffer.byteLength(text) <= bytes) return text;
+	// Tiny budgets get the short marker so some of the text itself survives.
+	if (bytes < marker.length + 40) marker = "[truncated] ";
+	if (bytes <= marker.length) return bytes > 0 ? marker.slice(0, bytes) : "";
+	return marker + sliceUtf8Tail(text, bytes - marker.length).tail;
+}
+
+const CUT_MARKER = /^\.\.\. \[truncated \d+ bytes from start\]\n\n/;
+function stripCutMarker(text: string): string { return text.replace(CUT_MARKER, ""); }
+
+function formatResult(result: SettledResult, bytes: number): string {
+	const header = resultHeader(result) + "\nResult:\n";
+	const sections: [string, string][] = [];
+	if (result.errorMessage) sections.push(["Error", stripCutMarker(result.errorMessage)]);
+	const stderr = result.stderr.trim();
+	if (result.status === "error" && stderr) sections.push(["Stderr", stderr]);
+	const available = bytes - Buffer.byteLength(header);
+	// Diagnostics never take more than a third, so the answer always keeps real room.
+	const per = Math.min(384, Math.floor(available / (3 * Math.max(1, sections.length))));
+	// Truncate only the body so each diagnostic keeps its label.
+	const diag = sections.map(([label, body]) => {
+		const heading = `\n${label}:\n`;
+		return heading + compactTail(body, Math.max(0, per - heading.length));
+	}).join("");
+	const bodyBytes = available - Buffer.byteLength(diag);
+	let text = result.finalText || "(the subagent produced no final message)";
+	// The stored text may already carry a cut marker; drop it before cutting again.
+	if (Buffer.byteLength(text) > bodyBytes) text = stripCutMarker(text);
+	const body = compactTail(text, bodyBytes,
+		`[truncated; subagent_list {id:${result.id}} has the transcript path] `);
+	return header + body + diag;
 }
 
 function formatResultBatch(results: SettledResult[]): string {
-	return results.map(formatSettledResult).join("\n\n---\n\n");
+	// At most MAX_BATCH_TURNS per envelope, so every turn always gets an ID and space.
+	const bytes = Math.min(2048, Math.floor(MAX_BATCH_BYTES / results.length) - 2);
+	return results.map(result => formatResult(result, bytes)).join("\n\n");
+}
+
+function resultDetails(result: SettledResult): string {
+	return `${resultHeader(result)} · ${Math.round(result.elapsedMs / 1000)}s\n${formatUsage(result.usage)}\nTranscript: ${result.sessionFile}` +
+		(result.errorMessage ? `\nError: ${truncateTailText(result.errorMessage, 2048)}` : "") +
+		(result.stderr.trim() ? `\nStderr:\n${truncateTailText(result.stderr.trim(), 2048)}` : "");
 }
 
 interface ParsedCommand {
@@ -242,7 +288,7 @@ function parseCommandOptions(input: string): ParsedCommand {
 		if (rest === "--" || rest.startsWith("-- ")) {
 			return { options, rest: rest.slice(2).trimStart() };
 		}
-		const flagMatch = rest.match(/^--(model|thinking|skills|write)(?:=([^\s]+))?(?:\s+|$)/);
+		const flagMatch = rest.match(/^--(model|thinking|skills|write|notify-only)(?:=([^\s]+))?(?:\s+|$)/);
 		if (!flagMatch) {
 			const flag = rest.match(/^\S+/)?.[0] || rest;
 			return { options, rest: "", error: `Unknown or malformed option: ${flag}` };
@@ -251,9 +297,10 @@ function parseCommandOptions(input: string): ParsedCommand {
 		const flag = flagMatch[1];
 		let value = flagMatch[2];
 		rest = rest.slice(flagMatch[0].length);
-		if (flag === "write") {
-			if (value !== undefined) return { options, rest: "", error: "--write does not take a value" };
-			options.writeAccess = true;
+		if (flag === "write" || flag === "notify-only") {
+			if (value !== undefined) return { options, rest: "", error: `--${flag} does not take a value` };
+			if (flag === "write") options.writeAccess = true;
+			else options.notifyOnly = true;
 			rest = rest.trimStart();
 			continue;
 		}
@@ -314,8 +361,17 @@ function childEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 
 export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) {
 	const agents: Map<number, SubState> = new Map();
-	let pendingResults: SettledResult[] = [];
+	const maxConcurrent = options.maxConcurrent ?? Number(process.env.PI_SUBAGENT_MAX_CONCURRENT);
+	let pool = new WorkerPool<SubState>(maxConcurrent);
+	const batches = new ResultBatches<SubState, SettledResult>(MAX_BATCH_TURNS, results => {
+		pi.sendMessage({ customType: "subagent-result", content: formatResultBatch(results), display: true },
+			{ deliverAs: "followUp", triggerTurn: true });
+	});
+	let toolTurn = 0;
+	let commandBurstStart = -Infinity;
+	pi.on("turn_start", () => { toolTurn++; });
 	const killGraceMs = resolveKillGraceMs(options);
+	const drainGraceMs = typeof options.drainGraceMs === "number" && options.drainGraceMs >= 0 ? options.drainGraceMs : DEFAULT_DRAIN_GRACE_MS;
 	const sessionFileMaxAgeMs = resolveSessionFileMaxAgeMs(options);
 	let nextId = 1;
 	let sessionFileSequence = 0;
@@ -323,14 +379,19 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	let lifecycleGeneration = 0;
 	let shuttingDown = false;
 	let widgetCtx: any;
-	const createChildDocsDirectory = options.createChildDocsDirectory ??
-		(() => fs.mkdtempSync(path.join(os.tmpdir(), "subagent-widget-child-")));
+	const helperPath = fileURLToPath(new URL("./subagent-widget/strip-pi-docs.mjs", import.meta.url));
+	const resolveChildDocsExtension = options.resolveChildDocsExtension ?? (() => helperPath);
+	let streamPaint: ReturnType<typeof setTimeout> | undefined;
+	let rowCache = new WeakMap<SubState, { width: number; theme: any; line: string }>();
 	let sharedTimer: ReturnType<typeof setInterval> | undefined;
 	let widgetVersion = 0;
 	let widgetRegistered = false;
 	let widgetUi: any;
-	let activeComponent: { invalidate(): void } | undefined;
+	let activeComponent: { invalidate(frameOnly?: boolean): void } | undefined;
 	let activeTui: { requestRender?: () => void } | undefined;
+
+	pi.registerEntryRenderer<{ text: string; details: string }>(NOTICE_TYPE, (entry, { expanded }) =>
+		new Text(sanitizeDisplayText((entry.data?.text ?? "") + (expanded ? `\n${entry.data?.details ?? ""}` : "")), 0, 0));
 
 	function syncManagementTools() {
 		const active = pi.getActiveTools();
@@ -344,6 +405,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	}
 
 	function resolveSkillPaths(skills: string[] | undefined, cwd: string): { paths: string[]; error?: string } {
+		if (!skills?.length) return { paths: [] };
 		const skillCommands = pi.getCommands().filter(command => command.source === "skill");
 		const paths: string[] = [];
 		for (const skill of skills ?? []) {
@@ -429,14 +491,15 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	}
 
 	function formatSubagentRow(state: SubState, width: number, theme: any): string {
-		const statusColor = state.status === "running" ? "accent"
+		const status = state.queuedTask !== undefined ? "queued" : state.status;
+		const statusColor = status === "queued" ? "dim" : state.status === "running" ? "accent"
 			: state.status === "done" ? "success" : "error";
-		const statusIcon = state.status === "running" ? "●"
+		const statusIcon = status === "queued" ? "○" : state.status === "running" ? "●"
 			: state.status === "done" ? "✓" : "✗";
 		const turnLabel = state.turnCount > 1 ? ` T${state.turnCount}` : "";
-		const elapsedLabel = `${Math.max(0, Math.round(state.elapsed / 1000))}s`;
+		const elapsedLabel = status === "queued" ? "-" : `${Math.max(0, Math.round(state.elapsed / 1000))}s`;
 		const toolLabel = state.status === "running" && state.currentTool ? state.currentTool : "-";
-		const plainTask = sanitizeDisplayText(state.task.replace(/[\r\n\t]+/g, " ").trim())
+		const plainTask = sanitizeDisplayText((state.queuedTask ?? state.task).replace(/[\r\n\t]+/g, " ").trim())
 			.replace(/\x1b\[[0-9;]*m/g, "");
 		const taskBudget = width <= 40 ? Math.max(6, Math.min(20, Math.floor(width / 3))) : 20;
 		// Truncate task label without ellipsis and strip any reset code so dim styling stays intact.
@@ -465,7 +528,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				theme.fg(statusColor, `${statusIcon} #${state.id}`) +
 				(turnLabel ? theme.fg("dim", turnLabel) : "") +
 				" " +
-				theme.fg(statusColor, state.status) +
+				theme.fg(statusColor, status) +
 				theme.fg("dim", ` ${elapsedLabel}`) +
 				(taskLabel ? " " + theme.fg("dim", taskLabel) : "") +
 				theme.fg("dim", ` Tools: ${state.toolCount} [${toolLabel}]`);
@@ -485,7 +548,13 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			theme.fg("dim", lead) + theme.fg("accent", title) + theme.fg("dim", "─".repeat(tailWidth)),
 			width,
 		);
-		const rows = Array.from(agents.values()).map(state => formatSubagentRow(state, width, theme));
+		const rows = Array.from(agents.values(), state => {
+			const hit = rowCache.get(state);
+			if (hit?.width === width && hit.theme === theme) return hit.line;
+			const line = formatSubagentRow(state, width, theme);
+			rowCache.set(state, { width, theme, line });
+			return line;
+		});
 		const bottomBorder = fitToWidth(theme.fg("dim", "─".repeat(width)), width);
 		return [topBorder, ...rows, bottomBorder];
 	}
@@ -497,9 +566,16 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		}
 	}
 
+	function streamChanged(state: SubState) {
+		rowCache.delete(state);
+		if (streamPaint || !activeComponent) return;
+		streamPaint = setTimeout(() => { streamPaint = undefined; requestWidgetRender(); }, 100);
+		streamPaint.unref?.();
+	}
+
 	function requestWidgetRender(): void {
 		widgetVersion++;
-		activeComponent?.invalidate();
+		activeComponent?.invalidate(true);
 		activeTui?.requestRender?.();
 	}
 
@@ -510,10 +586,11 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 					const now = Date.now();
 					let running = false;
 					for (const state of agents.values()) {
-						if (state.status === "running" && !state.cancelled) {
+						if (state.status === "running" && !state.cancelled && !pool.isQueued(state)) {
 							running = true;
 							if (state.startTime !== undefined) {
 								state.elapsed = now - state.startTime;
+								rowCache.delete(state);
 							}
 						}
 					}
@@ -536,6 +613,8 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	 */
 	function clearWidget(ctx: any = widgetCtx): void {
 		stopSharedTimer();
+		clearTimeout(streamPaint);
+		streamPaint = undefined;
 		const ui = widgetUi ?? ctx?.ui;
 		if (widgetRegistered && ui?.setWidget) {
 			try { ui.setWidget("subagents", undefined); } catch {}
@@ -547,7 +626,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		widgetVersion++;
 	}
 
-	function updateWidgets() {
+	function updateWidgets(changed?: SubState) {
+		if (changed) rowCache.delete(changed);
+		clearTimeout(streamPaint);
+		streamPaint = undefined;
 		if (agents.size === 0) {
 			clearWidget(widgetCtx);
 			return;
@@ -557,7 +639,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		if (!widgetCtx?.ui?.setWidget) return;
 
 		if (widgetRegistered && widgetUi === widgetCtx.ui) {
-			activeComponent?.invalidate();
+			activeComponent?.invalidate(true);
 			activeTui?.requestRender?.();
 			return;
 		}
@@ -587,7 +669,8 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 						cachedLines = renderWidgetLines(width, theme);
 						return cachedLines;
 					},
-					invalidate() {
+					invalidate(frameOnly = false) {
+						if (!frameOnly) rowCache = new WeakMap();
 						cachedWidth = undefined;
 						cachedLines = undefined;
 					},
@@ -614,19 +697,17 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	function hasRunningSubagents(): boolean {
 		for (const state of agents.values()) {
-			if (state.status === "running" && !state.cancelled) return true;
+			if (state.status === "running" && !state.cancelled && !pool.isQueued(state)) return true;
 		}
 		return false;
 	}
 
-	function flushPendingResultsIfSettled() {
-		if (pendingResults.length === 0 || hasRunningSubagents()) return;
-		const batch = pendingResults.splice(0, pendingResults.length);
-		pi.sendMessage({
-			customType: "subagent-result",
-			content: formatResultBatch(batch),
-			display: true,
-		}, { deliverAs: "followUp", triggerTurn: true });
+	function resetScheduler() {
+		// Killed children may still be draining; a fresh pool keeps them from throttling new launches.
+		pool.clear();
+		pool = new WorkerPool<SubState>(maxConcurrent);
+		batches.clear();
+		commandBurstStart = -Infinity;
 	}
 
 	function clearKillTimer(state: SubState) {
@@ -681,18 +762,20 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 	function removeSubagent(id: number, ctx: any): { found: boolean; wasRunning: boolean } {
 		const state = agents.get(id);
 		if (!state) return { found: false, wasRunning: false };
-		const wasRunning = state.status === "running";
+		// A queued launch has no process yet: removing it is not a kill.
+		const wasRunning = state.status === "running" && !pool.isQueued(state);
 		void cancelSubagent(state).then(() => deleteSessionFile(state), () => deleteSessionFile(state));
 		agents.delete(id);
 		updateWidgets();
 		syncManagementTools();
-		pendingResults = pendingResults.filter(result => result.id !== id);
-		flushPendingResultsIfSettled();
+		pool.remove(state);
+		batches.remove(state);
 		return { found: true, wasRunning };
 	}
 
 	function prepareTurnState(state: SubState, task: string) {
 		state.status = "running";
+		state.latestResult = undefined;
 		state.cancelled = false;
 		state.task = task;
 		state.lastLine = "";
@@ -802,7 +885,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				if (delta?.type === "text_delta") {
 					const chunk = delta.delta || "";
 					if (appendLastLine(state, chunk)) {
-						updateWidgets();
+						streamChanged(state);
 					}
 				}
 			} else if (type === "tool_execution_start") {
@@ -810,17 +893,17 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				if (typeof event.toolName === "string" && event.toolName) {
 					state.currentTool = event.toolName;
 				}
-				updateWidgets();
+				streamChanged(state);
 			} else if (type === "tool_execution_end") {
 				if (!event.toolName || state.currentTool === event.toolName) {
 					state.currentTool = undefined;
 				}
-				updateWidgets();
+				streamChanged(state);
 			} else if (type === "message_end") {
 				const message = event.message;
 				if (!message || typeof message !== "object") return;
 				if (message.role === "assistant") {
-					state.lastAssistantText = extractAssistantText(message);
+					state.lastAssistantText = truncateTailText(extractAssistantText(message));
 					state.stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
 					state.assistantErrorMessage = typeof message.errorMessage === "string" && message.errorMessage.trim()
 						? message.errorMessage.trim()
@@ -839,12 +922,13 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		} catch {}
 	}
 
-	function spawnAgent(
-		state: SubState,
-		prompt: string,
-		ctx: any,
-		options: SpawnOptions = {},
-	): Promise<void> {
+	function scheduleAgent(state: SubState, prompt: string, ctx: any, options: SpawnOptions, origin: "tool" | "command") {
+		// Freeze the selected model and launch environment before a queued start.
+		const env = { ...process.env };
+		const now = Date.now();
+		if (origin === "command" && now - commandBurstStart > 100) commandBurstStart = now;
+		const key = origin === "command" ? `command:${commandBurstStart}` : `turn:${toolTurn}`;
+		state.continueError = undefined;
 		const parentProvider = ctx.model?.provider?.trim();
 		const parentModelId = ctx.model?.id?.trim();
 		const hasParentModel = parentProvider && parentModelId
@@ -854,17 +938,44 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			: FALLBACK_MODEL;
 		const model = options.model?.trim() || state.model || parentModel;
 		const thinking = options.thinking || state.thinking || pi.getThinkingLevel();
-		state.continueError = undefined;
-		const tools = options.writeAccess ? "read,grep,find,ls,bash,edit,write" : "read,grep,find,ls";
-		let childDocsExtensionDir: string | undefined;
-		let proc: any;
-		const cleanupChildDocsExtension = () => {
-			if (childDocsExtensionDir) {
-				try { fs.rmSync(childDocsExtensionDir, { recursive: true, force: true }); } catch {}
+		// Join only now: anything above that throws must not leave an open batch member behind.
+		const finish = options.notifyOnly
+			? (result?: SettledResult) => { if (result) pi.appendEntry(NOTICE_TYPE, { text: formatResult(result, MAX_RESULT_BYTES), details: resultDetails(result) }); }
+			: batches.join(key, state);
+		pool.submit(state, wasQueued => {
+			state.queuedTask = state.queuedModel = state.queuedThinking = undefined;
+			let done: Promise<void>;
+			try { done = spawnAgent(state, prompt, ctx, options, model, thinking, env, finish); }
+			catch (error) { finish(undefined); throw error; }
+			if (!state.proc) {
+				// An immediate caller gets the launch error directly. A queued caller has
+				// already terminated its turn and must receive the failure as a result.
+				const error = state.continueError ?? state.error;
+				if (wasQueued && error) {
+					// The parent turn already ended; surface the failure where the user can see it.
+					try { ctx.ui.notify(`Subagent #${state.id}: ${error}`, "error"); } catch {}
+				}
+				let failed: SettledResult | undefined;
+				if (wasQueued) {
+					failed = { id: state.id, turnCount: state.turnCount + 1, sessionFile: state.sessionFile,
+						elapsedMs: 0, status: "error", exitCode: null, finalText: "Launch failed", stderr: "", usage: emptyUsage(), errorMessage: error };
+					state.latestResult = failed;
+					// The turn that was promised to the parent failed; do not leave a green row behind.
+					state.status = "error";
+				}
+				finish(failed);
+				updateWidgets(state);
 			}
-		};
+			return done;
+		});
+		if (pool.isQueued(state)) { state.queuedTask = prompt; state.queuedModel = model; state.queuedThinking = thinking; updateWidgets(state); }
+	}
+
+	function spawnAgent(state: SubState, prompt: string, ctx: any, options: SpawnOptions, model: string,
+		thinking: ThinkingLevel, env: NodeJS.ProcessEnv, finish: (result?: SettledResult) => void): Promise<void> {
+		const tools = options.writeAccess ? "read,grep,find,ls,bash,edit,write" : "read,grep,find,ls";
+		let proc: any;
 		const failLaunch = (prefix: string, error: unknown): Promise<void> => {
-			cleanupChildDocsExtension();
 			const message = `${prefix}: ${error instanceof Error ? error.message : String(error)}`;
 			state.proc = undefined;
 			if (options.isContinuation) {
@@ -876,19 +987,12 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			state.turnCount = 0;
 			state.error = message;
 			appendLastLine(state, message);
-			updateWidgets();
+			updateWidgets(state);
 			return Promise.resolve();
 		};
 		let launchStage = "prepare";
 		try {
-			childDocsExtensionDir = createChildDocsDirectory();
-			const childDocsExtension = path.join(childDocsExtensionDir, "strip-pi-docs.mjs");
-			fs.writeFileSync(childDocsExtension, `export default function (pi) {
-	pi.on("before_agent_start", (event) => {
-		const systemPrompt = event.systemPrompt.replace(/\\n\\n<docs>[\\s\\S]*?<\\/docs>(?=\\n\\n|$)/, "");
-		return systemPrompt === event.systemPrompt ? undefined : { systemPrompt };
-	});
-}`);
+			const childDocsExtension = resolveChildDocsExtension();
 			const args = [
 				"--mode", "json", "-p", "--session", state.sessionFile, "--no-extensions",
 				"--no-skills", "--no-mcp", "--no-prompt-templates", "--no-themes", "--offline",
@@ -898,12 +1002,12 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			for (const skill of options.skills ?? []) args.push("--skill", skill);
 			args.push("--");
 			if (!prompt.startsWith("@")) args.push(prompt);
-			const invocation = getPiInvocation(args);
+			const invocation = getPiInvocation(args, env);
 			launchStage = "spawn";
 			proc = spawn(invocation.command, invocation.args, {
 				cwd: ctx.cwd,
 				stdio: ["pipe", "pipe", "pipe"],
-				env: childEnvironment(process.env),
+				env: childEnvironment(env),
 			});
 		} catch (error) {
 			return failLaunch(
@@ -922,10 +1026,12 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		state.thinking = thinking;
 		state.error = undefined;
 		state.continueError = undefined;
-		updateWidgets();
+		updateWidgets(state);
 
 		return new Promise<void>((resolve) => {
-			proc.stdin!.end(prompt.startsWith("@") ? prompt : "");
+			// EPIPE from an already-exited child arrives as an async 'error' event; unhandled it would crash the host.
+			proc.stdin!.on("error", () => {});
+			try { proc.stdin!.end(prompt.startsWith("@") ? prompt : ""); } catch {}
 
 			state.proc = proc;
 
@@ -936,8 +1042,9 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			let settled = false;
 			let buffer = "";
 
+			let closeTimer: ReturnType<typeof setTimeout> | undefined;
 			const cleanupProcessResources = () => {
-				cleanupChildDocsExtension();
+				clearTimeout(closeTimer);
 				clearKillTimer(state);
 				if (state.proc === proc) state.proc = undefined;
 			};
@@ -958,27 +1065,31 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				state.elapsed = Date.now() - startTime;
 				state.status = status;
 				if (errorMessage) appendLastLine(state, `Error: ${errorMessage}`);
-				updateWidgets();
+				updateWidgets(state);
 
-				ctx.ui.notify(
-					`Subagent #${state.id} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
-					state.status === "done" ? "success" : "error"
-				);
+				// A throwing UI (stale ctx) must not strand the worker slot or the result batch.
+				try {
+					ctx.ui.notify(
+						`Subagent #${state.id} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
+						state.status === "done" ? "success" : "error"
+					);
+				} catch {}
 
-				pendingResults.push({
+				const result: SettledResult = {
 					id: state.id,
 					turnCount: state.turnCount,
-					prompt,
+					sessionFile: state.sessionFile,
 					elapsedMs: state.elapsed,
 					status: state.status,
 					exitCode,
 					finalText: state.lastAssistantText,
 					stderr: state.stderrChunks.join(""),
 					usage: { ...state.usage },
-					errorMessage,
-				});
-				flushPendingResultsIfSettled();
-				resolve();
+					errorMessage: errorMessage && truncateTailText(errorMessage),
+				};
+				state.latestResult = result;
+				// A stale host can throw while delivering; that must not escape the child event handler.
+				try { finish(result); } catch {} finally { resolve(); }
 			};
 
 			proc.stdout!.setEncoding("utf-8");
@@ -994,22 +1105,33 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			proc.stderr!.on("data", (chunk: string) => {
 				if (state.cancelled) return;
 				appendStderrTail(state, chunk);
-				if (chunk.trim()) {
-					appendLastLine(state, chunk);
-					updateWidgets();
-				}
+				if (chunk.trim() && appendLastLine(state, chunk)) streamChanged(state);
 			});
 
-			proc.on("exit", () => {
-				clearKillTimer(state);
-			});
-
-			proc.on("close", (code: number | null) => {
-				if (buffer.trim()) processLine(state, buffer);
+			const finishExited = (code: number | null) => {
+				// The grace timer and a late 'close' can both arrive; only the first may touch state.
+				if (settled) return;
+				const tail = buffer;
+				buffer = "";
+				if (tail.trim()) processLine(state, tail);
 				const hasAssistantError = Boolean(state.assistantErrorMessage) || state.stopReason === "error";
 				const status = code === 0 && !hasAssistantError ? "done" : "error";
 				settleResult(status, code, state.assistantErrorMessage);
+			};
+
+			proc.on("exit", (code: number | null) => {
+				clearKillTimer(state);
+				// A background grandchild can hold the stdio pipes open so 'close' never fires, which
+				// would pin the worker slot forever. Give the pipes a grace period, then settle anyway.
+				if (settled) return;
+				closeTimer = setTimeout(() => {
+					try { proc.stdout?.destroy(); proc.stderr?.destroy(); } catch {}
+					finishExited(code);
+				}, drainGraceMs);
+				closeTimer.unref?.();
 			});
+
+			proc.on("close", (code: number | null) => finishExited(code));
 
 			proc.on("error", (err: Error) => {
 				settleResult("error", null, err.message);
@@ -1070,13 +1192,13 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			updateWidgets();
 
 			// Fire-and-forget
-			spawnAgent(state, args.task, ctx, { model: args.model, thinking: args.thinking, skills: skillResolution.paths, writeAccess: args.writeAccess });
+			scheduleAgent(state, args.task, ctx, { model: args.model, thinking: args.thinking, skills: skillResolution.paths, writeAccess: args.writeAccess }, "tool");
 			if (state.status === "error") {
 				return { isError: true, content: [{ type: "text", text: state.error ?? `Could not launch subagent #${id}.` }] };
 			}
 
 			return {
-				content: [{ type: "text", text: `Subagent #${id} spawned with ${state.model} (${state.thinking} thinking) and is running in background.` }],
+				content: [{ type: "text", text: `Subagent #${id} ${pool.isQueued(state) ? "queued" : "spawned"}.` }],
 				terminate: true,
 			};
 		},
@@ -1105,7 +1227,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				return { content: [{ type: "text", text: `Error: No subagent #${args.id} found.` }] };
 			}
 			if (state.status === "running") {
-				return { content: [{ type: "text", text: `Error: Subagent #${args.id} is still running.` }] };
+				return { content: [{ type: "text", text: `Error: Subagent #${args.id} is ${pool.isQueued(state) ? "queued" : "still running"}.` }] };
 			}
 			const skillResolution = resolveSkillPaths(args.skills, ctx.cwd);
 			if (skillResolution.error) {
@@ -1120,14 +1242,18 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 				return { content: [{ type: "text", text: `Subagent #${state.id} continuation cancelled before it started.` }] };
 			}
 
-			spawnAgent(state, args.prompt, ctx, { model: args.model, thinking: args.thinking, skills: skillResolution.paths, writeAccess: args.writeAccess, isContinuation: true });
+			// Directory setup yields even on a cache hit: recheck before reserving the ID.
+			if (state.proc || pool.isQueued(state)) return { isError: true, content: [{ type: "text", text: `Subagent #${state.id} is already busy.` }] };
+			scheduleAgent(state, args.prompt, ctx, { model: args.model, thinking: args.thinking, skills: skillResolution.paths, writeAccess: args.writeAccess, isContinuation: true }, "tool");
 			if (state.continueError) {
 				return { isError: true, content: [{ type: "text", text: state.continueError }] };
 			}
-			ctx.ui.notify(`Continuing Subagent #${args.id} (Turn ${state.turnCount})…`, "info");
+			ctx.ui.notify(pool.isQueued(state)
+				? `Queued Subagent #${args.id} continuation (Turn ${state.turnCount + 1})…`
+				: `Continuing Subagent #${args.id} (Turn ${state.turnCount})…`, "info");
 
 			return {
-				content: [{ type: "text", text: `Subagent #${args.id} continuing with ${state.model} (${state.thinking} thinking) in background.` }],
+				content: [{ type: "text", text: `Subagent #${args.id} ${pool.isQueued(state) ? "queued" : "continuing"}.` }],
 				terminate: true,
 			};
 		},
@@ -1155,17 +1281,27 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 
 	pi.registerTool({
 		name: "subagent_list",
-		description: "List existing subagents and their status.",
+		description: "List subagents; pass id for latest usage, diagnostics and full transcript path.",
 		defaultActive: false,
-		parameters: Type.Object({}),
-		execute: async () => {
+		parameters: Type.Object({ id: Type.Optional(Type.Number()) }),
+		execute: async (_callId, args) => {
+			if (args.id !== undefined) {
+				const s = agents.get(args.id);
+				const queued = s ? pool.isQueued(s) : false;
+				// While a turn is queued or running, the stored result belongs to the previous turn.
+				const current = s?.latestResult && s.status !== "running" && !queued ? s.latestResult : undefined;
+				const text = current ? resultDetails(current) : s ? `#${s.id}: ${queued ? "queued" : s.status}` : `Unknown subagent #${args.id}`;
+				return { content: [{ type: "text", text }] };
+			}
 			if (agents.size === 0) {
 				return { content: [{ type: "text", text: "No active subagents." }] };
 			}
 
 			const list = Array.from(agents.values()).map(s => {
 				const continueNote = s.continueError ? ` [last continue failed: ${s.continueError}]` : "";
-				return `#${s.id} [${s.status.toUpperCase()}] (Turn ${s.turnCount}, ${s.model}, ${s.thinking}) - ${s.task}${continueNote}`;
+				const queued = pool.isQueued(s);
+				const meta = queued ? `Turn ${s.turnCount + 1}, ${s.queuedModel ?? s.model}, ${s.queuedThinking ?? s.thinking}` : `Turn ${s.turnCount}, ${s.model}, ${s.thinking}`;
+				return `#${s.id} [${queued ? "QUEUED" : s.status.toUpperCase()}] (${meta}) - ${capLinePrefix((s.queuedTask ?? s.task).replace(/\s+/g, " ").trim(), 96).value}${continueNote}`;
 			}).join("\n");
 
 			return {
@@ -1173,10 +1309,10 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			};
 		},
 	});
-	// ── /sub [--model <model>] [--thinking <level>] [--skills <list>] [--write] <task> ──
+	// ── /sub [--model <model>] [--thinking <level>] [--skills <list>] [--write] [--notify-only] <task> ──
 
 	pi.registerCommand("sub", {
-		description: "Spawn a subagent: /sub [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <task>. Skills and write access apply only to this launch.",
+		description: "Spawn a subagent: /sub [--model provider/model] [--thinking level] [--skills a,b] [--write] [--notify-only] [--] <task>. Skills and write access apply only to this launch. --notify-only shows the result without waking the parent model. Concurrency is capped (PI_SUBAGENT_MAX_CONCURRENT, default 4); extra launches queue.",
 		handler: async (args, ctx) => {
 			widgetCtx = ctx;
 
@@ -1187,7 +1323,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			}
 			const task = parsed.rest;
 			if (!task) {
-				ctx.ui.notify("Usage: /sub [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <task>. Skills and write access apply only to this launch.", "error");
+				ctx.ui.notify("Usage: /sub [--model provider/model] [--thinking level] [--skills a,b] [--write] [--notify-only] [--] <task>. Skills and write access apply only to this launch. --notify-only shows the result without waking the parent model. Concurrency is capped (PI_SUBAGENT_MAX_CONCURRENT, default 4); extra launches queue.", "error");
 				return;
 			}
 			const skillResolution = resolveSkillPaths(parsed.options.skills, ctx.cwd);
@@ -1227,7 +1363,8 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			updateWidgets();
 
 			// Fire-and-forget
-			spawnAgent(state, task, ctx, parsed.options);
+			scheduleAgent(state, task, ctx, parsed.options, "command");
+			if (pool.isQueued(state)) { ctx.ui.notify(`Subagent #${id} queued.`, "info"); return; }
 			if (state.status === "error") {
 				ctx.ui.notify(state.error ?? `Could not launch subagent #${id}.`, "error");
 				return;
@@ -1236,17 +1373,17 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		},
 	});
 
-	// ── /subcont <id> [--model <model>] [--thinking <level>] [--skills <list>] [--write] <prompt> ──
+	// ── /subcont <id> [--model <model>] [--thinking <level>] [--skills <list>] [--write] [--notify-only] <prompt> ──
 
 	pi.registerCommand("subcont", {
-		description: "Continue a subagent: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <prompt>. Skills and write access apply only to this turn.",
+		description: "Continue a subagent: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--notify-only] [--] <prompt>. Skills and write access apply only to this turn. --notify-only shows the result without waking the parent model. Concurrency is capped (PI_SUBAGENT_MAX_CONCURRENT, default 4); extra turns queue.",
 		handler: async (args, ctx) => {
 			widgetCtx = ctx;
 
 			const trimmed = args?.trim() ?? "";
 			const idMatch = trimmed.match(/^(\d+)(?:\s+|$)/);
 			if (!idMatch) {
-				ctx.ui.notify("Usage: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <prompt>. Skills and write access apply only to this turn.", "error");
+				ctx.ui.notify("Usage: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--notify-only] [--] <prompt>. Skills and write access apply only to this turn. --notify-only shows the result without waking the parent model. Concurrency is capped (PI_SUBAGENT_MAX_CONCURRENT, default 4); extra turns queue.", "error");
 				return;
 			}
 
@@ -1259,7 +1396,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			const prompt = parsed.rest;
 
 			if (!prompt) {
-				ctx.ui.notify("Usage: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--] <prompt>. Skills and write access apply only to this turn.", "error");
+				ctx.ui.notify("Usage: /subcont <id> [--model provider/model] [--thinking level] [--skills a,b] [--write] [--notify-only] [--] <prompt>. Skills and write access apply only to this turn. --notify-only shows the result without waking the parent model. Concurrency is capped (PI_SUBAGENT_MAX_CONCURRENT, default 4); extra turns queue.", "error");
 				return;
 			}
 
@@ -1270,7 +1407,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			}
 
 			if (state.status === "running") {
-				ctx.ui.notify(`Subagent #${num} is still running — wait for it to finish first.`, "warning");
+				ctx.ui.notify(`Subagent #${num} is ${pool.isQueued(state) ? "queued" : "still running"} — wait for it to finish first.`, "warning");
 				return;
 			}
 			const skillResolution = resolveSkillPaths(parsed.options.skills, ctx.cwd);
@@ -1288,7 +1425,9 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			parsed.options.skills = skillResolution.paths;
 
 			// Resume: update state for a new turn
-			spawnAgent(state, prompt, ctx, { model: parsed.options.model, thinking: parsed.options.thinking, skills: skillResolution.paths, writeAccess: parsed.options.writeAccess, isContinuation: true });
+			if (state.proc || pool.isQueued(state)) { ctx.ui.notify(`Subagent #${num} is already busy.`, "warning"); return; }
+			scheduleAgent(state, prompt, ctx, { ...parsed.options, isContinuation: true }, "command");
+			if (pool.isQueued(state)) { ctx.ui.notify(`Subagent #${num} queued.`, "info"); return; }
 			if (state.continueError) {
 				ctx.ui.notify(state.continueError, "error");
 				return;
@@ -1345,7 +1484,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 			const total = agents.size;
 			agents.clear();
 			syncManagementTools();
-			pendingResults = [];
+			resetScheduler();
 			nextId = 1;
 			clearWidget(ctx);
 			await Promise.all(removals);
@@ -1379,7 +1518,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		agents.clear();
 		// Removing restored management tools here would clear Pi's pending names for other extensions.
 		// Empty-state removal waits for before_agent_start; tools restored after that boundary sync on the next prompt.
-		pendingResults = [];
+		resetScheduler();
 		nextId = 1;
 		widgetCtx = ctx;
 		clearWidget(ctx);
@@ -1393,7 +1532,7 @@ export default function (pi: ExtensionAPI, options: SubagentWidgetOptions = {}) 
 		const hadSubagents = agents.size > 0;
 		agents.clear();
 		if (hadSubagents) syncManagementTools();
-		pendingResults = [];
+		resetScheduler();
 		clearWidget(ctx);
 		// A SIGTERM-ignoring child delays quit through the grace period; descendants holding stdio cannot delay it indefinitely.
 		let timeout: ReturnType<typeof setTimeout> | undefined;
