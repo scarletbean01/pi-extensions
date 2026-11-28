@@ -896,10 +896,25 @@ test("manual acceptance fixture helper covers scenarios 1-5 read-only without se
 			assert.deepEqual(list.damaged, []);
 
 			const attemptOutputLive = await getChecked(`/api/factories/${fixture.factories.attemptOutput}/live`);
-			const attemptOutputNodeIds = new Set(attemptOutputLive.graph.nodes.map((node: any) => node.id));
+			const attemptOutputNodes = new Map(attemptOutputLive.graph.nodes.map((node: any) => [node.id, node]));
 			for (const nodeId of ["attempt_history", "attempt_review", "command_exit", "command_signal", "missing_result", "still_running"]) {
-				assert.ok(attemptOutputNodeIds.has(nodeId), `manual Attempt output fixture is missing node ${nodeId}`);
+				assert.ok(attemptOutputNodes.has(nodeId), `manual Attempt output fixture is missing node ${nodeId}`);
 			}
+			const historyNode = attemptOutputNodes.get("attempt_history");
+			assert.equal(historyNode.status_text, "Waiting (parked)");
+			assert.equal(historyNode.current_attempt.attempt_number, 3);
+			assert.equal(attemptOutputNodes.get("attempt_review").status_text, "Waiting (parked)");
+			assert.equal(attemptOutputNodes.get("command_exit").current_attempt.command.exit_code, 17);
+			assert.equal(attemptOutputNodes.get("command_signal").current_attempt.command.signal, "SIGTERM");
+			assert.equal(attemptOutputNodes.get("still_running").status_text, "Running");
+
+			const attemptOutputBodies = new Map<string, any>();
+			for (const nodeId of ["attempt_history", "attempt_review", "command_exit", "command_signal", "missing_result", "still_running"]) {
+				attemptOutputBodies.set(nodeId, await getChecked(`/api/factories/${fixture.factories.attemptOutput}/output?node=${nodeId}`));
+			}
+			assert.equal(attemptOutputBodies.get("attempt_history").evidence, "available");
+			assert.equal(attemptOutputBodies.get("missing_result").evidence, "unavailable");
+			assert.equal(attemptOutputBodies.get("still_running").evidence, "not applicable");
 
 			// Scenario 1 & 5 initial node state: bound v2 run while v3 is current; left parked with completed_at, right running with timestamps.
 			const alphaLive = await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/live`);

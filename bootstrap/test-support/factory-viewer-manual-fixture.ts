@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import type test from "node:test";
 import { outcomeClaimPath } from "../cancellation.ts";
 import { createRequest, inTransaction, openRequestDatabase } from "../factory-requests.ts";
-import { handoffClaimPath } from "../handoff.ts";
+import { handoffClaimPath, inputDigest } from "../handoff.ts";
 import { buildProposalRow, insertProposalRow } from "../constraint-proposals.ts";
 import { atomicJson, completionRecord, readJson, readyPath, resultPath, type WorkerConfig } from "../session-store.ts";
 import { BootstrapService, type ExecResult, type GenerateRequest } from "../lifecycle.ts";
@@ -326,7 +326,7 @@ export async function createManualAcceptanceFixture(
 	}
 
 	// Dedicated manual Attempt output run. Keep the existing five-scenario fixture unchanged;
-	// this separate checkout adds a finished three-attempt review loop and command evidence.
+	// this separate checkout has three finished attempts in an unfinalized review loop, so both members stay parked.
 	const outputCwd = join(root, "project-attempt-output");
 	mkdirSync(join(outputCwd, ".pi", "agents"), { recursive: true });
 	mkdirSync(join(outputCwd, "extensions"), { recursive: true });
@@ -367,6 +367,9 @@ export async function createManualAcceptanceFixture(
 	const historyCfg = readJson<WorkerConfig>(join(outputDir, `${historyEntry.instance_id}.config.json`));
 	const reviewCfgOutput = readJson<WorkerConfig>(join(outputDir, `${reviewEntryOutput.instance_id}.config.json`));
 	const attemptTimes = ["2026-11-28T10:00:01.000Z", "2026-11-28T10:00:02.000Z", "2026-11-28T10:00:03.000Z"];
+	const historyInputDigests = new Map<number, string>();
+	const structuredPathSample = "/fixture-only/structured/review.json";
+	const structuredWrapSample = `STRUCTUREDCHECK${"s".repeat(640)}`;
 	const historyResults = [
 		{ status: "failure" as const, summary: "Attempt 1 found two synthetic checks to fix." },
 		{ status: "partial" as const, summary: "Attempt 2 fixed one check; one synthetic warning remains." },
@@ -384,7 +387,7 @@ export async function createManualAcceptanceFixture(
 		].join("\n");
 		const config = { ...historyCfg, attempt_id: attemptId };
 		const completedAt = attemptTimes[index]!;
-		atomicJson(resultPath(outputDir, attemptId), completionRecord(config, {
+		const historyCompletion = completionRecord(config, {
 			agent_name: historyEntry.persona_name,
 			node_id: "attempt_history",
 			status: resultMeta.status,
@@ -399,10 +402,21 @@ export async function createManualAcceptanceFixture(
 				applicability: "current",
 				reason: `Synthetic verification for attempt ${attemptNumber}.`,
 			}],
-			warnings: [`Synthetic warning recorded for attempt ${attemptNumber}.`],
-			next_steps: [`Review the fixture's attempt ${attemptNumber} notes.`],
-			outputs: { review_iteration: attemptNumber, outcome: resultMeta.status, fixture_only: true },
-		}, "sent", completedAt));
+			warnings: [attemptNumber === 3
+				? `Synthetic warning path ${structuredPathSample}; WRAPWARNING${"w".repeat(640)}`
+				: `Synthetic warning recorded for attempt ${attemptNumber}.`],
+			next_steps: [attemptNumber === 3
+				? `Review the fixture path ${structuredPathSample}; WRAPNEXTSTEP${"n".repeat(640)}`
+				: `Review the fixture's attempt ${attemptNumber} notes.`],
+			outputs: {
+				review_iteration: attemptNumber,
+				outcome: resultMeta.status,
+				fixture_only: true,
+				...(attemptNumber === 3 ? { sample_path: structuredPathSample, wrap_sample: structuredWrapSample } : {}),
+			},
+		}, "sent", completedAt);
+		atomicJson(resultPath(outputDir, attemptId), historyCompletion);
+		historyInputDigests.set(attemptNumber, inputDigest(historyCompletion.result));
 
 		const reviewAttemptId = `${reviewEntryOutput.instance_id}.${attemptNumber}`;
 		const reviewConfig = { ...reviewCfgOutput, attempt_id: reviewAttemptId };
@@ -422,6 +436,7 @@ export async function createManualAcceptanceFixture(
 		source: typeof historyEntry | typeof reviewEntryOutput,
 		sourceAttempt: number,
 		handoffId: string,
+		digest = "0".repeat(64),
 	) => atomicJson(handoffClaimPath(outputDir, `${destination.instance_id}.${destinationAttempt}`, source.instance_id), {
 		version: 1,
 		handoff_id: handoffId,
@@ -429,7 +444,7 @@ export async function createManualAcceptanceFixture(
 		run_id: outputRun.task_id,
 		source: { node_id: source.node_id, attempt_id: `${source.instance_id}.${sourceAttempt}`, instance_id: source.instance_id, session_id: `session-${source.instance_id}` },
 		destination: { node_id: destination.node_id, attempt_id: `${destination.instance_id}.${destinationAttempt}`, instance_id: destination.instance_id },
-		input_digest: "0".repeat(64),
+		input_digest: digest,
 		offer: "matched",
 		accepted_at: attemptTimes[destinationAttempt - 1]!,
 	});
@@ -441,9 +456,16 @@ export async function createManualAcceptanceFixture(
 			attempt: attemptNumber,
 		});
 		writeReviewHandoffClaim(historyEntry, attemptNumber, reviewEntryOutput, attemptNumber - 1, `manual-feedback-${attemptNumber}`);
-		writeReviewHandoffClaim(reviewEntryOutput, attemptNumber, historyEntry, attemptNumber, `manual-review-${attemptNumber}`);
+		writeReviewHandoffClaim(
+			reviewEntryOutput,
+			attemptNumber,
+			historyEntry,
+			attemptNumber,
+			`manual-review-${attemptNumber}`,
+			historyInputDigests.get(attemptNumber)!,
+		);
 	}
-	writeReviewHandoffClaim(reviewEntryOutput, 1, historyEntry, 1, "manual-review-1");
+	writeReviewHandoffClaim(reviewEntryOutput, 1, historyEntry, 1, "manual-review-1", historyInputDigests.get(1)!);
 
 	const commandExitEntry = outputEntry("command_exit");
 	const commandExitCfg = readJson<WorkerConfig>(join(outputDir, `${commandExitEntry.instance_id}.config.json`));
@@ -457,9 +479,9 @@ export async function createManualAcceptanceFixture(
 		started_at: "2026-11-28T10:01:00.000Z",
 		finished_at: "2026-11-28T10:01:01.000Z",
 		duration_ms: 1000,
-		stdout_bytes: Buffer.byteLength("fixture stdout: three synthetic checks\n"),
+		stdout_bytes: Buffer.byteLength(`fixture stdout: three synthetic checks\nFake path ${structuredPathSample}\nWRAPCOMMAND${"c".repeat(640)}\n`),
 		stderr_bytes: Buffer.byteLength("fixture stderr: expected sample failure\n"),
-		stdout_excerpt: "fixture stdout: three synthetic checks\n",
+		stdout_excerpt: `fixture stdout: three synthetic checks\nFake path ${structuredPathSample}\nWRAPCOMMAND${"c".repeat(640)}\n`,
 		stderr_excerpt: "fixture stderr: expected sample failure\n",
 	};
 	atomicJson(resultPath(outputDir, commandExitEntry.attempt_id!), completionRecord(commandExitCfg, {
@@ -903,7 +925,7 @@ async function runCli() {
 		console.log(`PID: ${process.pid}`);
 		console.log(`Temp root (deleted on exit): ${fixture.root}`);
 		console.log(`  Scenario 1/4/5 (alpha, v2 running / v3 current): ${viewer.url}/?factory=${fixture.factories.alphaLiveV2}&view=live`);
-		console.log(`  Attempt output (review history, command, absence): ${viewer.url}/?factory=${fixture.factories.attemptOutput}&view=live`);
+		console.log(`  Attempt output (review history and commands):    ${viewer.url}/?factory=${fixture.factories.attemptOutput}&view=live`);
 		console.log(`  Scenario 2a    (beta, reserved/blocked):         ${viewer.url}/?factory=${fixture.factories.betaUnreleased}&view=live`);
 		console.log(`  Scenario 2b/3  (gamma, contradictory/uncertain): ${viewer.url}/?factory=${fixture.factories.gammaUncertain}&view=live`);
 		console.log(`  Scenario 3/4   (delta, unmanaged/blocked):       ${viewer.url}/?factory=${fixture.factories.deltaUnmanaged}&view=live`);
