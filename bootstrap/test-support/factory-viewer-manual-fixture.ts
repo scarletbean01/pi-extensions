@@ -414,6 +414,22 @@ export async function createManualAcceptanceFixture(
 				fixture_only: true,
 				...(attemptNumber === 3 ? { sample_path: structuredPathSample, wrap_sample: structuredWrapSample } : {}),
 			},
+			...(attemptNumber === 3 ? {
+				artifacts: [
+					{
+						type: "file",
+						action: "created",
+						path: "fixture-only/report.txt",
+						description: "Synthetic fixture report summary without a real file.",
+					},
+					{
+						type: "file",
+						action: "modified",
+						path: "fixture-only/notes.md",
+						description: "Synthetic review notes for the manual fixture.",
+					},
+				],
+			} : {}),
 		}, "sent", completedAt);
 		atomicJson(resultPath(outputDir, attemptId), historyCompletion);
 		historyInputDigests.set(attemptNumber, inputDigest(historyCompletion.result));
@@ -685,6 +701,8 @@ export async function createManualAcceptanceFixture(
 		"SENTINEL_MANUAL_OUTPUT_BRIEF",
 		"fixture-fake-command",
 		"fixture-fake-signal-command",
+		"fixture-only/report.txt",
+		"fixture-only/notes.md",
 		"SENTINEL_MANUAL_BRIEF_V1",
 		"SENTINEL_MANUAL_BRIEF_V2",
 		"SENTINEL_MANUAL_BETA_PROMPT",

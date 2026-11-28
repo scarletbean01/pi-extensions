@@ -913,6 +913,22 @@ test("manual acceptance fixture helper covers scenarios 1-5 read-only without se
 				attemptOutputBodies.set(nodeId, await getChecked(`/api/factories/${fixture.factories.attemptOutput}/output?node=${nodeId}`));
 			}
 			assert.equal(attemptOutputBodies.get("attempt_history").evidence, "available");
+			const historyOutputRes = await fetch(`${viewer.url}/api/factories/${fixture.factories.attemptOutput}/output?node=attempt_history`);
+			const historyOutputRaw = await historyOutputRes.text();
+			assert.equal(historyOutputRes.status, 200);
+			assert.equal(historyOutputRaw.includes("fixture-only/report.txt"), false, "/output must never return artifact path fixture-only/report.txt");
+			assert.equal(historyOutputRaw.includes("fixture-only/notes.md"), false, "/output must never return artifact path fixture-only/notes.md");
+			assert.equal(historyOutputRaw.includes("Synthetic fixture report summary without a real file."), true);
+			assert.equal(historyOutputRaw.includes("Synthetic review notes for the manual fixture."), true);
+			const newestHistoryArtifacts = attemptOutputBodies.get("attempt_history").attempts[0].artifacts;
+			assert.equal(newestHistoryArtifacts.total_count, 2);
+			assert.deepEqual(
+				newestHistoryArtifacts.items.map((item: any) => item.description),
+				[
+					"Synthetic fixture report summary without a real file.",
+					"Synthetic review notes for the manual fixture.",
+				],
+			);
 			for (const nodeId of ["command_exit", "command_signal", "attempt_review"]) {
 				assert.equal(attemptOutputBodies.get(nodeId).evidence, "available", `${nodeId} attempt evidence should be available`);
 			}

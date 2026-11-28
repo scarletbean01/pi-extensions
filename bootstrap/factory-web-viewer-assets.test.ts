@@ -215,7 +215,7 @@ test("served HTML shell, stylesheets, and app.js have strict local-only hygiene,
 			assert.ok(htmlAttrsMatch, "app.js must define SAFE_HTML_ATTRS");
 			const parsedHtmlAttrs = [...htmlAttrsMatch[1].matchAll(/"([^"]+)"/g)].map(m => m[1]);
 			assert.deepEqual(
-				parsedHtmlAttrs.filter(a => /^on|^(?:srcdoc|style|src)$/i.test(a) || !["class", "id", "href", "type", "name", "value", "required", "disabled", "open", "for", "scope", "role", "tabindex", "aria-label", "aria-labelledby", "aria-current", "aria-pressed", "aria-expanded", "aria-controls", "aria-live", "aria-busy", "data-view", "data-factory-id", "data-node-id", "data-focus-key"].includes(a)),
+				parsedHtmlAttrs.filter(a => /^on|^(?:srcdoc|style|src)$/i.test(a) || !["class", "id", "href", "type", "name", "value", "required", "disabled", "open", "for", "scope", "role", "tabindex", "aria-label", "aria-labelledby", "aria-level", "aria-current", "aria-pressed", "aria-expanded", "aria-controls", "aria-live", "aria-busy", "data-view", "data-factory-id", "data-node-id", "data-focus-key"].includes(a)),
 				[],
 				"SAFE_HTML_ATTRS must stay strictly within the explicit safe attribute allowlist",
 			);
@@ -3162,7 +3162,14 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				assert.equal(detailsEls[0]!.hasAttribute("open"), true, "Latest attempt disclosure must be open");
 				assert.equal(detailsEls[1]!.hasAttribute("open"), false, "Structured outputs disclosure must start collapsed");
 				assert.equal(detailsEls[2]!.hasAttribute("open"), false, "Artifacts disclosure must start collapsed");
-				assert.ok(collectAllElements(detailsEls[0]!.children[0] as FakeElement).some(e => e.tagName === "h5"), "Attempt summary must contain real h5 heading");
+				const attemptSummary = detailsEls[0]!.children[0] as FakeElement;
+				const attemptHeadingEl = attemptSummary.children.find(
+					(e): e is FakeElement => e instanceof FakeElement && e.getAttribute("role") === "heading" && e.getAttribute("aria-level") === "5",
+				);
+				assert.ok(attemptHeadingEl, "Attempt summary must expose an aria-level=5 heading");
+				assert.equal(attemptHeadingEl.tagName, "strong", "Attempt summary heading must use an inline strong element instead of block h5");
+				assert.equal(attemptHeadingEl.classList.contains("inline"), false, "Attempt summary heading must not carry unused .inline class");
+				assert.ok(attemptSummary.children.some((e): e is FakeElement => e instanceof FakeElement && e.classList.contains("chip")), "Attempt summary heading and status chip must be siblings");
 				assert.ok(collectAllElements(detailsEls[1]!.children[0] as FakeElement).some(e => e.tagName === "h6"), "Structured outputs summary must contain real h6 heading");
 				assert.ok(collectAllElements(detailsEls[2]!.children[0] as FakeElement).some(e => e.tagName === "h6"), "Artifacts summary must contain real h6 heading");
 				assert.match(outSection.textContent, /… \[truncated, 19 items omitted\]/);
@@ -3347,7 +3354,7 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 					return collectAllElements(appT03.content).find(e => e.tagName === "section" && e.children.some(c => c.children.includes(h)))!;
 				};
 
-				// 1. Multi-attempt node: 3 disclosures newest first, only newest open, older collapsed & keyboard-reachable summaries with h5 + tone chips + omitted marker
+				// 1. Multi-attempt node: 3 disclosures newest first, only newest open, older collapsed & keyboard-reachable summaries with inline level-5 heading + tone chips + omitted marker
 				await clickNode("loop_node");
 				const loopSec = getOutputSection();
 				const loopDetails = collectAllElements(loopSec).filter(e => e.tagName === "details");
@@ -3361,9 +3368,15 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				assert.match(headings[2]!.textContent, /Attempt 20 of 25.*✕ Failed/);
 				for (const summaryEl of headings) {
 					assert.equal(summaryEl.tagName, "summary");
-					assert.ok(collectAllElements(summaryEl).some(e => e.tagName === "h5"));
-					const chip = collectAllElements(summaryEl).find(e => e.classList.contains("chip"))!;
-					assert.ok(chip);
+					const headingChild = summaryEl.children.find(
+						(e): e is FakeElement => e instanceof FakeElement && e.getAttribute("role") === "heading" && e.getAttribute("aria-level") === "5",
+					);
+					assert.ok(headingChild, "Attempt summary must contain inline role=heading aria-level=5 child");
+					assert.equal(headingChild.tagName, "strong", "Attempt summary heading must not be a block h1-h6 tag");
+					assert.equal(headingChild.classList.contains("inline"), false, "Attempt summary heading must not carry unused .inline class");
+					assert.equal(summaryEl.children.some(e => e instanceof FakeElement && /^h[1-6]$/.test(e.tagName)), false, "Attempt summary must not contain block heading tags");
+					const chip = summaryEl.children.find((e): e is FakeElement => e instanceof FakeElement && e.classList.contains("chip"))!;
+					assert.ok(chip, "Status chip must be a direct sibling of the heading inside summary");
 					assert.ok(chip.classList.contains("lighten-5") || chip.classList.contains("lighten-4") || chip.classList.contains("lighten-3"));
 				}
 				assert.match(loopSec.textContent, /… \[truncated, 2 attempts omitted\]/);
