@@ -81,6 +81,7 @@ const SAFE_HTML_ATTRS = new Set([
   "tabindex",
   "aria-label",
   "aria-labelledby",
+  "aria-level",
   "aria-current",
   "aria-pressed",
   "aria-expanded",
@@ -1100,15 +1101,17 @@ function upsertAttemptDisclosure(att, attKey, isOpen, defaultOpen, ds, existingE
   const bodySig = JSON.stringify(att);
   const focusKey = `output:${attKey}`;
 
+  const summaryChildren = () => [
+    el("strong", attemptHeading, { role: "heading", "aria-level": "5" }),
+    document.createTextNode(" "),
+    statusPill(att.status, statusLabel),
+  ];
+
   let entry = existingEntry;
   if (!entry) {
     const details = el("details", undefined, { class: "collapsible" });
     const summaryEl = el("summary", undefined, { class: "collapsible-header", "data-focus-key": focusKey });
-    summaryEl.append(
-      el("h5", attemptHeading, { class: "inline" }),
-      document.createTextNode(" "),
-      statusPill(att.status, statusLabel),
-    );
+    summaryEl.append(...summaryChildren());
     const body = el("div", undefined, { class: "collapsible-body" });
     const built = buildAttemptBodyNodes(att, attKey, ds, null, nextTrackedDisclosures, nextFocusTargets);
     body.append(...built.nodes);
@@ -1124,11 +1127,7 @@ function upsertAttemptDisclosure(att, attKey, isOpen, defaultOpen, ds, existingE
     };
   } else {
     if (entry.summarySig !== summarySig) {
-      entry.summaryEl.replaceChildren(
-        el("h5", attemptHeading, { class: "inline" }),
-        document.createTextNode(" "),
-        statusPill(att.status, statusLabel),
-      );
+      entry.summaryEl.replaceChildren(...summaryChildren());
       entry.summarySig = summarySig;
     }
     if (entry.bodySig !== bodySig) {
