@@ -948,6 +948,173 @@ test("served safe.js pure client logic enforces safeHref, typed live absence, nu
 			assert.equal(sameOrderDiff.added.length, 1);
 			const reorderedDiff = safe.planKeyedDiff(["a", "b"], [{ id: "b" }, { id: "a" }], (n) => n.id);
 			assert.equal(reorderedDiff.orderChanged, true);
+
+			// 10. Ticket 04 pure output refetch decision helper
+			const baseRunningNode = {
+				id: "build",
+				status: "running",
+				current_attempt: { attempt_id: "build.1", attempt_number: 1, max_attempts: 3, status: "running", updated_at: "2026-11-28T12:00:00Z" },
+			};
+			const baseFinishedNode = {
+				id: "build",
+				status: "succeeded",
+				current_attempt: {
+					attempt_id: "build.1",
+					attempt_number: 1,
+					max_attempts: 3,
+					status: "succeeded",
+					result_status: "success",
+					completed_at: "2026-11-28T12:00:02Z",
+					updated_at: "2026-11-28T12:00:02Z",
+				},
+			};
+			const refetchCases: Array<{
+				name: string;
+				prev: unknown;
+				next: unknown;
+				opts?: { prevFactoryId?: string; nextFactoryId?: string };
+				want: boolean;
+			}> = [
+				{
+					name: "no change while running (only updated_at bumped)",
+					prev: baseRunningNode,
+					next: {
+						...baseRunningNode,
+						current_attempt: { ...baseRunningNode.current_attempt, updated_at: "2026-11-28T12:00:02Z" },
+					},
+					opts: { prevFactoryId: "fac_1", nextFactoryId: "fac_1" },
+					want: false,
+				},
+				{
+					name: "pending to running (unfinished)",
+					prev: { id: "build", status: "pending", current_attempt: { attempt_id: "build.1", attempt_number: 1, status: "pending" } },
+					next: baseRunningNode,
+					want: false,
+				},
+				{
+					name: "running to finished (succeeded)",
+					prev: baseRunningNode,
+					next: baseFinishedNode,
+					opts: { prevFactoryId: "fac_1", nextFactoryId: "fac_1" },
+					want: true,
+				},
+				{
+					name: "running to finished (failed)",
+					prev: baseRunningNode,
+					next: { id: "build", status: "failed", current_attempt: { attempt_id: "build.1", attempt_number: 1, status: "failed", completed_at: "2026-11-28T12:00:03Z" } },
+					want: true,
+				},
+				{
+					name: "running to finished (needs_attention)",
+					prev: baseRunningNode,
+					next: { id: "build", status: "needs_attention", current_attempt: { attempt_id: "build.1", attempt_number: 1, status: "needs_attention" } },
+					want: true,
+				},
+				{
+					name: "running to parked (finished attempt waiting in review loop)",
+					prev: baseRunningNode,
+					next: {
+						id: "build",
+						status: "waiting",
+						parked: true,
+						current_attempt: { attempt_id: "build.1", attempt_number: 1, status: "waiting", result_status: "success", completed_at: "2026-11-28T12:00:02Z" },
+					},
+					want: true,
+				},
+				{
+					name: "same finished across polls",
+					prev: baseFinishedNode,
+					next: { ...baseFinishedNode },
+					opts: { prevFactoryId: "fac_1", nextFactoryId: "fac_1" },
+					want: false,
+				},
+				{
+					name: "same parked across polls",
+					prev: { id: "build", status: "waiting", parked: true, current_attempt: { attempt_id: "build.1", attempt_number: 1, status: "waiting", result_status: "success", completed_at: "2026-11-28T12:00:02Z" } },
+					next: { id: "build", status: "waiting", parked: true, current_attempt: { attempt_id: "build.1", attempt_number: 1, status: "waiting", result_status: "success", completed_at: "2026-11-28T12:00:02Z" } },
+					want: false,
+				},
+				{
+					name: "new attempt number (finished 1 -> running 2)",
+					prev: baseFinishedNode,
+					next: {
+						id: "build",
+						status: "running",
+						current_attempt: { attempt_id: "build.2", attempt_number: 2, max_attempts: 3, status: "running" },
+					},
+					want: true,
+				},
+				{
+					name: "new attempt number without attempt_id change",
+					prev: { id: "build", status: "running", current_attempt: { attempt_number: 1, status: "running" } },
+					next: { id: "build", status: "running", current_attempt: { attempt_number: 2, status: "running" } },
+					want: true,
+				},
+				{
+					name: "new attempt id with same attempt number",
+					prev: { id: "build", status: "running", current_attempt: { attempt_id: "build.1a", attempt_number: 1, status: "running" } },
+					next: { id: "build", status: "running", current_attempt: { attempt_id: "build.1b", attempt_number: 1, status: "running" } },
+					want: true,
+				},
+				{
+					name: "attempt id became unverified absence",
+					prev: baseRunningNode,
+					next: {
+						id: "build",
+						status: "needs_attention",
+						current_attempt: { attempt_id: { absence: "evidence unavailable" }, attempt_number: 1, status: "needs_attention" },
+					},
+					want: true,
+				},
+				{
+					name: "node switched",
+					prev: baseFinishedNode,
+					next: { id: "review", status: "succeeded", current_attempt: { attempt_id: "build.1", attempt_number: 1, status: "succeeded", completed_at: "2026-11-28T12:00:02Z" } },
+					opts: { prevFactoryId: "fac_1", nextFactoryId: "fac_1" },
+					want: true,
+				},
+				{
+					name: "factory switched",
+					prev: baseFinishedNode,
+					next: baseFinishedNode,
+					opts: { prevFactoryId: "fac_1", nextFactoryId: "fac_2" },
+					want: true,
+				},
+				{
+					name: "missing prev node (initial selection)",
+					prev: null,
+					next: { id: "build" },
+					want: true,
+				},
+				{
+					name: "missing fields unchanged",
+					prev: {},
+					next: {},
+					want: false,
+				},
+				{
+					name: "missing current_attempt running to finished",
+					prev: { id: "build", status: "running" },
+					next: { id: "build", status: "succeeded" },
+					want: true,
+				},
+				{
+					name: "selected node vanished (null next)",
+					prev: baseFinishedNode,
+					next: null,
+					opts: { prevFactoryId: "fac_1", nextFactoryId: "fac_1" },
+					want: false,
+				},
+				{
+					name: "selected node vanished (undefined next)",
+					prev: baseRunningNode,
+					next: undefined,
+					want: false,
+				},
+			];
+			for (const tc of refetchCases) {
+				assert.equal(safe.shouldRefetchNodeOutput(tc.prev, tc.next, tc.opts), tc.want, `shouldRefetchNodeOutput failed for: ${tc.name}`);
+			}
 		},
 	);
 });
@@ -2042,22 +2209,50 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 					}
 					if (url === "/api/factories/fac_1/output?node=build") {
 						outputFetchCount++;
+						if (phase >= 2) {
+							return jsonResp(200, {
+								factory_id: "fac_1",
+								node_id: "build",
+								run_id: "run-1",
+								bound_version: "v1",
+								evidence: "available",
+								total_attempts: 1,
+								omitted_attempts: 0,
+								attempts: [
+									{
+										attempt_id: "build.1",
+										attempt_number: 1,
+										max_attempts: 2,
+										status: "succeeded",
+										status_text: "Succeeded",
+										evidence: "available",
+										summary: "Build finished summary",
+										detail: "Build finished detail",
+										outputs_text: "{\n  \"ok\": true\n}",
+									},
+								],
+							});
+						}
 						return jsonResp(200, {
 							factory_id: "fac_1",
 							node_id: "build",
 							run_id: "run-1",
 							bound_version: "v1",
 							evidence: "not applicable",
-							latest_attempt: {
-								attempt_id: "build.1",
-								attempt_number: 1,
-								max_attempts: 2,
-								status: "running",
-								status_text: "Running",
-								evidence: "not applicable",
-								absence: "not applicable",
-								explanation: "Attempt output is recorded when the attempt finishes.",
-							},
+							total_attempts: 1,
+							omitted_attempts: 0,
+							attempts: [
+								{
+									attempt_id: "build.1",
+									attempt_number: 1,
+									max_attempts: 2,
+									status: "running",
+									status_text: "Running",
+									evidence: "not applicable",
+									absence: "not applicable",
+									explanation: "Attempt output is recorded when the attempt finishes.",
+								},
+							],
 						});
 					}
 					phase++;
@@ -2099,22 +2294,32 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				const detailsBefore = collectAllElements(appLiveFlow.content).find(e => e.tagName === "details" && e.textContent.includes("Optional attempt timestamps"))!;
 				assert.ok(detailsBefore);
 				detailsBefore.open = true;
+				const attemptDetailsBefore = collectAllElements(appLiveFlow.content).find(e => e.tagName === "details" && e.textContent.includes("Attempt 1 of 2"))!;
+				assert.ok(attemptDetailsBefore);
+				assert.equal(attemptDetailsBefore.open, true);
 
-				// Poll 2, 3, 4 (same run-1): SVG, nodes, viewBox, selection, <details>.open, and activeElement MUST survive!
+				// Poll 2 (build transitions running -> succeeded -> refetches /output once), Poll 3 & 4 (build stays succeeded -> no extra /output fetch):
+				// SVG, nodes, viewBox, selection, open disclosures, and activeElement MUST survive!
 				for (const expectedChecked of ["2026-11-24T12:00:02Z", "2026-11-24T12:00:04Z", "2026-11-24T12:00:06Z"]) {
 					await appLiveFlow.advanceTimers(2000);
-					assert.equal(outputFetchCount, 1, "Two-second poll must not re-fetch /output in Ticket 01");
+					assert.equal(outputFetchCount, 2, "Poll must re-fetch /output once on running->succeeded and never on unchanged polls");
 					const svgNow = collectAllElements(appLiveFlow.content).find(e => e.tagName === "svg")!;
 					const nodeBuildNow = collectAllElements(svgNow).find(e => e.getAttribute("data-node-id") === "build")!;
 					const nodeReviewNow = collectAllElements(svgNow).find(e => e.getAttribute("data-node-id") === "review")!;
 					const allDetails = collectAllElements(appLiveFlow.content).filter(e => e.tagName === "details");
-					assert.equal(allDetails.length, 2, "Same-run poll must keep Attempt output and timestamps <details>");
-					const detailsNow = allDetails.find(e => e.textContent.includes("Optional attempt timestamps"))!;
+					assert.equal(allDetails.length, 3, "Same-run poll must keep Attempt output, Structured outputs, and timestamps <details>");
+					const detailsNow = allDetails.find(e => e.children[0]?.textContent.includes("Optional attempt timestamps"))!;
+					const attemptDetailsNow = allDetails.find(e => e.children[0]?.textContent.includes("Attempt 1 of 2"))!;
+					const outputsDetailsNow = allDetails.find(e => e.children[0]?.textContent.includes("Structured outputs"))!;
 					assert.equal(svgNow, svgBefore, "Same-run poll must NOT recreate <svg>");
 					assert.equal(nodeBuildNow, nodeBuildBefore, "Same-run poll must NOT recreate node <g>");
 					assert.equal(nodeReviewNow, nodeReviewBefore, "Same-run poll must NOT recreate untouched node <g>");
 					assert.equal(detailsNow, detailsBefore, "Same-run poll must NOT recreate <details>");
+					assert.equal(attemptDetailsNow, attemptDetailsBefore, "Output refetch must patch attempt <details> in place");
 					assert.equal(detailsNow.open, true, "<details>.open must survive same-run refresh");
+					assert.equal(attemptDetailsNow.open, true, "Attempt disclosure open state must survive output refetch and subsequent polls");
+					assert.equal(outputsDetailsNow.open, false, "Structured outputs disclosure must start collapsed");
+					assert.match(attemptDetailsNow.textContent, /Build finished summary/);
 					assert.ok(detailsNow.textContent.includes(expectedChecked), "<details> timestamps must update in place");
 					assert.equal(svgNow.getAttribute("viewBox"), zoomedViewBox, "viewBox pan/zoom must survive same-run refresh");
 					assert.equal(nodeBuildNow.getAttribute("aria-pressed"), "true", "Selected node must survive same-run refresh");
@@ -3194,6 +3399,480 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				assert.match(unvDetails[1]!.textContent, /… \[truncated, 500 characters omitted\]/);
 				assert.match(unvSec.textContent, /Total attempt count could not be verified/);
 				appUnv.assertSafeDom();
+			}
+
+			// M. Ticket 04 Live output refetch, abort & stale discard across poll-triggered refetch, in-section error, open-disclosure & focus preservation (Scenario 5)
+			{
+				const makeLive = (checkedAt: string, nodeA: Record<string, unknown>, extraNodes: Array<Record<string, unknown>> = []) => ({
+					factory_id: "fac_t04",
+					current_version: "v1",
+					checked_at: checkedAt,
+					state: "running",
+					reason: "Running",
+					run: { run_id: "run-t04", attempt_id: "att-t04", bound_version: "v1" },
+					outcome: "incomplete",
+					settlement: "unsettled",
+					capacity_release: "held",
+					graph: {
+						evidence: "available",
+						bound_version: "v1",
+						topology: "graph",
+						nodes: [
+							nodeA,
+							{ id: "node_b", kind: "agent", status: "waiting", status_text: "Waiting", current_attempt: { attempt_id: "b.1", attempt_number: 1, max_attempts: 3, instance_id: "i-b", process_state: "alive", resource_state: "open" } },
+							...extraNodes,
+						],
+						edges: [],
+					},
+				});
+
+				// M1 + M4: Node finishing during poll, plain poll issues 0 requests, new attempt opens by default while user's open/closed choices & focus survive
+				let liveStep = 0;
+				let outACalls = 0;
+				const appM1 = bootApp("?factory=fac_t04&view=live", async (url) => {
+					if (url === "/api/factories") return jsonResp(200, [{ factory_id: "fac_t04", name: "FacT04", current_version: "v1", management: "managed" }]);
+					if (url === "/api/factories/fac_t04/live") {
+						liveStep++;
+						// 1: initial running att 1; 2: plain running poll; 3: att 1 succeeded; 4: plain succeeded poll; 5: att 2 running; 6: att 2 succeeded
+						if (liveStep <= 2) {
+							return jsonResp(200, makeLive(`2026-11-28T12:00:0${liveStep}Z`, {
+								id: "node_a",
+								kind: "agent",
+								status: "running",
+								status_text: "Running",
+								current_attempt: { attempt_id: "a.1", attempt_number: 1, max_attempts: 3, instance_id: "i-a", process_state: "alive", resource_state: "open", updated_at: `2026-11-28T12:00:0${liveStep}Z` },
+							}));
+						}
+						if (liveStep <= 4) {
+							return jsonResp(200, makeLive(`2026-11-28T12:00:0${liveStep}Z`, {
+								id: "node_a",
+								kind: "agent",
+								status: "succeeded",
+								status_text: "Succeeded",
+								current_attempt: { attempt_id: "a.1", attempt_number: 1, max_attempts: 3, instance_id: "i-a", process_state: "exited", resource_state: "closed", result_status: "success", completed_at: "2026-11-28T12:00:03Z" },
+							}));
+						}
+						if (liveStep === 5) {
+							return jsonResp(200, makeLive("2026-11-28T12:00:05Z", {
+								id: "node_a",
+								kind: "agent",
+								status: "running",
+								status_text: "Running",
+								current_attempt: { attempt_id: "a.2", attempt_number: 2, max_attempts: 3, instance_id: "i-a", process_state: "alive", resource_state: "open" },
+							}));
+						}
+						return jsonResp(200, makeLive("2026-11-28T12:00:06Z", {
+							id: "node_a",
+							kind: "agent",
+							status: "succeeded",
+							status_text: "Succeeded",
+							current_attempt: { attempt_id: "a.2", attempt_number: 2, max_attempts: 3, instance_id: "i-a", process_state: "exited", resource_state: "closed", result_status: "success", completed_at: "2026-11-28T12:00:06Z" },
+						}));
+					}
+					if (url === "/api/factories/fac_t04/output?node=node_a") {
+						outACalls++;
+						if (liveStep <= 2) {
+							return jsonResp(200, {
+								factory_id: "fac_t04",
+								node_id: "node_a",
+								evidence: "not applicable",
+								total_attempts: 1,
+								omitted_attempts: 0,
+								attempts: [{
+									attempt_id: "a.1",
+									attempt_number: 1,
+									max_attempts: 3,
+									status: "running",
+									status_text: "Running",
+									evidence: "not applicable",
+									absence: "not applicable",
+									explanation: "Attempt output is recorded when the attempt finishes.",
+								}],
+							});
+						}
+						const att1Finished = {
+							attempt_id: "a.1",
+							attempt_number: 1,
+							max_attempts: 3,
+							status: "succeeded",
+							status_text: "Succeeded",
+							evidence: "available",
+							summary: "Attempt 1 completed summary",
+							detail: "Attempt 1 completed detail",
+							outputs_text: "{\n  \"attempt\": 1\n}",
+							artifacts: {
+								items: [{ type: "file", action: "created", description: "Artifact 1 desc" }],
+								total_count: 1,
+								omitted_count: 0,
+							},
+						};
+						if (liveStep <= 4) {
+							return jsonResp(200, {
+								factory_id: "fac_t04",
+								node_id: "node_a",
+								evidence: "available",
+								total_attempts: 1,
+								omitted_attempts: 0,
+								attempts: [att1Finished],
+							});
+						}
+						if (liveStep === 5) {
+							return jsonResp(200, {
+								factory_id: "fac_t04",
+								node_id: "node_a",
+								evidence: "not applicable",
+								total_attempts: 2,
+								omitted_attempts: 0,
+								attempts: [
+									{
+										attempt_id: "a.2",
+										attempt_number: 2,
+										max_attempts: 3,
+										status: "running",
+										status_text: "Running",
+										evidence: "not applicable",
+										absence: "not applicable",
+										explanation: "Attempt output is recorded when the attempt finishes.",
+									},
+									att1Finished,
+								],
+							});
+						}
+						return jsonResp(200, {
+							factory_id: "fac_t04",
+							node_id: "node_a",
+							evidence: "available",
+							total_attempts: 2,
+							omitted_attempts: 0,
+							attempts: [
+								{
+									attempt_id: "a.2",
+									attempt_number: 2,
+									max_attempts: 3,
+									status: "succeeded",
+									status_text: "Succeeded",
+									evidence: "available",
+									summary: "Attempt 2 completed summary",
+									detail: "Attempt 2 completed detail",
+								},
+								att1Finished,
+							],
+						});
+					}
+					throw new Error(`Unexpected URL ${url}`);
+				});
+				await flushMicrotasks();
+
+				// Zoom + select node_a + focus Attempt 1 <summary>
+				const svgM1 = collectAllElements(appM1.content).find(e => e.tagName === "svg")!;
+				for (const fn of svgM1.listeners.get("wheel") ?? []) fn({ deltaY: -100, preventDefault() {} });
+				const zoomedM1 = svgM1.getAttribute("viewBox");
+				const gNodeAM1 = collectAllElements(svgM1).find(e => e.getAttribute("data-node-id") === "node_a")!;
+				for (const fn of gNodeAM1.listeners.get("click") ?? []) fn({});
+				await flushMicrotasks();
+				assert.equal(outACalls, 1);
+				assert.match(appM1.content.textContent, /Attempt output is recorded when the attempt finishes\./);
+
+				const att1Details0 = collectAllElements(appM1.content).find(e => e.tagName === "details" && e.children[0]?.textContent.includes("Attempt 1 of 3"))!;
+				const att1Summary0 = att1Details0.children[0] as FakeElement;
+				att1Summary0.focus();
+				assert.equal(appM1.fakeDocument.activeElement, att1Summary0);
+
+				// Poll 2 (plain poll while running) -> NO output refetch; focus & pan/zoom & selection preserved
+				await appM1.advanceTimers(2000);
+				assert.equal(outACalls, 1, "Plain poll with no status/attempt change must not refetch /output");
+				assert.equal(svgM1.getAttribute("viewBox"), zoomedM1);
+				assert.equal(gNodeAM1.getAttribute("aria-pressed"), "true");
+				assert.equal(appM1.fakeDocument.activeElement, att1Summary0);
+
+				// Poll 3 (att 1 transitions running -> succeeded) -> triggers refetch without page reload; focus & open disclosure survive
+				await appM1.advanceTimers(2000);
+				assert.equal(outACalls, 2, "Finishing attempt during poll must refetch /output");
+				assert.match(appM1.content.textContent, /Attempt 1 completed summary/);
+				assert.match(appM1.content.textContent, /Attempt 1 completed detail/);
+				const att1DetailsAfterFinish = collectAllElements(appM1.content).find(e => e.tagName === "details" && e.children[0]?.textContent.includes("Attempt 1 of 3"))!;
+				assert.equal(att1DetailsAfterFinish, att1Details0, "Same attempt disclosure must patch in place");
+				assert.equal(att1DetailsAfterFinish.hasAttribute("open"), true);
+				assert.equal(att1DetailsAfterFinish.open, true);
+				assert.equal(appM1.fakeDocument.activeElement, att1Summary0, "Keyboard focus on Attempt 1 summary must survive output refetch");
+				assert.equal(svgM1.getAttribute("viewBox"), zoomedM1);
+
+				// User opens Structured outputs, leaves Artifacts closed, and moves focus to Structured outputs <summary>
+				const outSubDetails = collectAllElements(att1DetailsAfterFinish).find(e => e.tagName === "details" && e.children[0]?.textContent.includes("Structured outputs"))!;
+				const artSubDetails = collectAllElements(att1DetailsAfterFinish).find(e => e.tagName === "details" && e.children[0]?.textContent.includes("Artifacts"))!;
+				assert.equal(outSubDetails.open, false);
+				assert.equal(artSubDetails.open, false);
+				outSubDetails.setAttribute("open", "");
+				const outSubSummary = outSubDetails.children[0] as FakeElement;
+				outSubSummary.focus();
+
+				// Poll 4 (same finished att 1) -> NO output refetch; open Structured outputs & focus survive
+				await appM1.advanceTimers(2000);
+				assert.equal(outACalls, 2, "Unchanged finished poll must not refetch /output");
+				assert.equal(outSubDetails.open, true);
+				assert.equal(artSubDetails.open, false);
+				assert.equal(appM1.fakeDocument.activeElement, outSubSummary);
+
+				// Poll 5 (new attempt 2 arrives as running) -> refetches /output; NEW newest attempt 2 opens by default, previously newest Attempt 1 keeps its open state + Structured outputs open + focus!
+				await appM1.advanceTimers(2000);
+				assert.equal(outACalls, 3, "New attempt appearing during poll must refetch /output");
+				const att2Details = collectAllElements(appM1.content).find(e => e.tagName === "details" && e.children[0]?.textContent.includes("Attempt 2 of 3"))!;
+				const att1DetailsAfterAtt2 = collectAllElements(appM1.content).find(e => e.tagName === "details" && e.children[0]?.textContent.includes("Attempt 1 of 3"))!;
+				assert.equal(att2Details.open, true, "New newest attempt must open by default");
+				assert.equal(att2Details.hasAttribute("open"), true);
+				assert.equal(att1DetailsAfterAtt2, att1Details0);
+				assert.equal(att1DetailsAfterAtt2.open, true, "Previously newest attempt must keep user/prior open state");
+				assert.equal(outSubDetails.open, true, "Structured outputs open state must survive new attempt refetch");
+				assert.equal(artSubDetails.open, false, "Artifacts collapsed state must survive new attempt refetch");
+				assert.equal(appM1.fakeDocument.activeElement, outSubSummary, "Focus on Structured outputs summary must survive new attempt refetch");
+				assert.equal(svgM1.getAttribute("viewBox"), zoomedM1);
+				assert.equal(gNodeAM1.getAttribute("aria-pressed"), "true");
+
+				// Now user explicitly closes Attempt 2 (newest) and focuses Attempt 2's <summary> before Poll 6 (Attempt 2 finishes!)
+				att2Details.open = false;
+				const att2Summary = att2Details.children[0] as FakeElement;
+				att2Summary.focus();
+
+				// Poll 6 (Attempt 2 running -> succeeded) -> refetches /output; user's closed choice on Attempt 2 WINS, and focus stays on Attempt 2 <summary>!
+				await appM1.advanceTimers(2000);
+				assert.equal(outACalls, 4);
+				assert.match(appM1.content.textContent, /Attempt 2 completed summary/);
+				assert.equal(att2Details.open, false, "User closing newest attempt must win over default-open after refetch");
+				assert.equal(att2Details.hasAttribute("open"), false);
+				assert.equal(att1DetailsAfterAtt2.open, true);
+				assert.equal(outSubDetails.open, true);
+				assert.equal(appM1.fakeDocument.activeElement, att2Summary, "Keyboard focus must stay on Attempt 2 summary across refetch");
+				appM1.assertSafeDom();
+
+				// M2: Abort & stale-response discard including stale response arriving after poll-triggered refetch, node switch, factory switch, and mismatch
+				let m2LiveStep = 0;
+				let outCallIdx = 0;
+				const outSignals: AbortSignal[] = [];
+				const outResolvers: Array<(r: any) => void> = [];
+				const appM2 = bootApp("?factory=fac_1&view=live", async (url, init) => {
+					if (url === "/api/factories") {
+						return jsonResp(200, [
+							{ factory_id: "fac_1", name: "F1", current_version: "v1", management: "managed" },
+							{ factory_id: "fac_2", name: "F2", current_version: "v1", management: "managed" },
+						]);
+					}
+					if (url === "/api/factories/fac_1/live") {
+						m2LiveStep++;
+						const isFinished = m2LiveStep >= 2;
+						return jsonResp(200, {
+							factory_id: "fac_1",
+							current_version: "v1",
+							checked_at: `2026-11-28T12:00:0${m2LiveStep}Z`,
+							state: "running",
+							reason: "Running",
+							run: { run_id: "r-m2", attempt_id: "a-m2", bound_version: "v1" },
+							outcome: "incomplete",
+							settlement: "unsettled",
+							capacity_release: "held",
+							graph: {
+								evidence: "available",
+								bound_version: "v1",
+								topology: "graph",
+								nodes: [
+									{
+										id: "node_a",
+										kind: "agent",
+										status: isFinished ? "succeeded" : "running",
+										status_text: isFinished ? "Succeeded" : "Running",
+										current_attempt: {
+											attempt_id: m2LiveStep >= 3 ? "a.2" : "a.1",
+											attempt_number: m2LiveStep >= 3 ? 2 : 1,
+											max_attempts: 3,
+											instance_id: "i-a",
+											process_state: isFinished ? "exited" : "alive",
+											resource_state: isFinished ? "closed" : "open",
+											...(isFinished ? { result_status: "success", completed_at: "2026-11-28T12:00:02Z" } : {}),
+										},
+									},
+									{
+										id: "node_b",
+										kind: "agent",
+										status: "succeeded",
+										status_text: "Succeeded",
+										current_attempt: { attempt_id: "b.1", attempt_number: 1, max_attempts: 1, instance_id: "i-b", process_state: "exited", resource_state: "closed" },
+									},
+								],
+								edges: [],
+							},
+						});
+					}
+					if (url === "/api/factories/fac_2/live") {
+						return jsonResp(200, {
+							factory_id: "fac_2",
+							current_version: "v1",
+							checked_at: "2026-11-28T12:00:10Z",
+							state: "idle",
+							reason: "Fac2 idle",
+							run: null,
+							graph: { evidence: "not applicable", absence: "no records", explanation: "Idle" },
+						});
+					}
+					if (url.startsWith("/api/factories/fac_1/output")) {
+						const idx = outCallIdx++;
+						if (init?.signal) outSignals[idx] = init.signal;
+						return new Promise(res => { outResolvers[idx] = res; });
+					}
+					throw new Error(`Unexpected URL ${url}`);
+				});
+				await flushMicrotasks();
+
+				// 1. Select node_a (call 0 in-flight), then poll finishes node_a -> aborts call 0 & starts call 1
+				const gM2A = collectAllElements(appM2.content).find(e => e.getAttribute("data-node-id") === "node_a")!;
+				for (const fn of gM2A.listeners.get("click") ?? []) fn({});
+				await flushMicrotasks();
+				assert.equal(outCallIdx, 1);
+				assert.equal(outSignals[0]!.aborted, false);
+
+				await appM2.advanceTimers(2000);
+				assert.equal(outCallIdx, 2, "Poll transition must start refetch even while initial request was in flight");
+				assert.equal(outSignals[0]!.aborted, true, "Initial output request must be aborted when poll-triggered refetch starts");
+				assert.equal(outSignals[1]!.aborted, false);
+
+				// Stale call 0 resolves late ignoring abort -> must be discarded!
+				outResolvers[0]!(jsonResp(200, {
+					factory_id: "fac_1",
+					node_id: "node_a",
+					evidence: "available",
+					attempts: [{ attempt_id: "a.1", attempt_number: 1, max_attempts: 3, status: "succeeded", status_text: "Succeeded", evidence: "available", summary: "STALE_PRE_POLL_LEAK" }],
+				}));
+				await flushMicrotasks();
+				assert.equal(appM2.content.textContent.includes("STALE_PRE_POLL_LEAK"), false, "Response arriving after poll-triggered refetch started must be discarded");
+
+				// Resolve call 1 -> renders fresh finished output
+				outResolvers[1]!(jsonResp(200, {
+					factory_id: "fac_1",
+					node_id: "node_a",
+					evidence: "available",
+					attempts: [{ attempt_id: "a.1", attempt_number: 1, max_attempts: 3, status: "succeeded", status_text: "Succeeded", evidence: "available", summary: "Fresh poll output" }],
+				}));
+				await flushMicrotasks();
+				assert.match(appM2.content.textContent, /Fresh poll output/);
+
+				// 2. Poll 3 introduces attempt 2 -> starts poll-triggered refetch (call 2); switch to node_b before it resolves -> aborts call 2 & discards late response
+				await appM2.advanceTimers(2000);
+				assert.equal(outCallIdx, 3);
+				assert.equal(outSignals[2]!.aborted, false);
+				const gM2B = collectAllElements(appM2.content).find(e => e.getAttribute("data-node-id") === "node_b")!;
+				for (const fn of gM2B.listeners.get("click") ?? []) fn({});
+				await flushMicrotasks();
+				assert.equal(outSignals[2]!.aborted, true, "Switching node must abort in-flight poll-triggered refetch");
+				assert.equal(outCallIdx, 4);
+				outResolvers[2]!(jsonResp(200, {
+					factory_id: "fac_1",
+					node_id: "node_a",
+					evidence: "available",
+					attempts: [{ attempt_id: "a.2", attempt_number: 2, max_attempts: 3, status: "succeeded", status_text: "Succeeded", evidence: "available", summary: "STALE_AFTER_NODE_SWITCH" }],
+				}));
+				outResolvers[3]!(jsonResp(200, {
+					factory_id: "fac_1",
+					node_id: "node_b",
+					evidence: "available",
+					attempts: [{ attempt_id: "b.1", attempt_number: 1, max_attempts: 1, status: "succeeded", status_text: "Succeeded", evidence: "available", summary: "Node B clean output" }],
+				}));
+				await flushMicrotasks();
+				assert.equal(appM2.content.textContent.includes("STALE_AFTER_NODE_SWITCH"), false);
+				assert.match(appM2.content.textContent, /Node B clean output/);
+
+				// 3. Switch back to node_a (call 4 in-flight), then switch factory to fac_2 -> aborts call 4 & discards late response
+				for (const fn of gM2A.listeners.get("click") ?? []) fn({});
+				await flushMicrotasks();
+				assert.equal(outCallIdx, 5);
+				assert.equal(outSignals[4]!.aborted, false);
+				const fac2LinkM2 = collectAllElements(appM2.sidebar).find(e => e.tagName === "a" && (e.getAttribute("href") ?? "").includes("fac_2"))!;
+				for (const fn of fac2LinkM2.listeners.get("click") ?? []) fn({ button: 0, preventDefault() {} });
+				await flushMicrotasks();
+				assert.equal(outSignals[4]!.aborted, true, "Switching factory must abort in-flight output request");
+				outResolvers[4]!(jsonResp(200, {
+					factory_id: "fac_1",
+					node_id: "node_a",
+					evidence: "available",
+					attempts: [{ attempt_id: "a.2", attempt_number: 2, max_attempts: 3, status: "succeeded", status_text: "Succeeded", evidence: "available", summary: "STALE_AFTER_FACTORY_SWITCH" }],
+				}));
+				await flushMicrotasks();
+				assert.equal(appM2.content.textContent.includes("STALE_AFTER_FACTORY_SWITCH"), false);
+				assert.match(appM2.content.textContent, /Fac2 idle/);
+
+				// M3: Failed poll-triggered refetch shows error inside Attempt output section only, leaving graph and rest of panel untouched
+				let m3LiveStep = 0;
+				const appM3 = bootApp("?factory=fac_err&view=live", async (url) => {
+					if (url === "/api/factories") return jsonResp(200, [{ factory_id: "fac_err", name: "FacErr", current_version: "v1", management: "managed" }]);
+					if (url === "/api/factories/fac_err/live") {
+						m3LiveStep++;
+						const finished = m3LiveStep >= 2;
+						return jsonResp(200, {
+							factory_id: "fac_err",
+							current_version: "v1",
+							checked_at: `2026-11-28T12:00:0${m3LiveStep}Z`,
+							state: "running",
+							reason: "Running",
+							run: { run_id: "r-m3", attempt_id: "a-m3", bound_version: "v1" },
+							outcome: "incomplete",
+							settlement: "unsettled",
+							capacity_release: "held",
+							graph: {
+								evidence: "available",
+								bound_version: "v1",
+								topology: "graph",
+								nodes: [{
+									id: "node_a",
+									kind: "agent",
+									status: finished ? "succeeded" : "running",
+									status_text: finished ? "Succeeded" : "Running",
+									current_attempt: {
+										attempt_id: "a.1",
+										attempt_number: 1,
+										max_attempts: 2,
+										instance_id: "i-a",
+										process_state: finished ? "exited" : "alive",
+										resource_state: finished ? "closed" : "open",
+										started_at: "2026-11-28T12:00:00Z",
+										...(finished ? { completed_at: "2026-11-28T12:00:02Z" } : {}),
+									},
+								}],
+								edges: [],
+							},
+						});
+					}
+					if (url === "/api/factories/fac_err/output?node=node_a") {
+						if (m3LiveStep === 1) {
+							return jsonResp(200, {
+								factory_id: "fac_err",
+								node_id: "node_a",
+								evidence: "not applicable",
+								attempts: [{ attempt_id: "a.1", attempt_number: 1, max_attempts: 2, status: "running", status_text: "Running", evidence: "not applicable", absence: "not applicable", explanation: "Attempt output is recorded when the attempt finishes." }],
+							});
+						}
+						return jsonResp(503, { error: "Evidence unavailable" });
+					}
+					throw new Error(`Unexpected URL ${url}`);
+				});
+				await flushMicrotasks();
+				const svgM3Before = collectAllElements(appM3.content).find(e => e.tagName === "svg")!;
+				const gM3A = collectAllElements(svgM3Before).find(e => e.getAttribute("data-node-id") === "node_a")!;
+				for (const fn of gM3A.listeners.get("click") ?? []) fn({});
+				await flushMicrotasks();
+				const tsDetailsM3 = collectAllElements(appM3.content).find(e => e.tagName === "details" && e.textContent.includes("Optional attempt timestamps"))!;
+				tsDetailsM3.open = true;
+
+				// Poll 2 finishes node_a, refetch fails with 503 -> error appears inside Attempt output section only; SVG & timestamps stay intact!
+				await appM3.advanceTimers(2000);
+				const svgM3After = collectAllElements(appM3.content).find(e => e.tagName === "svg")!;
+				assert.equal(svgM3After, svgM3Before, "Failed output refetch must not disturb the SVG graph");
+				assert.equal(gM3A.getAttribute("aria-pressed"), "true");
+				assert.equal(tsDetailsM3.open, true, "Failed output refetch must leave the rest of the detail panel untouched");
+				assert.match(tsDetailsM3.textContent, /2026-11-28T12:00:02Z/);
+				const m3OutHeading = collectAllElements(appM3.content).find(e => e.tagName === "h4" && e.textContent === "Attempt output")!;
+				const m3OutSection = collectAllElements(appM3.content).find(e => e.tagName === "section" && e.children.some(c => c.children.includes(m3OutHeading)))!;
+				assert.match(m3OutSection.textContent, /! HTTP 503/);
+				const topLevelAlerts = collectAllElements(appM3.content).filter(e => e.getAttribute("role") === "alert");
+				assert.equal(topLevelAlerts.length, 1);
+				assert.ok(m3OutSection.contains(topLevelAlerts[0]!), "Failed refetch alert must stay inside Attempt output section only");
+				appM3.assertSafeDom();
 			}
 		},
 	);

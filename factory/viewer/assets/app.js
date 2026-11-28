@@ -41,6 +41,7 @@ const {
   reduceLiveFetchOutcome,
   computeNextPollAction,
   planKeyedDiff,
+  shouldRefetchNodeOutput,
 } = Safe;
 
 const FETCH_TIMEOUT_MS = 15000;
@@ -751,10 +752,28 @@ function createDetailState() {
     outputSec: null,
     outputBody: null,
     outputLoadedKey: "",
+    outputFactoryId: "",
+    outputNodeSnapshot: null,
+    outputHasRendered: false,
+    outputDisclosureOpen: new Map(),
+    outputAttemptEntries: new Map(),
+    outputTrackedDisclosures: new Map(),
+    outputFocusTargets: new Map(),
     actionsEl: null,
     detailsEl: null,
     detailsDl: null,
   };
+}
+
+function resetDetailOutputState(ds) {
+  ds.outputLoadedKey = "";
+  ds.outputFactoryId = "";
+  ds.outputNodeSnapshot = null;
+  ds.outputHasRendered = false;
+  ds.outputDisclosureOpen = new Map();
+  ds.outputAttemptEntries = new Map();
+  ds.outputTrackedDisclosures = new Map();
+  ds.outputFocusTargets = new Map();
 }
 
 function abortOutputRequest() {
@@ -817,18 +836,83 @@ function renderBoundedTextListSection(title, listObj) {
   return sec;
 }
 
-function renderSingleAttemptDisclosure(att, isOpen) {
-  const details = el("details", undefined, { class: "collapsible", ...(isOpen ? { open: true } : {}) });
-  const summaryEl = el("summary", undefined, { class: "collapsible-header" });
-  const attemptHeading = typeof att.attempt_number === "number"
-    ? `Attempt ${att.attempt_number} of ${att.max_attempts ?? "?"}`
-    : `Attempt (number unverified) of ${att.max_attempts ?? "?"}`;
-  summaryEl.append(
-    el("h5", attemptHeading, { class: "inline" }),
-    document.createTextNode(" "),
-    statusPill(att.status, att.status_text || att.status),
-  );
-  const body = el("div", undefined, { class: "collapsible-body" });
+function setDetailsOpen(detailsEl, shouldOpen) {
+  if (!detailsEl) return;
+  if (shouldOpen) {
+    if (!detailsEl.hasAttribute("open")) detailsEl.setAttribute("open", "");
+    if (!detailsEl.open) detailsEl.open = true;
+  } else {
+    if (detailsEl.hasAttribute("open")) detailsEl.removeAttribute("open");
+    if (detailsEl.open) detailsEl.open = false;
+  }
+}
+
+function getAttemptDisclosureKey(att, idx, seenKeys) {
+  let baseKey;
+  if (typeof att.attempt_id === "string" && att.attempt_id) {
+    baseKey = `id:${att.attempt_id}`;
+  } else if (typeof att.attempt_number === "number" && Number.isFinite(att.attempt_number)) {
+    baseKey = `num:${att.attempt_number}`;
+  } else {
+    baseKey = `unverified:${idx}`;
+  }
+  let key = baseKey;
+  if (seenKeys) {
+    let dup = 1;
+    while (seenKeys.has(key)) {
+      key = `${baseKey}#${dup++}`;
+    }
+    seenKeys.add(key);
+  }
+  return key;
+}
+
+function syncOpenDisclosuresFromDom(ds) {
+  if (!ds || !(ds.outputTrackedDisclosures instanceof Map)) return;
+  for (const [key, detailsEl] of ds.outputTrackedDisclosures.entries()) {
+    ds.outputDisclosureOpen.set(key, Boolean(detailsEl.open));
+  }
+}
+
+function getFocusedOutputKey(slot, ds) {
+  if (!slot || !ds || !(ds.outputFocusTargets instanceof Map)) return null;
+  const active = document.activeElement;
+  if (!active || !slot.contains(active)) return null;
+  for (const [focusKey, targetEl] of ds.outputFocusTargets.entries()) {
+    if (targetEl === active) return focusKey;
+  }
+  return typeof active.getAttribute === "function" ? active.getAttribute("data-focus-key") : null;
+}
+
+function upsertSubDisclosure(existingSub, subKey, focusKey, headingText, isOpen, bodySig, buildBodyNodes, nextTrackedDisclosures, nextFocusTargets) {
+  let entry = existingSub;
+  if (!entry) {
+    const details = el("details", undefined, { class: "collapsible" });
+    const headingEl = el("h6", headingText, { class: "inline" });
+    const summaryEl = el("summary", undefined, { class: "collapsible-header", "data-focus-key": focusKey });
+    summaryEl.append(headingEl);
+    const body = el("div", undefined, { class: "collapsible-body" });
+    body.append(...buildBodyNodes());
+    details.append(summaryEl, body);
+    entry = { details, summaryEl, headingEl, body, bodySig };
+  } else {
+    setTextIfChanged(entry.headingEl, headingText);
+    if (entry.bodySig !== bodySig) {
+      entry.body.replaceChildren(...buildBodyNodes());
+      entry.bodySig = bodySig;
+    }
+  }
+  setDetailsOpen(entry.details, isOpen);
+  nextTrackedDisclosures.set(subKey, entry.details);
+  nextFocusTargets.set(focusKey, entry.summaryEl);
+  return entry;
+}
+
+function buildAttemptBodyNodes(att, attKey, ds, existingEntry, nextTrackedDisclosures, nextFocusTargets) {
+  const nodes = [];
+  let outputsEntry = null;
+  let artifactsEntry = null;
+
   if (att.evidence === "available") {
     const facts = el("dl", undefined, { class: "row" });
     facts.append(
@@ -838,24 +922,24 @@ function renderSingleAttemptDisclosure(att, isOpen) {
       facts.append(factItem("Attempt number", absenceNode(att.attempt_number)));
     }
     if (att.completed_at) facts.append(factItem("Completed at", att.completed_at));
-    body.append(facts);
+    nodes.push(facts);
 
     const sumSec = el("div", undefined, { class: "section" });
     sumSec.append(el("h6", "Summary"));
     sumSec.append(att.summary
       ? el("div", att.summary, { class: "output-text" })
       : el("p", "No summary recorded.", { class: "grey-text text-darken-3" }));
-    body.append(sumSec);
+    nodes.push(sumSec);
 
     const detSec = el("div", undefined, { class: "section" });
     detSec.append(el("h6", "Detail"));
     detSec.append(att.detail
       ? el("div", att.detail, { class: "output-text" })
       : el("p", "No detail recorded.", { class: "grey-text text-darken-3" }));
-    body.append(detSec);
+    nodes.push(detSec);
 
     if (att.command && typeof att.command === "object") {
-      body.append(renderCommandOutputSection(att.command));
+      nodes.push(renderCommandOutputSection(att.command));
     }
 
     if (att.verification && Array.isArray(att.verification.items) && att.verification.items.length > 0) {
@@ -880,73 +964,97 @@ function renderSingleAttemptDisclosure(att, isOpen) {
       if (att.verification.omitted_count > 0) {
         verSec.append(el("p", att.verification.omitted_marker || `… [truncated, ${att.verification.omitted_count} items omitted]`, { class: "grey-text text-darken-3" }));
       }
-      body.append(verSec);
+      nodes.push(verSec);
     }
 
     const warnSec = renderBoundedTextListSection("Warnings", att.warnings);
-    if (warnSec) body.append(warnSec);
+    if (warnSec) nodes.push(warnSec);
 
     const nextSec = renderBoundedTextListSection("Next steps", att.next_steps);
-    if (nextSec) body.append(nextSec);
+    if (nextSec) nodes.push(nextSec);
 
     if (typeof att.outputs_text === "string") {
-      const outDetails = el("details", undefined, { class: "collapsible" });
-      const outSummary = el("summary", undefined, { class: "collapsible-header" });
-      outSummary.append(el("h6", "Structured outputs", { class: "inline" }));
-      const outBody = el("div", undefined, { class: "collapsible-body" });
-      outBody.append(el("div", att.outputs_text, { class: "output-text mono" }));
-      outDetails.append(outSummary, outBody);
-      body.append(outDetails);
+      const outKey = `${attKey}:outputs`;
+      const outFocusKey = `output:${outKey}`;
+      const outOpen = ds?.outputDisclosureOpen?.has(outKey) ? Boolean(ds.outputDisclosureOpen.get(outKey)) : false;
+      ds?.outputDisclosureOpen?.set(outKey, outOpen);
+      outputsEntry = upsertSubDisclosure(
+        existingEntry?.outputsEntry || null,
+        outKey,
+        outFocusKey,
+        "Structured outputs",
+        outOpen,
+        att.outputs_text,
+        () => [el("div", att.outputs_text, { class: "output-text mono" })],
+        nextTrackedDisclosures,
+        nextFocusTargets,
+      );
+      nodes.push(outputsEntry.details);
     }
 
     if (att.artifacts && Array.isArray(att.artifacts.items) && att.artifacts.items.length > 0) {
-      const artDetails = el("details", undefined, { class: "collapsible" });
-      const artSummary = el("summary", undefined, { class: "collapsible-header" });
-      artSummary.append(el("h6", `Artifacts (${att.artifacts.total_count ?? att.artifacts.items.length})`, { class: "inline" }));
-      const artBody = el("div", undefined, { class: "collapsible-body" });
-      const artList = el("ul", undefined, { class: "collection" });
-      for (const art of att.artifacts.items) {
-        const li = el("li", undefined, { class: "collection-item" });
-        const head = el("div");
-        const label = art.action ? `${art.type || "artifact"} (${art.action})` : (art.type || "artifact");
-        head.append(el("strong", label));
-        if (art.missing) {
-          head.append(document.createTextNode(" "), statusPill("unavailable", "Missing"));
-        }
-        li.append(head);
-        li.append(art.description
-          ? el("div", art.description, { class: "output-text" })
-          : el("p", "No description recorded.", { class: "grey-text text-darken-3" }));
-        artList.append(li);
-      }
-      artBody.append(artList);
-      if (att.artifacts.omitted_count > 0) {
-        artBody.append(el("p", att.artifacts.omitted_marker || `… [truncated, ${att.artifacts.omitted_count} items omitted]`, { class: "grey-text text-darken-3" }));
-      }
-      artDetails.append(artSummary, artBody);
-      body.append(artDetails);
+      const artKey = `${attKey}:artifacts`;
+      const artFocusKey = `output:${artKey}`;
+      const artOpen = ds?.outputDisclosureOpen?.has(artKey) ? Boolean(ds.outputDisclosureOpen.get(artKey)) : false;
+      ds?.outputDisclosureOpen?.set(artKey, artOpen);
+      const artCount = att.artifacts.total_count ?? att.artifacts.items.length;
+      const artSig = JSON.stringify(att.artifacts);
+      artifactsEntry = upsertSubDisclosure(
+        existingEntry?.artifactsEntry || null,
+        artKey,
+        artFocusKey,
+        `Artifacts (${artCount})`,
+        artOpen,
+        artSig,
+        () => {
+          const artList = el("ul", undefined, { class: "collection" });
+          for (const art of att.artifacts.items) {
+            const li = el("li", undefined, { class: "collection-item" });
+            const head = el("div");
+            const label = art.action ? `${art.type || "artifact"} (${art.action})` : (art.type || "artifact");
+            head.append(el("strong", label));
+            if (art.missing) {
+              head.append(document.createTextNode(" "), statusPill("unavailable", "Missing"));
+            }
+            li.append(head);
+            li.append(art.description
+              ? el("div", art.description, { class: "output-text" })
+              : el("p", "No description recorded.", { class: "grey-text text-darken-3" }));
+            artList.append(li);
+          }
+          const bodyNodes = [artList];
+          if (att.artifacts.omitted_count > 0) {
+            bodyNodes.push(el("p", att.artifacts.omitted_marker || `… [truncated, ${att.artifacts.omitted_count} items omitted]`, { class: "grey-text text-darken-3" }));
+          }
+          return bodyNodes;
+        },
+        nextTrackedDisclosures,
+        nextFocusTargets,
+      );
+      nodes.push(artifactsEntry.details);
     }
+
     if (typeof att.omitted_characters === "number" && att.omitted_characters > 0) {
-      body.append(el("p", `… [truncated, ${att.omitted_characters} character${att.omitted_characters === 1 ? "" : "s"} omitted]`, { class: "grey-text text-darken-3" }));
+      nodes.push(el("p", `… [truncated, ${att.omitted_characters} character${att.omitted_characters === 1 ? "" : "s"} omitted]`, { class: "grey-text text-darken-3" }));
     }
   } else {
-    body.append(absenceNode(att));
+    nodes.push(absenceNode(att));
     if (isAbsenceObject(att.attempt_number)) {
       const facts = el("dl", undefined, { class: "row" });
       facts.append(factItem("Attempt number", absenceNode(att.attempt_number)));
-      body.append(facts);
+      nodes.push(facts);
     }
     if (att.disposition_reason) {
       const dispSec = el("div", undefined, { class: "section" });
       dispSec.append(el("h6", "Disposition reason"));
       dispSec.append(el("div", att.disposition_reason, { class: "output-text" }));
-      body.append(dispSec);
+      nodes.push(dispSec);
     }
     if (att.error_message) {
       const errSec = el("div", undefined, { class: "section" });
       errSec.append(el("h6", "Recorded error"));
       errSec.append(el("div", att.error_message, { class: "output-text" }));
-      body.append(errSec);
+      nodes.push(errSec);
     }
     if (att.causes && Array.isArray(att.causes.items) && att.causes.items.length > 0) {
       const causesSec = el("div", undefined, { class: "section" });
@@ -964,26 +1072,125 @@ function renderSingleAttemptDisclosure(att, isOpen) {
       if (att.causes.omitted_count > 0) {
         causesSec.append(el("p", att.causes.omitted_marker || `… [truncated, ${att.causes.omitted_count} items omitted]`, { class: "grey-text text-darken-3" }));
       }
-      body.append(causesSec);
+      nodes.push(causesSec);
     }
     if (att.command && typeof att.command === "object") {
-      body.append(renderCommandOutputSection(att.command));
+      nodes.push(renderCommandOutputSection(att.command));
     }
     if (typeof att.omitted_characters === "number" && att.omitted_characters > 0) {
-      body.append(el("p", `… [truncated, ${att.omitted_characters} character${att.omitted_characters === 1 ? "" : "s"} omitted]`, { class: "grey-text text-darken-3" }));
+      nodes.push(el("p", `… [truncated, ${att.omitted_characters} character${att.omitted_characters === 1 ? "" : "s"} omitted]`, { class: "grey-text text-darken-3" }));
     }
   }
-  details.append(summaryEl, body);
-  return details;
+  return { nodes, outputsEntry, artifactsEntry };
 }
 
-function renderAttemptOutputBody(slot, data, errorInfo) {
+function upsertAttemptDisclosure(att, attKey, isOpen, ds, existingEntry, nextTrackedDisclosures, nextFocusTargets) {
+  const attemptHeading = typeof att.attempt_number === "number"
+    ? `Attempt ${att.attempt_number} of ${att.max_attempts ?? "?"}`
+    : `Attempt (number unverified) of ${att.max_attempts ?? "?"}`;
+  const statusLabel = att.status_text || att.status;
+  const summarySig = JSON.stringify([attemptHeading, att.status, statusLabel]);
+  const bodySig = JSON.stringify(att);
+  const focusKey = `output:${attKey}`;
+
+  let entry = existingEntry;
+  if (!entry) {
+    const details = el("details", undefined, { class: "collapsible" });
+    const summaryEl = el("summary", undefined, { class: "collapsible-header", "data-focus-key": focusKey });
+    summaryEl.append(
+      el("h5", attemptHeading, { class: "inline" }),
+      document.createTextNode(" "),
+      statusPill(att.status, statusLabel),
+    );
+    const body = el("div", undefined, { class: "collapsible-body" });
+    const built = buildAttemptBodyNodes(att, attKey, ds, null, nextTrackedDisclosures, nextFocusTargets);
+    body.append(...built.nodes);
+    details.append(summaryEl, body);
+    entry = {
+      details,
+      summaryEl,
+      body,
+      summarySig,
+      bodySig,
+      outputsEntry: built.outputsEntry,
+      artifactsEntry: built.artifactsEntry,
+    };
+  } else {
+    if (entry.summarySig !== summarySig) {
+      entry.summaryEl.replaceChildren(
+        el("h5", attemptHeading, { class: "inline" }),
+        document.createTextNode(" "),
+        statusPill(att.status, statusLabel),
+      );
+      entry.summarySig = summarySig;
+    }
+    if (entry.bodySig !== bodySig) {
+      const built = buildAttemptBodyNodes(att, attKey, ds, entry, nextTrackedDisclosures, nextFocusTargets);
+      entry.body.replaceChildren(...built.nodes);
+      entry.bodySig = bodySig;
+      entry.outputsEntry = built.outputsEntry;
+      entry.artifactsEntry = built.artifactsEntry;
+    } else {
+      if (entry.outputsEntry) {
+        const outKey = `${attKey}:outputs`;
+        const outFocusKey = `output:${outKey}`;
+        const outOpen = ds?.outputDisclosureOpen?.has(outKey) ? Boolean(ds.outputDisclosureOpen.get(outKey)) : false;
+        setDetailsOpen(entry.outputsEntry.details, outOpen);
+        nextTrackedDisclosures.set(outKey, entry.outputsEntry.details);
+        nextFocusTargets.set(outFocusKey, entry.outputsEntry.summaryEl);
+      }
+      if (entry.artifactsEntry) {
+        const artKey = `${attKey}:artifacts`;
+        const artFocusKey = `output:${artKey}`;
+        const artOpen = ds?.outputDisclosureOpen?.has(artKey) ? Boolean(ds.outputDisclosureOpen.get(artKey)) : false;
+        setDetailsOpen(entry.artifactsEntry.details, artOpen);
+        nextTrackedDisclosures.set(artKey, entry.artifactsEntry.details);
+        nextFocusTargets.set(artFocusKey, entry.artifactsEntry.summaryEl);
+      }
+    }
+  }
+  setDetailsOpen(entry.details, isOpen);
+  nextTrackedDisclosures.set(attKey, entry.details);
+  nextFocusTargets.set(focusKey, entry.summaryEl);
+  return entry;
+}
+
+function reconcileSlotChildren(slot, targetNodes) {
+  const targetSet = new Set(targetNodes);
+  for (const child of Array.from(slot.children)) {
+    if (!targetSet.has(child)) {
+      child.remove();
+    }
+  }
+  for (let i = 0; i < targetNodes.length; i++) {
+    const want = targetNodes[i];
+    const cur = slot.children[i] || null;
+    if (cur !== want) {
+      slot.insertBefore(want, cur);
+    }
+  }
+}
+
+function renderAttemptOutputBody(slot, data, errorInfo, ds) {
+  syncOpenDisclosuresFromDom(ds);
+  const focusedKey = getFocusedOutputKey(slot, ds);
   slot.setAttribute("aria-busy", "false");
+  if (ds) ds.outputHasRendered = true;
+
+  const clearRenderedEntries = () => {
+    if (!ds) return;
+    ds.outputAttemptEntries = new Map();
+    ds.outputTrackedDisclosures = new Map();
+    ds.outputFocusTargets = new Map();
+  };
+
   if (errorInfo) {
+    clearRenderedEntries();
     slot.replaceChildren(errorBanner(errorInfo.status, errorInfo.message, errorInfo.detail));
     return;
   }
   if (!data || typeof data !== "object") {
+    clearRenderedEntries();
     slot.replaceChildren(absenceNode({ absence: "evidence unavailable", explanation: "Attempt output response was empty or invalid." }));
     return;
   }
@@ -991,12 +1198,31 @@ function renderAttemptOutputBody(slot, data, errorInfo) {
     ? data.attempts.filter((a) => a && typeof a === "object")
     : (data.latest_attempt && typeof data.latest_attempt === "object" ? [data.latest_attempt] : []);
   if (attempts.length === 0) {
+    clearRenderedEntries();
     slot.replaceChildren(absenceNode(isAbsenceObject(data)
       ? data
       : { absence: "evidence unavailable", explanation: data.explanation || "Attempt output evidence is unavailable." }));
     return;
   }
-  const nodes = attempts.map((att, idx) => renderSingleAttemptDisclosure(att, idx === 0));
+
+  const seenKeys = new Set();
+  const nextAttemptEntries = new Map();
+  const nextTrackedDisclosures = new Map();
+  const nextFocusTargets = new Map();
+  const nodes = [];
+
+  attempts.forEach((att, idx) => {
+    const attKey = getAttemptDisclosureKey(att, idx, seenKeys);
+    const isOpen = ds?.outputDisclosureOpen?.has(attKey)
+      ? Boolean(ds.outputDisclosureOpen.get(attKey))
+      : idx === 0;
+    ds?.outputDisclosureOpen?.set(attKey, isOpen);
+    const existingEntry = ds?.outputAttemptEntries?.get(attKey) || null;
+    const entry = upsertAttemptDisclosure(att, attKey, isOpen, ds, existingEntry, nextTrackedDisclosures, nextFocusTargets);
+    nextAttemptEntries.set(attKey, entry);
+    nodes.push(entry.details);
+  });
+
   if (isAbsenceObject(data.total_attempts)) {
     const totalWrap = el("p");
     totalWrap.append(absenceNode(data.total_attempts));
@@ -1005,22 +1231,37 @@ function renderAttemptOutputBody(slot, data, errorInfo) {
   if (typeof data.omitted_attempts === "number" && data.omitted_attempts > 0) {
     nodes.push(el("p", data.omitted_marker || `… [truncated, ${data.omitted_attempts} attempt${data.omitted_attempts === 1 ? "" : "s"} omitted]`, { class: "grey-text text-darken-3" }));
   }
-  slot.replaceChildren(...nodes);
+
+  if (ds) {
+    ds.outputAttemptEntries = nextAttemptEntries;
+    ds.outputTrackedDisclosures = nextTrackedDisclosures;
+    ds.outputFocusTargets = nextFocusTargets;
+  }
+  reconcileSlotChildren(slot, nodes);
+
+  if (focusedKey && ds?.outputFocusTargets?.has(focusedKey)) {
+    const focusTarget = ds.outputFocusTargets.get(focusedKey);
+    if (focusTarget && document.activeElement !== focusTarget) {
+      focusTarget.focus();
+    }
+  }
 }
 
-async function requestNodeOutput(factoryId, nodeId, ds) {
+async function requestNodeOutput(factoryId, nodeId, ds, nodeSnapshot) {
   abortOutputRequest();
   const slot = ds.outputBody;
   if (!slot) return;
   const outputKey = `${factoryId}\u0000${nodeId}`;
   ds.outputLoadedKey = "";
+  ds.outputFactoryId = factoryId;
+  ds.outputNodeSnapshot = nodeSnapshot || null;
   const url = outputApiUrl(factoryId, nodeId);
   if (!url) {
     renderAttemptOutputBody(slot, null, {
       status: null,
       message: "Invalid factory or node identifier",
       detail: "Unable to request attempt output without valid identifiers.",
-    });
+    }, ds);
     ds.outputLoadedKey = outputKey;
     return;
   }
@@ -1028,7 +1269,9 @@ async function requestNodeOutput(factoryId, nodeId, ds) {
   const controller = new AbortController();
   state.outputController = controller;
   slot.setAttribute("aria-busy", "true");
-  slot.replaceChildren(el("p", "Loading attempt output…"));
+  if (!ds.outputHasRendered) {
+    slot.replaceChildren(el("p", "Loading attempt output…"));
+  }
   try {
     const data = await fetchJsonStrict(url, controller.signal);
     if (seq !== state.outputRequestSeq || factoryId !== state.selectedFactoryId || nodeId !== state.selectedGraphNodeId || state.activeView !== "live") return;
@@ -1039,11 +1282,11 @@ async function requestNodeOutput(factoryId, nodeId, ds) {
         status: null,
         message: "Output response did not match the selected node",
         detail: `Expected factory "${factoryId}" node "${nodeId}" but received "${gotFactory}" / "${gotNode}".`,
-      });
+      }, ds);
       ds.outputLoadedKey = outputKey;
       return;
     }
-    renderAttemptOutputBody(slot, data, null);
+    renderAttemptOutputBody(slot, data, null, ds);
     ds.outputLoadedKey = outputKey;
   } catch (err) {
     if (err && err.name === "AbortError") return;
@@ -1052,7 +1295,7 @@ async function requestNodeOutput(factoryId, nodeId, ds) {
       status: err?.status || null,
       message: err?.message || "Failed to load attempt output",
       detail: err?.detail || "Unable to fetch attempt output from the local viewer.",
-    });
+    }, ds);
     ds.outputLoadedKey = outputKey;
   } finally {
     if (seq === state.outputRequestSeq && state.outputController === controller) {
@@ -1129,7 +1372,7 @@ function patchLiveNodeDetail(detailEl, node, boundVersion, detailState) {
       ds.causesWrap = null;
       ds.outputSec = null;
       ds.outputBody = null;
-      ds.outputLoadedKey = "";
+      resetDetailOutputState(ds);
       ds.actionsEl = null;
       ds.detailsEl = null;
       ds.detailsDl = null;
@@ -1188,7 +1431,7 @@ function patchLiveNodeDetail(detailEl, node, boundVersion, detailState) {
     ds.outputBody = el("div", undefined, { "aria-busy": "false" });
     outputCardBody.append(ds.outputBody);
     ds.outputSec.append(outputCardBody);
-    ds.outputLoadedKey = "";
+    resetDetailOutputState(ds);
     ds.actionsEl = el("div", undefined, { class: "section" });
     if (cfgLink && isAbsenceObject(cfgLink)) {
       ds.actionsEl.append(absenceNode(cfgLink));
@@ -1215,7 +1458,7 @@ function patchLiveNodeDetail(detailEl, node, boundVersion, detailState) {
     children.push(ds.actionsEl);
     if (ds.detailsEl) children.push(ds.detailsEl);
     detailEl.replaceChildren(...children);
-    void requestNodeOutput(state.selectedFactoryId, node.id, ds);
+    void requestNodeOutput(state.selectedFactoryId, node.id, ds, node);
     return ds;
   }
 
@@ -1284,8 +1527,12 @@ function patchLiveNodeDetail(detailEl, node, boundVersion, detailState) {
   }
   ds.sigs = nextSigs;
   const outputKey = `${state.selectedFactoryId}\u0000${node.id}`;
-  if (ds.outputLoadedKey !== outputKey && !state.outputController) {
-    void requestNodeOutput(state.selectedFactoryId, node.id, ds);
+  const needsRefetch = shouldRefetchNodeOutput(ds.outputNodeSnapshot, node, {
+    prevFactoryId: ds.outputFactoryId,
+    nextFactoryId: state.selectedFactoryId,
+  });
+  if (needsRefetch || (ds.outputLoadedKey !== outputKey && !state.outputController)) {
+    void requestNodeOutput(state.selectedFactoryId, node.id, ds, node);
   }
   return ds;
 }
@@ -2049,7 +2296,10 @@ function mountOrPatchLiveView(data, transition, stale) {
       ld.graphSlot.replaceChildren(ld.graphCtrl.wrapper, detailPanel);
     }
   } else {
-    ld.graphCtrl = null;
+    if (ld.graphCtrl) {
+      abortOutputRequest();
+      ld.graphCtrl = null;
+    }
     const graphFallback = resolveLiveGraphBanner(data, stateVal);
     const nextFallbackSig = JSON.stringify(graphFallback);
     if (nextFallbackSig !== ld.fallbackGraphSig) {
