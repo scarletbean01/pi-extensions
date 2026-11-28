@@ -24,10 +24,16 @@ const HAS_SEP_RE = /[\\/]/;
 const DOT_EXT_RE = /^\.[A-Za-z][A-Za-z0-9_-]{0,9}$/;
 const ONE_CHAR_STEM_DOT_EXT_RE = /^\.[A-Za-z]{2}[A-Za-z0-9_-]{0,8}$/;
 const DOTFILE_RE = /^\.[A-Za-z][\w-]+$/;
-const ARTIFACT_DELIM_CHAR_RE = /[\s"'<>()\[\]{}`*,;|!?=]/;
-const NON_ASCII_DELIM_RE = /[^\p{L}\p{N}\p{M}]/u;
+const ASCII_ARTIFACT_DELIM_CHARS = new Set(["\"", "'", "<", ">", "(", ")", "[", "]", "{", "}", "`", "*", ",", ";", "|", "!", "?", "="]);
+const ASCII_ARTIFACT_DELIM_TABLE = Uint8Array.from({ length: 128 }, (_, code) => {
+	if (code <= 32 || code === 127) return 1;
+	return ASCII_ARTIFACT_DELIM_CHARS.has(String.fromCharCode(code)) ? 1 : 0;
+});
+// Non-ASCII punctuation, symbols, non-ASCII numbers (\p{No}, \p{Nl}), modifier letters (\p{Lm}), and surrogate halves delimit.
+const NON_ASCII_DELIM_RE = /(?:[^\p{L}\p{N}\p{M}]|[\p{No}\p{Nl}\p{Lm}])/u;
+const HAS_ARTIFACT_DELIM_RE = /[\u0000-\u0020\u007F"'<>()\[\]{}`*,;|!?=]|[\u{10000}-\u{10FFFF}]|(?![\x00-\x7F])(?:[^\p{L}\p{N}\p{M}]|[\p{No}\p{Nl}\p{Lm}])/u;
 const ARTIFACT_SUFFIX_SPLIT_CHARS = [":", "#", "@", "~", "+", "&", "%", "$", "^"] as const;
-const LEADING_ARTIFACT_PREFIX_CHARS = new Set(["@", "#", "&", "%"]);
+const LEADING_ARTIFACT_PREFIX_CHARS = new Set(["@", "#", "&", "%", "+", "$", "^"]);
 const DRIVE_PREFIX_RE = /^[A-Za-z]:/;
 
 function escapeRegExp(value: string): string {
@@ -114,10 +120,7 @@ const EMPTY_ARTIFACT_MATCHER: ArtifactRedactionMatcher = {
 };
 
 function hasArtifactDelim(token: string): boolean {
-	for (let i = 0; i < token.length; i++) {
-		if (isArtifactDelimChar(token.charCodeAt(i), token[i]!)) return true;
-	}
-	return false;
+	return HAS_ARTIFACT_DELIM_RE.test(token);
 }
 
 function isRedactableArtifactForm(token: string): boolean {
@@ -153,7 +156,9 @@ export function collectArtifactPathTokens(
 		totalChars += candidate.length;
 	};
 	const addForm = (candidate: string) => {
+		if (tokens.size >= MAX_ARTIFACT_TOKENS) return;
 		const t = candidate.trim();
+		if (t.length < 2 || t.length > MAX_ARTIFACT_TOKEN_CHARS - totalChars) return;
 		if (!isRedactableArtifactForm(t)) return;
 		pushToken(t);
 		const jsonEscaped = t.replace(/\\/g, "\\\\");
@@ -238,9 +243,8 @@ export function compileArtifactRedactionMatcher(tokens: readonly string[] | Arti
 }
 
 function isArtifactDelimChar(code: number, ch: string): boolean {
-	if (code <= 32 || code === 127) return true; // whitespace / control
-	if (code > 127) return NON_ASCII_DELIM_RE.test(ch); // non-letter/number/mark Unicode punctuation; surrogate halves count as delimiters
-	return ARTIFACT_DELIM_CHAR_RE.test(ch);
+	if (code < 128) return ASCII_ARTIFACT_DELIM_TABLE[code] === 1;
+	return NON_ASCII_DELIM_RE.test(ch); // non-letter/number/mark Unicode punctuation, \p{No}/\p{Nl}/\p{Lm}, and surrogate halves
 }
 
 function matchesCandidatePrefix(
@@ -388,8 +392,11 @@ function scrubExtraRedactedTokens(text: string, matcher: ArtifactRedactionMatche
 		let matchPrefixOffset = 0;
 		let matchedLen = findMatchedPrefixEnd(tok, matcher);
 		if (matchedLen < 0) {
-			const sigilOffset = tok.length > 1 && LEADING_ARTIFACT_PREFIX_CHARS.has(tok[0]!) ? 1 : 0;
-			if (sigilOffset > 0) {
+			let sigilOffset = 0;
+			while (sigilOffset < tok.length && LEADING_ARTIFACT_PREFIX_CHARS.has(tok[sigilOffset]!)) {
+				sigilOffset += 1;
+			}
+			if (sigilOffset > 0 && sigilOffset < tok.length) {
 				const subLen = findMatchedPrefixEnd(tok.slice(sigilOffset), matcher);
 				if (subLen > 0) {
 					matchPrefixOffset = sigilOffset;
