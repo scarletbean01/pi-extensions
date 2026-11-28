@@ -77,22 +77,111 @@ test("sanitizeOutputText preserves line breaks, scrubs blocked/generic paths and
 	const mdOp = sanitizeOperatorText("see `/etc/probe_gen/x.conf` and **/var/probe_gen/y** and `/home/alice/project/z`", 1000, blocked);
 	assert.equal(mdOp, "see `[redacted-path]` and **[redacted-path]** and `[redacted-path]`");
 
-	// N7: Hangul fillers (U+3164, U+115F) and variation selectors (U+FE00..U+FE0F) are neutralised like other control/format chars
-	const invisRaw = "a\u3164b\u115Fc\uFE00d\uFE0Fe";
-	assert.equal(sanitizeOutputText(invisRaw, 8000, []), "a [ctrl] b [ctrl] c [ctrl] d [ctrl] e");
-	assert.equal(sanitizeOperatorText(invisRaw, 1000, []), "a [ctrl] b [ctrl] c [ctrl] d [ctrl] e");
+	// N7 & N-a: Hangul fillers (U+3164, U+115F, U+1160, U+FFA0) and U+FE00..U+FE0D are neutralised as [ctrl],
+	// while standard variation selectors U+FE0E/U+FE0F are deleted silently so emoji don't turn into [ctrl].
+	const invisRaw = "a\u3164b\u115Fc\u1160d\uFFA0e\uFE00f\uFE0Eg\uFE0Fh";
+	assert.equal(sanitizeOutputText(invisRaw, 8000, []), "a [ctrl] b [ctrl] c [ctrl] d [ctrl] e [ctrl] fgh");
+	assert.equal(sanitizeOperatorText(invisRaw, 1000, []), "a [ctrl] b [ctrl] c [ctrl] d [ctrl] e [ctrl] fgh");
+	assert.equal(sanitizeOutputText("⚠️ Warning ❤️", 8000, []), "⚠ Warning ❤");
+	assert.equal(sanitizeOperatorText("⚠️ Warning ❤️", 1000, []), "⚠ Warning ❤");
 
-	// N8: literal truncation-marker patterns in agent text are neutralised before capping
-	const spoofShort = "Result ok … [truncated, 99999 characters omitted] and [truncated, 1 character omitted] end";
+	// N-d: remaining invisibles (U+E0100..E01EF, U+034F, U+2800, U+180B..180D) neutralised as [ctrl]
+	const moreInvis = "a\u{E0100}b\u{E01EF}c\u034Fd\u2800e\u180Bf\u180Dg";
+	assert.equal(sanitizeOutputText(moreInvis, 8000, []), "a [ctrl] b [ctrl] c [ctrl] d [ctrl] e [ctrl] f [ctrl] g");
+	assert.equal(sanitizeOperatorText(moreInvis, 1000, []), "a [ctrl] b [ctrl] c [ctrl] d [ctrl] e [ctrl] f [ctrl] g");
+
+	// N-b: adjacent paths joined by ',', ';', '|' redact individually with delimiter preserved (without losing closing delimiters)
+	const adjRaw = "/a/b,/c/d;/e/f|/g/h /home/alice/project/1,/home/alice/project/2|~/x/y,C:\\Users\\bob,file:///etc/hosts";
+	const adjExpected = "[redacted-path],[redacted-path];[redacted-path]|[redacted-path] [redacted-path],[redacted-path]|[redacted-path],[redacted-path],[redacted-path]";
+	assert.equal(sanitizeOutputText(adjRaw, 8000, blocked), adjExpected);
+	assert.equal(sanitizeOperatorText(adjRaw, 1000, blocked), adjExpected);
+	assert.equal(sanitizeOutputText("x|/var/a/b| `/a/b`/c/d`", 8000, blocked), "x|[redacted-path]| `[redacted-path]`[redacted-path]`");
+
+	// N-c: pin conservative lead-character behaviour and untouched non-path forms
+	const ncRedacted = "#/definitions/foo $/x/y +/x/y";
+	assert.equal(sanitizeOutputText(ncRedacted, 8000, blocked), "#[redacted-path] $[redacted-path] +[redacted-path]");
+	assert.equal(sanitizeOperatorText(ncRedacted, 1000, blocked), "#[redacted-path] $[redacted-path] +[redacted-path]");
+	const ncUntouched = "https://host/path/to 1/2 2026/11/28 src/foo/bar ./a/b ../c/d @scope/pkg/sub";
+	assert.equal(sanitizeOutputText(ncUntouched, 8000, blocked), ncUntouched);
+	assert.equal(sanitizeOperatorText(ncUntouched, 1000, blocked), ncUntouched);
+
+	// N8 & N-d: literal truncation-marker patterns (including comma-grouped and fullwidth digits, or VS-split) are neutralised before capping
+	const spoofShort = [
+		"Result ok … [truncated, 99999 characters omitted]",
+		"and [truncated, 1 character omitted]",
+		"and … [truncated, 1,000 characters omitted]",
+		"and [truncated, 1,234,567 characters omitted]",
+		"and … [truncated, １２ characters omitted]",
+		"and … [truncated, １,０００ characters omitted]",
+		"and … [trunc\uFE0Fated, 42 characters omitted] end",
+	].join(" ");
 	const spoofOut = sanitizeOutputText(spoofShort, 8000, []);
-	assert.doesNotMatch(spoofOut, /\[truncated,\s*\d+\s+characters?\s+omitted\]/i);
+	assert.doesNotMatch(spoofOut, /\[truncated,\s*[0-9\uFF10-\uFF19,]+\s+characters?\s+omitted\]/i);
 	assert.equal(spoofOut.includes("99999"), false);
-	assert.doesNotMatch(sanitizeOperatorText(spoofShort, 1000, []), /\[truncated,\s*\d+\s+characters?\s+omitted\]/i);
+	assert.equal(spoofOut.includes("1,000"), false);
+	assert.equal(spoofOut.includes("１２"), false);
+	assert.doesNotMatch(sanitizeOperatorText(spoofShort, 1000, []), /\[truncated,\s*[0-9\uFF10-\uFF19,]+\s+characters?\s+omitted\]/i);
 	const spoofAndLong = `Prefix … [truncated, 99999 characters omitted] ${"Q".repeat(1100)}`;
 	const spoofLongOut = sanitizeOutputText(spoofAndLong, 1000, []);
 	assert.ok(Array.from(spoofLongOut).length <= 1000);
 	assert.equal(spoofLongOut.includes("99999"), false);
 	assert.match(spoofLongOut, /^Prefix \[truncated-marker\] Q+… \[truncated, \d+ characters? omitted\]$/);
+});
+
+test("sanitizeOutputText and sanitizeOperatorText handle 200k hostile inputs in linear time and preserve exact marker arithmetic", () => {
+	const blocked = ["/home/alice", "/srv/sess/run-1", "/work/proj"];
+	const repeatTo = (s: string, len: number) => s.repeat(Math.ceil(len / s.length)).slice(0, len);
+	const hostileInputs: Record<string, string> = {
+		puncTailDots: `/a/${".".repeat(200_000)}x`,
+		puncTailCommas: `/a/b${",;".repeat(100_000)}z`,
+		puncTailBlocked: `/home/alice/${".".repeat(200_000)}x`,
+		slashes: repeatTo("/", 200_000),
+		commaSlash: repeatTo(",/a", 200_000),
+		tildeRun: `,~${"a".repeat(200_000)}`,
+		deepPath: `/${"a/".repeat(100_000)}`,
+	};
+	for (const [name, input] of Object.entries(hostileInputs)) {
+		const t0 = performance.now();
+		const out = sanitizeOutputText(input, 8000, blocked);
+		const op = sanitizeOperatorText(input, 1000, blocked);
+		const uncapped = sanitizeOutputText(input, 300_000, blocked);
+		const elapsed = performance.now() - t0;
+		assert.ok(elapsed < 1000, `${name} took too long: ${elapsed.toFixed(1)}ms`);
+		assert.ok(Array.from(out).length <= 8000, `${name} output exceeded cap`);
+		assert.ok(Array.from(op).length <= 1000, `${name} operator exceeded cap`);
+		assert.equal(uncapped.isWellFormed(), true);
+	}
+
+	// Marker arithmetic exactness across pre-bound threshold (4 * 8000 = 32000) and surrogate pairs
+	for (const len of [7999, 8000, 8001, 8040, 9000, 12345, 32000, 32001, 100000]) {
+		const out = sanitizeOutputText("x".repeat(len), 8000, blocked);
+		const cp = Array.from(out).length;
+		assert.ok(cp <= 8000, `len=${len} exceeded cap: ${cp}`);
+		const m = /… \[truncated, (\d+) characters? omitted\]$/.exec(out);
+		if (len <= 8000) {
+			assert.equal(m, null, `len=${len} should not be truncated`);
+			assert.equal(cp, len);
+		} else {
+			assert.ok(m, `len=${len} missing truncation marker`);
+			const kept = cp - Array.from(m[0]).length;
+			assert.equal(kept + Number(m[1]), len, `len=${len} marker arithmetic mismatch`);
+		}
+	}
+
+	const astral = "🚀".repeat(50_000);
+	const astralOut = sanitizeOutputText(astral, 8000, []);
+	assert.equal(astralOut.isWellFormed(), true, "pre-bound astral truncation must not split surrogate pairs");
+	const astralCp = Array.from(astralOut).length;
+	assert.ok(astralCp <= 8000);
+	const astralMatch = /… \[truncated, (\d+) characters? omitted\]$/.exec(astralOut);
+	assert.ok(astralMatch);
+	assert.equal(astralCp - Array.from(astralMatch[0]).length + Number(astralMatch[1]), 50_000);
+
+	// When a 4*cap prefix collapses into a short marker, pre-dropped chars still produce a truncation marker
+	const giantPath = `/a/${"x".repeat(50_000)}`;
+	const giantOut = sanitizeOutputText(giantPath, 1000, []);
+	assert.ok(Array.from(giantOut).length <= 1000);
+	assert.match(giantOut, /^\[redacted-path\]… \[truncated, \d+ characters? omitted\]$/);
 });
 
 test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summary/detail/live-summary, caps fields, and handles absence and hostile files", async t => {
@@ -731,6 +820,68 @@ test("GET /api/factories/:id/output keeps Live execution status alongside eviden
 				assert.equal(out.latest_attempt.status, liveNode.status, `${nodeId} status must match Live`);
 				assert.equal(out.latest_attempt.status_text, liveNode.status_text, `${nodeId} status_text must match Live`);
 			}
+		},
+	);
+});
+
+test("GET /api/factories/:id/output and /live respond quickly on 60k hostile punctuation-tail summary and detail (R2-B1)", async t => {
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_HOSTILE_PERF_PROMPT",
+		agents: [{ node_id: "hostile_perf", persona: "builder", sub_task: "PRIVATE_HOSTILE_PERF_SUB" }],
+	};
+	const fac = ops({ action: "publish", name: "hostile-perf-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-hostile-perf" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "hostile-perf-ref", brief: "PRIVATE_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const entry = launched.manifest.pane_manifest.find(e => e.node_id === "hostile_perf")!;
+	const cfg = readJson<WorkerConfig>(join(dir, `${entry.instance_id}.config.json`));
+	atomicJson(
+		resultPath(dir, entry.instance_id),
+		completionRecord(
+			cfg,
+			{
+				agent_name: entry.persona_name,
+				node_id: "hostile_perf",
+				status: "success",
+				summary: `/b/secret/${".".repeat(60_000)}y`,
+				detail: `/a/secret/${".".repeat(60_000)}x`,
+			},
+			"sent",
+			"2026-01-01T00:00:01.000Z",
+		),
+	);
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const tOut = performance.now();
+			const outRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=hostile_perf`);
+			const outMs = performance.now() - tOut;
+			assert.equal(outRes.status, 200);
+			const outText = await outRes.text();
+			assert.equal(outText.includes("/a/secret"), false);
+			assert.equal(outText.includes("/b/secret"), false);
+			assert.ok(outMs < 1000, `/output with 60k hostile payload took ${outMs.toFixed(0)}ms`);
+
+			const tLive = performance.now();
+			const liveRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
+			const liveMs = performance.now() - tLive;
+			assert.equal(liveRes.status, 200);
+			const liveText = await liveRes.text();
+			assert.equal(liveText.includes("/b/secret"), false);
+			assert.ok(liveMs < 1000, `/live with 60k hostile payload took ${liveMs.toFixed(0)}ms`);
 		},
 	);
 });

@@ -2,18 +2,50 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import type { FactoryDeletionInfo } from "../operations.ts";
 
-const CONTROL_AND_FORMAT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u115F\u1160\u3164\uFE00-\uFE0F\uFFA0\u2028\u2029\p{Cf}]+/gu;
-const GENERIC_PATH_RE = /(^|[^A-Za-z0-9._~/-])((?:file:\/\/[^\s"'<>()\[\]{}`*]+|\/(?:[^\s"'<>()\[\]{}`*/]+\/)+[^\s"'<>()\[\]{}`*]*|~[A-Za-z0-9._-]*[\\/][^\s"'<>()\[\]{}`*]+|[A-Za-z]:[\\/][^\s"'<>()\[\]{}`*]+))/g;
-const SPOOFED_TRUNCATION_MARKER_RE = /(?:…\s*)?\[truncated,\s*\d+\s+characters?\s+omitted\]/gi;
+const CONTROL_AND_FORMAT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u034F\u115F\u1160\u180B-\u180D\u2800\u3164\uFE00-\uFE0D\uFFA0\u2028\u2029\u{E0100}-\u{E01EF}\p{Cf}]+/gu;
+const VARIATION_SELECTORS_RE = /[\uFE0E\uFE0F]+/g;
+const GENERIC_PATH_RE = /(^|[^A-Za-z0-9._~/-])((?:file:\/\/[^\s"'<>()\[\]{}`*,;|]+|\/(?:[^\s"'<>()\[\]{}`*,;|/]+\/)+[^\s"'<>()\[\]{}`*,;|]*|~[A-Za-z0-9._-]*[\\/][^\s"'<>()\[\]{}`*,;|]+|[A-Za-z]:[\\/][^\s"'<>()\[\]{}`*,;|]+))/g;
+const SPOOFED_TRUNCATION_MARKER_RE = /(?:…\s*)?\[truncated,\s*[0-9\uFF10-\uFF19]+(?:,[0-9\uFF10-\uFF19]+)*\s+characters?\s+omitted\]/gi;
+const TRAILING_SENTENCE_PUNCTUATION = new Set([".", ",", ";", ":", "!", "?"]);
+const PRE_BOUND_MULTIPLIER = 4;
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function splitTrailingSentencePunctuation(token: string): { core: string; trailing: string } {
-	const match = /^(.*?)([.,;:!?]+)$/.exec(token);
-	if (!match || !match[1]) return { core: token, trailing: "" };
-	return { core: match[1], trailing: match[2] };
+	let splitAt = token.length;
+	while (splitAt > 0 && TRAILING_SENTENCE_PUNCTUATION.has(token[splitAt - 1]!)) {
+		splitAt -= 1;
+	}
+	if (splitAt === 0 || splitAt === token.length) {
+		return { core: token, trailing: "" };
+	}
+	return { core: token.slice(0, splitAt), trailing: token.slice(splitAt) };
+}
+
+function preBoundCodePoints(wellFormed: string, maxCodePoints: number): { bounded: string; droppedCodePoints: number } {
+	if (wellFormed.length <= maxCodePoints) {
+		return { bounded: wellFormed, droppedCodePoints: 0 };
+	}
+	const len = wellFormed.length;
+	let cpCount = 0;
+	let i = 0;
+	while (i < len && cpCount < maxCodePoints) {
+		const code = wellFormed.charCodeAt(i);
+		i += code >= 0xd800 && code <= 0xdbff && i + 1 < len ? 2 : 1;
+		cpCount += 1;
+	}
+	if (i >= len) {
+		return { bounded: wellFormed, droppedCodePoints: 0 };
+	}
+	let droppedCodePoints = 0;
+	for (let j = i; j < len; ) {
+		const code = wellFormed.charCodeAt(j);
+		j += code >= 0xd800 && code <= 0xdbff && j + 1 < len ? 2 : 1;
+		droppedCodePoints += 1;
+	}
+	return { bounded: wellFormed.slice(0, i), droppedCodePoints };
 }
 
 function scrubBlockedAndGenericPaths(text: string, blockedPaths: readonly string[]): string {
@@ -26,7 +58,7 @@ function scrubBlockedAndGenericPaths(text: string, blockedPaths: readonly string
 	)].sort((a, b) => b.length - a.length);
 	for (const blocked of uniquePaths) {
 		if (!cleaned.includes(blocked)) continue;
-		const re = new RegExp(`${escapeRegExp(blocked)}[^\\s"'<>()\\[\\]{}\`*]*`, "g");
+		const re = new RegExp(`${escapeRegExp(blocked)}[^\\s"'<>()\\[\\]{}\`*,;|]*`, "g");
 		cleaned = cleaned.replace(re, match => {
 			const { trailing } = splitTrailingSentencePunctuation(match);
 			return `[redacted-path]${trailing}`;
@@ -38,11 +70,11 @@ function scrubBlockedAndGenericPaths(text: string, blockedPaths: readonly string
 	});
 }
 
-function truncateWithOmissionMarker(codePoints: string[], maxChars: number): string {
+function truncateWithOmissionMarker(codePoints: string[], maxChars: number, extraOmitted = 0): string {
 	if (maxChars <= 0) return "";
-	const total = codePoints.length;
-	if (total <= maxChars) return codePoints.join("");
-	let kept = Math.max(0, maxChars - 40);
+	const total = codePoints.length + extraOmitted;
+	if (extraOmitted === 0 && codePoints.length <= maxChars) return codePoints.join("");
+	let kept = Math.min(codePoints.length, Math.max(0, maxChars - 40));
 	for (let i = 0; i < 4; i++) {
 		const omitted = total - kept;
 		const marker = `… [truncated, ${omitted} character${omitted === 1 ? "" : "s"} omitted]`;
@@ -50,7 +82,7 @@ function truncateWithOmissionMarker(codePoints: string[], maxChars: number): str
 		if (markerLen >= maxChars) {
 			return maxChars === 1 ? "…" : `${codePoints.slice(0, maxChars - 1).join("")}…`;
 		}
-		const nextKept = maxChars - markerLen;
+		const nextKept = Math.min(codePoints.length, maxChars - markerLen);
 		if (nextKept === kept) {
 			return `${codePoints.slice(0, kept).join("")}${marker}`;
 		}
@@ -67,8 +99,10 @@ function truncateWithOmissionMarker(codePoints: string[], maxChars: number): str
  * starting with `/`, `~`, `file://`, or a drive letter) is conservatively redacted to `[redacted-path]`.
  */
 export function sanitizeOperatorText(value: string, maxChars: number, blockedPaths: readonly string[] = []): string {
-	const normalized = value
-		.toWellFormed()
+	if (maxChars <= 0) return "";
+	const { bounded, droppedCodePoints } = preBoundCodePoints(value.trimStart().toWellFormed(), maxChars * PRE_BOUND_MULTIPLIER);
+	const normalized = bounded
+		.replace(VARIATION_SELECTORS_RE, "")
 		.replace(/[\r\n\t]+/g, " ")
 		.replace(CONTROL_AND_FORMAT_RE, " [ctrl] ")
 		.replace(/\s+/g, " ")
@@ -76,8 +110,7 @@ export function sanitizeOperatorText(value: string, maxChars: number, blockedPat
 	const cleaned = scrubBlockedAndGenericPaths(normalized, blockedPaths)
 		.replace(SPOOFED_TRUNCATION_MARKER_RE, "[truncated-marker]");
 	const codePoints = Array.from(cleaned);
-	if (maxChars <= 0) return "";
-	if (codePoints.length > maxChars) {
+	if (codePoints.length > maxChars || droppedCodePoints > 0) {
 		return maxChars === 1 ? "…" : `${codePoints.slice(0, maxChars - 1).join("")}…`;
 	}
 	return cleaned;
@@ -88,8 +121,10 @@ export function sanitizeOperatorText(value: string, maxChars: number, blockedPat
  * then bound by Unicode code points with an explicit omission-count marker without splitting surrogate pairs.
  */
 export function sanitizeOutputText(value: string, maxChars: number, blockedPaths: readonly string[] = []): string {
-	const normalized = value
-		.toWellFormed()
+	if (maxChars <= 0) return "";
+	const { bounded, droppedCodePoints } = preBoundCodePoints(value.toWellFormed(), maxChars * PRE_BOUND_MULTIPLIER);
+	const normalized = bounded
+		.replace(VARIATION_SELECTORS_RE, "")
 		.replace(/\r\n?/g, "\n")
 		.replace(CONTROL_AND_FORMAT_RE, (match, offset: number, whole: string) => {
 			const before = offset > 0 ? whole[offset - 1]! : "";
@@ -100,7 +135,7 @@ export function sanitizeOutputText(value: string, maxChars: number, blockedPaths
 		});
 	const cleaned = scrubBlockedAndGenericPaths(normalized, blockedPaths)
 		.replace(SPOOFED_TRUNCATION_MARKER_RE, "[truncated-marker]");
-	return truncateWithOmissionMarker(Array.from(cleaned), maxChars);
+	return truncateWithOmissionMarker(Array.from(cleaned), maxChars, droppedCodePoints);
 }
 
 export interface ViewerDeletionSummary {
