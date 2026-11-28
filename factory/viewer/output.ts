@@ -298,13 +298,17 @@ function buildBoundedList<T, U>(raw: readonly T[] | undefined, maxItems: number,
 	};
 }
 
-function projectAttemptCommand(ev: CommandEvidence | undefined, blockedPaths: readonly string[]) {
+function projectAttemptCommand(
+	ev: CommandEvidence | undefined,
+	blockedPaths: readonly string[],
+	artifactMatcher?: ArtifactRedactionMatcher,
+) {
 	if (!ev) return undefined;
 	const spawnError = typeof ev.spawn_error === "string" && ev.spawn_error
-		? sanitizeOutputText(ev.spawn_error, OUTPUT_SUMMARY_MAX_CHARS, blockedPaths)
+		? sanitizeOutputText(ev.spawn_error, OUTPUT_SUMMARY_MAX_CHARS, blockedPaths, artifactMatcher)
 		: undefined;
 	const terminationError = typeof ev.termination_error === "string" && ev.termination_error
-		? sanitizeOutputText(ev.termination_error, OUTPUT_SUMMARY_MAX_CHARS, blockedPaths)
+		? sanitizeOutputText(ev.termination_error, OUTPUT_SUMMARY_MAX_CHARS, blockedPaths, artifactMatcher)
 		: undefined;
 	return {
 		exit_code: ev.exit_code,
@@ -313,30 +317,34 @@ function projectAttemptCommand(ev: CommandEvidence | undefined, blockedPaths: re
 		stdout_bytes: ev.stdout_bytes,
 		stderr_bytes: ev.stderr_bytes,
 		...(typeof ev.stdout_excerpt === "string"
-			? { stdout_excerpt: sanitizeOutputText(ev.stdout_excerpt, OUTPUT_COMMAND_EXCERPT_MAX_CHARS, blockedPaths) }
+			? { stdout_excerpt: sanitizeOutputText(ev.stdout_excerpt, OUTPUT_COMMAND_EXCERPT_MAX_CHARS, blockedPaths, artifactMatcher) }
 			: {}),
 		...(typeof ev.stderr_excerpt === "string"
-			? { stderr_excerpt: sanitizeOutputText(ev.stderr_excerpt, OUTPUT_COMMAND_EXCERPT_MAX_CHARS, blockedPaths) }
+			? { stderr_excerpt: sanitizeOutputText(ev.stderr_excerpt, OUTPUT_COMMAND_EXCERPT_MAX_CHARS, blockedPaths, artifactMatcher) }
 			: {}),
 		...(spawnError ? { spawn_error: spawnError } : {}),
 		...(terminationError ? { termination_error: terminationError } : {}),
 	};
 }
 
-function projectScrubbedCauses(causes: readonly ProjectedCause[] | undefined, blockedPaths: readonly string[]): BoundedList<ProjectedCause> | undefined {
+function projectScrubbedCauses(
+	causes: readonly ProjectedCause[] | undefined,
+	blockedPaths: readonly string[],
+	artifactMatcher?: ArtifactRedactionMatcher,
+): BoundedList<ProjectedCause> | undefined {
 	return buildBoundedList(causes, OUTPUT_LIST_MAX_ITEMS, c => {
 		const rawNodeId = typeof c?.node_id === "string" ? c.node_id : "";
 		const rawReason = typeof c?.reason === "string" ? c.reason : "";
 		const rawCheck = c?.check && typeof c.check === "object" ? c.check : undefined;
 		const rawCheckName = rawCheck && typeof rawCheck.name === "string" ? rawCheck.name : "";
 		return {
-			node_id: sanitizeOutputText(rawNodeId, 128, blockedPaths),
+			node_id: sanitizeOutputText(rawNodeId, 128, blockedPaths, artifactMatcher),
 			state: validateExecutionState(c?.state),
-			reason: sanitizeOutputText(rawReason, OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths),
+			reason: sanitizeOutputText(rawReason, OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths, artifactMatcher),
 			...(rawCheck
 				? {
 					check: {
-						name: sanitizeOutputText(rawCheckName, OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths),
+						name: sanitizeOutputText(rawCheckName, OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths, artifactMatcher),
 						evidence: validateEvidenceStatus(rawCheck.evidence),
 					},
 				}
@@ -737,9 +745,10 @@ function projectAttemptFromObservation(
 			disp.reason || `Recorded disposition: ${disp.state}.`,
 			OUTPUT_DISPOSITION_REASON_MAX_CHARS,
 			blockedPaths,
+			sharedArtifactMatcher,
 		);
-		const causes = projectScrubbedCauses(obs.raw_causes ?? obs.causes, blockedPaths);
-		const command = projectAttemptCommand(disp.command_evidence, blockedPaths);
+		const causes = projectScrubbedCauses(obs.raw_causes ?? obs.causes, blockedPaths, sharedArtifactMatcher);
+		const command = projectAttemptCommand(disp.command_evidence, blockedPaths, sharedArtifactMatcher);
 		const recordedAt = validateIsoTimestamp(disp.recorded_at);
 		const extras = {
 			disposition_state: disp.state,
@@ -784,7 +793,7 @@ function projectAttemptFromObservation(
 		const nextSteps = buildBoundedList(res.next_steps, OUTPUT_LIST_MAX_ITEMS, s =>
 			sanitizeOutputText(typeof s === "string" ? s : "", OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths, artifactMatcher),
 		);
-		const command = projectAttemptCommand(res.command_evidence, blockedPaths);
+		const command = projectAttemptCommand(res.command_evidence, blockedPaths, artifactMatcher);
 		let outputsText: string | undefined;
 		if (res.outputs !== undefined) {
 			try {
@@ -835,8 +844,9 @@ function projectAttemptFromObservation(
 			obs.raw_reason || obs.reason || "Blocked by upstream review closure.",
 			OUTPUT_DISPOSITION_REASON_MAX_CHARS,
 			blockedPaths,
+			sharedArtifactMatcher,
 		);
-		const causes = projectScrubbedCauses(obs.raw_causes ?? obs.causes, blockedPaths);
+		const causes = projectScrubbedCauses(obs.raw_causes ?? obs.causes, blockedPaths, sharedArtifactMatcher);
 		return notApplicable(
 			obs.attempt_status,
 			obs.attempt_status_text,
@@ -851,7 +861,7 @@ function projectAttemptFromObservation(
 
 	if (obs.error_source) {
 		const errorMessage = obs.error_message
-			? sanitizeOutputText(obs.error_message, OUTPUT_ERROR_MAX_CHARS, blockedPaths)
+			? sanitizeOutputText(obs.error_message, OUTPUT_ERROR_MAX_CHARS, blockedPaths, sharedArtifactMatcher)
 			: undefined;
 		return unavailable(
 			obs.attempt_status,
@@ -874,6 +884,7 @@ function projectAttemptFromObservation(
 			obs.cancel_reason || "Cancelled.",
 			OUTPUT_DISPOSITION_REASON_MAX_CHARS,
 			blockedPaths,
+			sharedArtifactMatcher,
 		);
 		return notApplicable(
 			"cancelled",
