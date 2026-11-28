@@ -33,3 +33,20 @@ Non-blocking notes carried forward (suggested for a small follow-up before or du
 - NB5: every default open state is recorded as if the user had chosen it (`app.js` ~1219), so a long review loop watched live ends with every attempt expanded (record only explicit toggles); a failed fetch on a node that never transitions again recovers only by selecting another node and returning, because `outputLoadedKey` is already set (let re-selecting the same node retry after an error).
 
 Review file: scratchpad `review-04-r1.md`.
+
+## Follow-up 04b (client follow-ups NB1 to NB5), merged
+
+Done as a separate work item (branch `ticket/vao-04b`, builder agy hydrogen high, commits `4e1d87f`, `0531982`), one Opus review round (medium): PASS, no blocking findings. The reviewer mutation-checked scratchpad copies: deleting the focus-restoration call now fails a test (the harness moves `activeElement` to the body when a subtree holding it is detached, and a test focuses a sub-disclosure summary and refetches changed content for that attempt); the NB4 flap scenario, the helper and the last-seen update are also covered. Viewer suite 100 passed, docs test 7 passed, deterministic 1620 of 1623 (builder; the 3 failures are `hc-live-isolation.test.ts` in an hc cgroup).
+
+Done: NB1 the Attempt output card has `aria-live="off"` and a short announcer line ("Attempt N of node X finished: <Status>") is produced once per transition; NB2 harness focus detach and the missing test; NB3 `focus({ preventScroll: true })`; NB4 "last seen" node updated on every poll and passed as `prev`; NB5 only explicit user toggles are remembered (the newest attempt opens by default, a new newest attempt opens, untouched older attempts return to collapsed) and re-selecting the same node after a failed output fetch retries (click or Enter/Space).
+
+Docs sentences needed in `docs/factory-web-viewer.md` (ticket 05's builder writes them): (1) the Attempt output card is `aria-live="off"` and live polls announce a finished transition through the polite screen-reader announcer ("Attempt N of node X finished: <Status>"); (2) only explicit user disclosure toggles are remembered across refetches, and when a new attempt arrives untouched older attempts return to collapsed; (3) re-selecting the same node after a failed output fetch (click or Enter/Space) retries the output request.
+
+Non-blocking notes from that review, left open (for ticket 05's browser pass or a later small fix):
+- The output announcement can overwrite the factory-state announcement in the same poll (the last node finishes and the run state changes in one poll: `mountOrPatchLiveView` sets "Factory live state changed to ..." and the refetch then replaces it in the same polite announcer, `app.js` ~1302-1304 and ~2338-2342). Use a dedicated sr-only polite element for output announcements, or append.
+- Test gap: block M7 never advances a poll between a 503 and the re-click, so a regression passing `retryOutputOnError: true` from the poll path (`app.js` ~2012) would survive and retry once per poll forever on a persistent error; advance 2 or 3 polls and assert one call.
+- A second genuine entry with identical announcement text is not re-announced (`setTextIfChanged`, `safe.js` ~891-919); clear the announcer before writing (best together with the dedicated output announcer).
+- The announcer label trusts `status_text` from the response (`safe.js` ~910-915). Not exploitable today (the server sets it from a fixed table and the node id is validated), but prefer `STATUS_META[status].label` for known statuses.
+- Nits: a near-trivial assertion at `bootstrap/factory-web-viewer-assets.test.ts` ~4047; consider renaming `ds.outputNodeSnapshot` to `outputLastSeenNode`.
+
+Review file: scratchpad `review-04b-r1.md`.
