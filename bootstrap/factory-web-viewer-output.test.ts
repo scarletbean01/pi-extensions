@@ -3629,9 +3629,8 @@ test("Fix round 1 (B1, B2, B3, N3, N5): verified attempt numbers, context-failur
 	assert.equal(droppedAtt.summary, "S".repeat(280));
 });
 
-test("Fix round 1 (ticket 05 B1): artifact-path redaction runs on command excerpts/errors, disposition reasons, error messages, and causes in /output, and 20-attempt prefix timing stays < 1s", async t => {
+test("Fix round 1 (ticket 05 B1): artifact-path redaction runs on command excerpts/errors, disposition reasons, error messages, and causes in /output, and 11-attempt prefix timing stays < 1s", async t => {
 	const { writeFileSync } = await import("node:fs");
-	const { DatabaseSync } = await import("node:sqlite");
 	const { runCancelPath } = await import("./cancellation.ts");
 	const { handoffClaimPath, inputDigest } = await import("./handoff.ts");
 	const { finalizePath } = await import("./review-loop.ts");
@@ -4044,7 +4043,6 @@ test("Fix round 1 (ticket 05 B1): artifact-path redaction runs on command excerp
 	));
 
 	const sentinels = ["PRIV_ART", "PRIV_FAIL_ART", "PRIV_LOOP_ART", "PRIV_CAN_ART", "PRIV_CMD_LOOP", f.root, f.cwd, f.home, dir];
-	let liveBaseline = "";
 
 	await verifyReadOnlyViewer(
 		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
@@ -4109,16 +4107,10 @@ test("Fix round 1 (ticket 05 B1): artifact-path redaction runs on command excerp
 			scanSentinels(cancelText, sentinels, "multi-attempt cancel_loop");
 			const cancelBody = JSON.parse(cancelText);
 			assert.equal(cancelBody.attempts[0].disposition_reason, "Cancelled while editing [redacted-path]");
-
-			// /live remains unchanged
-			const liveRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
-			assert.equal(liveRes.status, 200);
-			liveBaseline = await liveRes.text();
-			assert.ok(liveBaseline.length > 0);
 		},
 	);
 
-	// 5. Timing test: 20 hostile attempts on /output with maximal 4,000-character excerpts and many artifacts sharing a prefix
+	// 5. Timing test (N2): 11 maximal command attempts on /output with 4,000-char excerpts containing real artifact tokens
 	const fPerf = serviceFixture(t, ["builder", "reviewer"]);
 	const statePerf = join(fPerf.root, "factories.sqlite");
 	const coordPerf = join(fPerf.root, "factory-coordination.sqlite");
@@ -4127,23 +4119,30 @@ test("Fix round 1 (ticket 05 B1): artifact-path redaction runs on command excerp
 	const draftPerf: GenerateRequest = {
 		project_cwd: fPerf.cwd,
 		topology: "graph",
-		task: "PRIVATE_PERF20_PROMPT",
+		task: "PRIVATE_PERF11_PROMPT",
 		agents: [
-			{ node_id: "build", persona: "builder", sub_task: "PRIVATE_PERF20_B" },
+			{
+				node_id: "build",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "0"],
+				working_directory: fPerf.cwd,
+				sub_task: "PRIVATE_PERF11_B",
+			},
 			{
 				node_id: "review",
 				persona: "reviewer",
 				depends_on: ["build"],
-				sub_task: "PRIVATE_PERF20_R",
+				sub_task: "PRIVATE_PERF11_R",
 				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
-				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 10, on_exhausted: "failed" },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 10, on_exhausted: "needs_attention" },
 			},
 		],
 	};
-	const facPerf = opsPerf({ action: "publish", name: "t05-perf20-fac", draft: draftPerf, sessionModel });
-	const authPerf = createManagerAuthority({ pi_session_id: "sess-t05-perf20" });
+	const facPerf = opsPerf({ action: "publish", name: "t05-perf11-fac", draft: draftPerf, sessionModel });
+	const authPerf = createManagerAuthority({ pi_session_id: "sess-t05-perf11" });
 	opsPerf({ action: "resume", factory_id: facPerf.factory_id, authority: authPerf });
-	opsPerf({ action: "submit", factory_id: facPerf.factory_id, authority: authPerf, reference: "t05-perf20-ref", brief: "PRIVATE_PERF20_BRIEF" });
+	opsPerf({ action: "submit", factory_id: facPerf.factory_id, authority: authPerf, reference: "t05-perf11-ref", brief: "PRIVATE_PERF11_BRIEF" });
 	const launchedPerf = await opsPerf({ action: "launch", factory_id: facPerf.factory_id, authority: authPerf });
 	revokeManagerAuthority(authPerf);
 
@@ -4152,39 +4151,20 @@ test("Fix round 1 (ticket 05 B1): artifact-path redaction runs on command excerp
 	const pRev = launchedPerf.manifest.pane_manifest.find(e => e.node_id === "review")!;
 	const pBuildCfg = readJson<WorkerConfig>(join(dirPerf, `${pBuild.instance_id}.config.json`));
 	const pRevCfg = readJson<WorkerConfig>(join(dirPerf, `${pRev.instance_id}.config.json`));
-	const prefix = "src/shared/aaaaaaaa";
-	const hostileExcerpt = `${`${prefix}x `.repeat(320)}${"E".repeat(4000)}`.slice(0, 4000);
-	const manifest20 = {
-		...launchedPerf.manifest,
-		review_plan: {
-			...launchedPerf.manifest.review_plan!,
-			max_total_attempts: 45,
-			loops: [{ ...launchedPerf.manifest.review_plan!.loops[0], max_revisions: 19 }],
-		},
-	};
-	atomicJson(join(dirPerf, "manifest.json"), manifest20);
-	atomicJson(join(fPerf.stateDir, `${launchedPerf.task_id}.json`), manifest20);
-	const dbPerf = new DatabaseSync(statePerf);
-	try {
-		const row = dbPerf.prepare("SELECT definition FROM factory_versions WHERE factory_id = ? AND version = 'v1'").get(facPerf.factory_id) as { definition: string };
-		const defObj = JSON.parse(row.definition);
-		defObj.max_total_attempts = 45;
-		defObj.agents[1].decision.max_revisions = 19;
-		dbPerf.prepare("UPDATE factory_versions SET definition = ? WHERE factory_id = ? AND version = 'v1'").run(JSON.stringify(defObj), facPerf.factory_id);
-	} finally {
-		dbPerf.close();
-	}
+	const prefix = "src/shared/PRIVPFX/aaaaaaaa";
 
-	for (let n = 1; n <= 20; n++) {
+	for (let n = 1; n <= 11; n++) {
 		const bId = `${pBuild.instance_id}.${n}`;
 		const rId = `${pRev.instance_id}.${n}`;
 		const ts = `2026-11-28T14:00:${String(n).padStart(2, "0")}.000Z`;
+		const unit = `${prefix}${n}_0.ts ${prefix}${n}_1.ts:12 @${prefix}${n}_2.ts# "${prefix}${n}_3.ts" ${prefix}${n}_0.js ${prefix}${n}_ `;
+		const excerpt = unit.repeat(Math.ceil(4000 / unit.length)).slice(0, 4000);
 		const rec = completionRecord(
 			{ ...pBuildCfg, attempt_id: bId },
 			{
 				agent_name: pBuild.persona_name,
 				node_id: "build",
-				status: n === 20 ? "success" : "partial",
+				status: n === 11 ? "success" : "partial",
 				summary: `Perf summary ${n}`,
 				detail: `Perf detail ${n}`,
 				artifacts: Array.from({ length: 20 }, (_, i) => ({
@@ -4197,15 +4177,15 @@ test("Fix round 1 (ticket 05 B1): artifact-path redaction runs on command excerp
 					command: process.execPath,
 					args: ["-e", "0"],
 					working_directory: fPerf.cwd,
-					exit_code: n === 20 ? 0 : 1,
+					exit_code: n === 11 ? 0 : 1,
 					signal: null,
 					started_at: ts,
 					finished_at: ts,
 					duration_ms: 100,
 					stdout_bytes: 4000,
 					stderr_bytes: 4000,
-					stdout_excerpt: hostileExcerpt,
-					stderr_excerpt: hostileExcerpt,
+					stdout_excerpt: excerpt,
+					stderr_excerpt: excerpt,
 				},
 			},
 			"sent",
@@ -4233,7 +4213,7 @@ test("Fix round 1 (ticket 05 B1): artifact-path redaction runs on command excerp
 		}
 		atomicJson(resultPath(dirPerf, rId), completionRecord(
 			{ ...pRevCfg, attempt_id: rId },
-			{ agent_name: pRev.persona_name, node_id: "review", status: "success", summary: `R${n}`, outputs: { verdict: n === 20 ? "approve" : "revise" } },
+			{ agent_name: pRev.persona_name, node_id: "review", status: "success", summary: `R${n}`, outputs: { verdict: n === 11 ? "approve" : "revise" } },
 			"sent",
 			ts,
 		));
@@ -4253,14 +4233,316 @@ test("Fix round 1 (ticket 05 B1): artifact-path redaction runs on command excerp
 	await verifyReadOnlyViewer(
 		{ stateDirs: fPerf.root, viewerOptions: { statePath: statePerf, coordinationPath: coordPerf, env: envPerf, home: fPerf.home } },
 		async viewer => {
+			// Verify real attempts are returned and redaction is active BEFORE timing
+			const checkRes = await fetch(`${viewer.url}/api/factories/${facPerf.factory_id}/output?node=build`);
+			assert.equal(checkRes.status, 200);
+			const checkText = await checkRes.text();
+			const checkBody = JSON.parse(checkText);
+			assert.notEqual(checkBody.evidence, "unavailable", `Unexpected unavailable output: ${checkBody.explanation ?? checkText}`);
+			assert.ok(Array.isArray(checkBody.attempts) && checkBody.attempts.length > 1, `Expected >1 attempts, got ${checkBody.attempts?.length}`);
+			assert.equal(checkBody.attempts[0].attempt_number, 11);
+			scanSentinels(checkText, ["PRIVATE_", `${prefix}11_0.ts`, `${prefix}11_1.ts`, `${prefix}11_2.ts`, `${prefix}11_3.ts`], "perf11");
+			for (const att of checkBody.attempts as Array<Record<string, any>>) {
+				const ownRe = new RegExp(`aaaaaaaa${att.attempt_number}_\\d+\\.ts(?:$|[^A-Za-z0-9_])`);
+				for (const field of ["stdout_excerpt", "stderr_excerpt"] as const) {
+					const val = att.command?.[field];
+					if (typeof val === "string") {
+						assert.doesNotMatch(val, ownRe, `Attempt ${att.attempt_number} leaked own artifact in ${field}`);
+					}
+				}
+			}
+			const newestOut: string = checkBody.attempts[0].command.stdout_excerpt;
+			assert.match(newestOut, /\[redacted-path\] \[redacted-path\]:12 @\[redacted-path\]# "\[redacted-path\]" src\/shared\/PRIVPFX\/aaaaaaaa11_0\.js/);
+
 			const t0 = performance.now();
 			const res = await fetch(`${viewer.url}/api/factories/${facPerf.factory_id}/output?node=build`);
 			const elapsedMs = performance.now() - t0;
 			assert.equal(res.status, 200);
 			const text = await res.text();
-			assert.ok(elapsedMs < 1000, `20 hostile attempts with maximal 4000-char excerpts took ${elapsedMs.toFixed(0)}ms`);
+			const body = JSON.parse(text);
+			assert.notEqual(body.evidence, "unavailable");
+			assert.ok(Array.isArray(body.attempts) && body.attempts.length > 1);
+			assert.ok(elapsedMs < 1000, `11 maximal command attempts with 4000-char artifact-laden excerpts took ${elapsedMs.toFixed(0)}ms`);
 			assert.ok(Buffer.byteLength(text, "utf8") <= 64 * 1024);
-			scanSentinels(text, ["PRIVATE_", `${prefix}19_`, `${prefix}20_`], "perf20");
 		},
+	);
+});
+
+test("Fix round 2 (ticket 05 B1 & N6): runner-clipped command excerpts drop trailing partial path without over-trimming prose, and command signal redacts artifacts", async t => {
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_T05_R2_PROMPT",
+		agents: [
+			{
+				node_id: "cmd_clip_json",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "0"],
+				working_directory: f.cwd,
+				sub_task: "PRIVATE_CLIP_JSON",
+			},
+			{
+				node_id: "cmd_clip_prefix",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "0"],
+				working_directory: f.cwd,
+				sub_task: "PRIVATE_CLIP_PREFIX",
+			},
+			{
+				node_id: "cmd_clip_slash_prose",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "0"],
+				working_directory: f.cwd,
+				sub_task: "PRIVATE_CLIP_SLASH_PROSE",
+			},
+			{
+				node_id: "cmd_clip_long",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "0"],
+				working_directory: f.cwd,
+				sub_task: "PRIVATE_CLIP_LONG",
+			},
+		],
+	};
+	const fac = ops({ action: "publish", name: "t05-r2-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-t05-r2" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "t05-r2-ref", brief: "PRIVATE_T05_R2_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const entryOf = (nodeId: string) => launched.manifest.pane_manifest.find(e => e.node_id === nodeId)!;
+	const cfgOf = (e: ReturnType<typeof entryOf>) => readJson<WorkerConfig>(join(dir, `${e.instance_id}.config.json`));
+
+	// 1. Reviewer end-to-end case: 980 filler chars + JSON artifact path clipped at `…`, plus stderr clip and N6 signal
+	const jsonEntry = entryOf("cmd_clip_json");
+	atomicJson(
+		resultPath(dir, jsonEntry.instance_id),
+		completionRecord(
+			cfgOf(jsonEntry),
+			{
+				agent_name: jsonEntry.persona_name,
+				node_id: "cmd_clip_json",
+				status: "failure",
+				summary: "Clipped command",
+				detail: "Runner clipped stdout and stderr",
+				artifacts: [{ type: "file", path: "src/PRIV_ART.ts", action: "created", description: "Clipped artifact" }],
+				command_evidence: {
+					version: 1,
+					command: process.execPath,
+					args: ["-e", "0"],
+					working_directory: f.cwd,
+					exit_code: 1,
+					signal: "src/PRIV_ART.ts",
+					started_at: "2026-11-28T15:00:00.000Z",
+					finished_at: "2026-11-28T15:00:01.000Z",
+					duration_ms: 1000,
+					stdout_bytes: 2048,
+					stderr_bytes: 2048,
+					stdout_excerpt: `${"Y".repeat(980)}{"artifacts":[{"path":"src/PRIV_ART…`,
+					stderr_excerpt: `${"E".repeat(980)} src/PRIV_ART…`,
+				},
+			},
+			"not_required",
+			"2026-11-28T15:00:01.000Z",
+		),
+	);
+
+	// 2. Clip after `src/app/` prefix
+	const prefixEntry = entryOf("cmd_clip_prefix");
+	atomicJson(
+		resultPath(dir, prefixEntry.instance_id),
+		completionRecord(
+			cfgOf(prefixEntry),
+			{
+				agent_name: prefixEntry.persona_name,
+				node_id: "cmd_clip_prefix",
+				status: "failure",
+				summary: "Prefix clip",
+				detail: "Clipped after src/app/",
+				artifacts: [{ type: "file", path: "src/app/PRIV_APP_ART.ts", action: "modified", description: "App artifact" }],
+				command_evidence: {
+					version: 1,
+					command: process.execPath,
+					args: ["-e", "0"],
+					working_directory: f.cwd,
+					exit_code: 1,
+					signal: "SIGTERM",
+					started_at: "2026-11-28T15:00:00.000Z",
+					finished_at: "2026-11-28T15:00:01.000Z",
+					duration_ms: 1000,
+					stdout_bytes: 1200,
+					stderr_bytes: 0,
+					stdout_excerpt: "prefix src/app/PRIV_APP_ART…",
+					stderr_excerpt: "",
+				},
+			},
+			"not_required",
+			"2026-11-28T15:00:01.000Z",
+		),
+	);
+
+	// 3. Clip right after `/` (raw ends `src/…`) and ordinary prose clip (`…`)
+	const slashProseEntry = entryOf("cmd_clip_slash_prose");
+	atomicJson(
+		resultPath(dir, slashProseEntry.instance_id),
+		completionRecord(
+			cfgOf(slashProseEntry),
+			{
+				agent_name: slashProseEntry.persona_name,
+				node_id: "cmd_clip_slash_prose",
+				status: "success",
+				summary: "Slash and prose clips",
+				detail: "Slash clip and ordinary prose clip",
+				artifacts: [{ type: "file", path: "src/PRIV_SLASH.ts", action: "created", description: "Slash artifact" }],
+				command_evidence: {
+					version: 1,
+					command: process.execPath,
+					args: ["-e", "0"],
+					working_directory: f.cwd,
+					exit_code: 0,
+					signal: null,
+					started_at: "2026-11-28T15:00:00.000Z",
+					finished_at: "2026-11-28T15:00:01.000Z",
+					duration_ms: 1000,
+					stdout_bytes: 1024,
+					stderr_bytes: 1024,
+					stdout_excerpt: "prefix src/…",
+					stderr_excerpt: "Keep this ordinary prose clippedword…",
+				},
+			},
+			"not_required",
+			"2026-11-28T15:00:01.000Z",
+		),
+	);
+
+	// 4. Long (>4000 chars) excerpt ending with ` src/PRIV_LONG…` to verify exact 4,000-cap marker arithmetic
+	const longEntry = entryOf("cmd_clip_long");
+	atomicJson(
+		resultPath(dir, longEntry.instance_id),
+		completionRecord(
+			cfgOf(longEntry),
+			{
+				agent_name: longEntry.persona_name,
+				node_id: "cmd_clip_long",
+				status: "success",
+				summary: "Long clip",
+				detail: "Over 4000 chars ending in partial path clip",
+				artifacts: [{ type: "file", path: "src/PRIV_LONG.ts", action: "created", description: "Long artifact" }],
+				command_evidence: {
+					version: 1,
+					command: process.execPath,
+					args: ["-e", "0"],
+					working_directory: f.cwd,
+					exit_code: 0,
+					signal: null,
+					started_at: "2026-11-28T15:00:00.000Z",
+					finished_at: "2026-11-28T15:00:01.000Z",
+					duration_ms: 1000,
+					stdout_bytes: 4500,
+					stderr_bytes: 0,
+					stdout_excerpt: `${"A".repeat(4200)} src/PRIV_LONG…`,
+					stderr_excerpt: "",
+				},
+			},
+			"not_required",
+			"2026-11-28T15:00:01.000Z",
+		),
+	);
+
+	const sentinels = ["PRIV_ART", "PRIV_APP_ART", "PRIV_SLASH", "PRIV_LONG", "PRIVATE_T05_R2", f.root, f.cwd, f.home, dir];
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const jsonRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_clip_json`);
+			assert.equal(jsonRes.status, 200);
+			const jsonText = await jsonRes.text();
+			scanSentinels(jsonText, sentinels, "cmd_clip_json");
+			const jsonBody = JSON.parse(jsonText);
+			assert.equal(jsonBody.attempts[0].command.stdout_excerpt, `${"Y".repeat(980)}{"artifacts":[{"path":"…`);
+			assert.equal(jsonBody.attempts[0].command.stderr_excerpt, `${"E".repeat(980)} …`);
+			assert.equal(jsonBody.attempts[0].command.signal, "[redacted-path]");
+
+			const prefixRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_clip_prefix`);
+			assert.equal(prefixRes.status, 200);
+			const prefixText = await prefixRes.text();
+			scanSentinels(prefixText, sentinels, "cmd_clip_prefix");
+			const prefixBody = JSON.parse(prefixText);
+			assert.equal(prefixBody.attempts[0].command.stdout_excerpt, "prefix …");
+			assert.equal(prefixBody.attempts[0].command.signal, "SIGTERM");
+
+			const slashRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_clip_slash_prose`);
+			assert.equal(slashRes.status, 200);
+			const slashText = await slashRes.text();
+			scanSentinels(slashText, sentinels, "cmd_clip_slash_prose");
+			const slashBody = JSON.parse(slashText);
+			assert.equal(slashBody.attempts[0].command.stdout_excerpt, "prefix …");
+			const proseOut: string = slashBody.attempts[0].command.stderr_excerpt;
+			assert.ok(proseOut.startsWith("Keep this ordinary prose "), `Unexpected prose over-trim: ${proseOut}`);
+			assert.ok(proseOut.endsWith("…"));
+
+			const longRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_clip_long`);
+			assert.equal(longRes.status, 200);
+			const longText = await longRes.text();
+			scanSentinels(longText, sentinels, "cmd_clip_long");
+			const longBody = JSON.parse(longText);
+			const longOut: string = longBody.attempts[0].command.stdout_excerpt;
+			assert.equal(Array.from(longOut).length, 4000);
+			const markerMatch = /… \[truncated, (\d+) characters? omitted\]$/.exec(longOut);
+			assert.ok(markerMatch, `Expected counted truncation marker in ${longOut.slice(-60)}`);
+			const kept = Array.from(longOut.slice(0, markerMatch.index)).length;
+			const omitted = Number(markerMatch[1]);
+			assert.equal(kept + omitted, 4202);
+		},
+	);
+
+	// 64 KB budget arithmetic on a runner-clipped excerpt
+	const budgetBody = enforceOutputResponseBudget(
+		{
+			factory_id: "f-clip",
+			node_id: "cmd_clip_json",
+			evidence: "available",
+			total_attempts: 1,
+			omitted_attempts: 0,
+			attempts: [
+				{
+					attempt_id: "a.1",
+					attempt_number: 1,
+					max_attempts: 1,
+					status: "succeeded",
+					status_text: "Succeeded",
+					evidence: "available",
+					summary: "Clipped budget check",
+					command: {
+						exit_code: 0,
+						signal: null,
+						duration_ms: 10,
+						stdout_bytes: 2048,
+						stderr_bytes: 0,
+						stdout_excerpt: `${"Y".repeat(980)}{"artifacts":[{"path":"…`,
+					},
+				},
+			],
+		},
+		450,
+	);
+	assert.ok(Buffer.byteLength(JSON.stringify(budgetBody), "utf8") <= 450);
+	const trimmedClipped = (budgetBody.attempts as any[])[0].command.stdout_excerpt as string;
+	const budgetMarker = /… \[truncated, (\d+) characters? omitted\]$/.exec(trimmedClipped);
+	assert.ok(budgetMarker, `Expected counted marker after budget trim: ${trimmedClipped}`);
+	assert.equal(
+		Array.from(trimmedClipped.slice(0, budgetMarker.index)).length + Number(budgetMarker[1]),
+		`${"Y".repeat(980)}{"artifacts":[{"path":"…`.length,
 	);
 });

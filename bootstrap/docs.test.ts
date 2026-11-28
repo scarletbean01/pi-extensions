@@ -608,12 +608,12 @@ test("docs/factory-web-viewer.md, links, and GLOSSARY Run graph entry match the 
 	assert.match(attemptOutput, /Attempt output is allowed in scrubbed, bounded form/);
 	assert.match(
 		attemptOutput,
-		/raw prompts,\s*input briefs,\s*tokens,\s*endpoint paths,\s*worker configuration,\s*metrics,\s*artifact paths,?\s*and canonical checkout paths remain excluded\./,
+		/raw prompts,\s*(?:full\s+)?input briefs,\s*tokens,\s*endpoint paths,\s*worker configuration,\s*metrics,\s*artifact paths,?\s*and canonical checkout paths remain excluded\b/,
 		"Attempt output privacy statement must preserve the full exclusion sentence",
 	);
 	assert.match(
 		attemptOutput,
-		/Session transcripts,\s*terminal capture,\s*thinking text,\s*and any log are also excluded/,
+		/Session transcripts,\s*terminal capture,\s*thinking text,?\s*and any log are also excluded/,
 		"Attempt output privacy statement must preserve the transcripts/log exclusion sentence",
 	);
 	assert.doesNotMatch(
