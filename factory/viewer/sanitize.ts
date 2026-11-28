@@ -22,8 +22,12 @@ const MAX_ARTIFACT_TOKENS = 512;
 const MAX_ARTIFACT_TOKEN_CHARS = 256 * 1024;
 const HAS_SEP_RE = /[\\/]/;
 const DOT_EXT_RE = /^\.[A-Za-z][A-Za-z0-9_-]{0,9}$/;
+const ONE_CHAR_STEM_DOT_EXT_RE = /^\.[A-Za-z]{2}[A-Za-z0-9_-]{0,8}$/;
+const DOTFILE_RE = /^\.[A-Za-z][\w-]+$/;
 const ARTIFACT_DELIM_CHAR_RE = /[\s"'<>()\[\]{}`*,;|!?=]/;
-const ARTIFACT_SUFFIX_SPLIT_CHARS = [":", "#", "@", "~", "+", "&", "%"] as const;
+const NON_ASCII_DELIM_RE = /[^\p{L}\p{N}\p{M}]/u;
+const ARTIFACT_SUFFIX_SPLIT_CHARS = [":", "#", "@", "~", "+", "&", "%", "$", "^"] as const;
+const LEADING_ARTIFACT_PREFIX_CHARS = new Set(["@", "#", "&", "%"]);
 const DRIVE_PREFIX_RE = /^[A-Za-z]:/;
 
 function escapeRegExp(value: string): string {
@@ -110,9 +114,8 @@ const EMPTY_ARTIFACT_MATCHER: ArtifactRedactionMatcher = {
 };
 
 function hasArtifactDelim(token: string): boolean {
-	if (ARTIFACT_DELIM_CHAR_RE.test(token)) return true;
 	for (let i = 0; i < token.length; i++) {
-		if (token.charCodeAt(i) <= 32) return true;
+		if (isArtifactDelimChar(token.charCodeAt(i), token[i]!)) return true;
 	}
 	return false;
 }
@@ -122,15 +125,18 @@ function isRedactableArtifactForm(token: string): boolean {
 	if (token === "[ctrl]" || token === "[redacted-path]" || token === "[truncated-marker]") return false;
 	if (hasArtifactDelim(token)) return false;
 	if (HAS_SEP_RE.test(token)) return true;
+	if (DOTFILE_RE.test(token)) return true;
 	const lastDot = token.lastIndexOf(".");
+	if (lastDot === 1) return ONE_CHAR_STEM_DOT_EXT_RE.test(token.slice(lastDot));
 	return lastDot >= 2 && DOT_EXT_RE.test(token.slice(lastDot));
 }
 
 /**
  * Collect normalized forms (literal, trailing-separator-stripped, `./`/`../`-stripped, separator-swapped,
  * JSON-escaped, and project-joined absolute) from the projected artifacts (capped at 20 artifacts,
- * 512 tokens, and 256 KiB), excluding delimiter-containing forms and bare single words without a separator
- * or 1–10-char letter-led dot-extension on a 2+-char stem.
+ * 512 tokens, and 256 KiB), excluding delimiter-containing forms and bare single words without a separator,
+ * a 3+-char letter-led dotfile, a 2+-letter extension on a 1-char stem, or a 1–10-char letter-led
+ * dot-extension on a 2+-char stem.
  */
 export function collectArtifactPathTokens(
 	artifacts: ReadonlyArray<{ path?: unknown }> | undefined,
@@ -232,7 +238,8 @@ export function compileArtifactRedactionMatcher(tokens: readonly string[] | Arti
 }
 
 function isArtifactDelimChar(code: number, ch: string): boolean {
-	if (code <= 32) return true; // whitespace / control
+	if (code <= 32 || code === 127) return true; // whitespace / control
+	if (code > 127) return NON_ASCII_DELIM_RE.test(ch); // non-letter/number/mark Unicode punctuation; surrogate halves count as delimiters
 	return ARTIFACT_DELIM_CHAR_RE.test(ch);
 }
 
@@ -294,6 +301,18 @@ function findMatchedPrefixEnd(cand: string, matcher: ArtifactRedactionMatcher): 
 				splitLengths.push(last - 1);
 			}
 		}
+	}
+
+	let firstDot = cand.indexOf(".");
+	while (firstDot !== -1) {
+		if (firstDot > 0 && firstDot + 1 < cand.length) {
+			const nextCode = cand.charCodeAt(firstDot + 1);
+			if (nextCode >= 48 && nextCode <= 57) {
+				splitLengths.push(firstDot);
+				break;
+			}
+		}
+		firstDot = cand.indexOf(".", firstDot + 1);
 	}
 
 	const lastDot = cand.lastIndexOf(".");
@@ -368,13 +387,23 @@ function scrubExtraRedactedTokens(text: string, matcher: ArtifactRedactionMatche
 
 		let matchPrefixOffset = 0;
 		let matchedLen = findMatchedPrefixEnd(tok, matcher);
-		if (matchedLen < 0 && tok.length > 5 && tok.slice(0, 5).toLowerCase() === "file:") {
-			const offset = tok.startsWith("//", 5) ? 7 : 5;
-			if (offset < tok.length) {
-				const subLen = findMatchedPrefixEnd(tok.slice(offset), matcher);
+		if (matchedLen < 0) {
+			const sigilOffset = tok.length > 1 && LEADING_ARTIFACT_PREFIX_CHARS.has(tok[0]!) ? 1 : 0;
+			if (sigilOffset > 0) {
+				const subLen = findMatchedPrefixEnd(tok.slice(sigilOffset), matcher);
 				if (subLen > 0) {
-					matchPrefixOffset = offset;
+					matchPrefixOffset = sigilOffset;
 					matchedLen = subLen;
+				}
+			}
+			if (matchedLen < 0 && tok.length > sigilOffset + 5 && tok.slice(sigilOffset, sigilOffset + 5).toLowerCase() === "file:") {
+				const fileOffset = sigilOffset + (tok.startsWith("//", sigilOffset + 5) ? 7 : 5);
+				if (fileOffset < tok.length) {
+					const subLen = findMatchedPrefixEnd(tok.slice(fileOffset), matcher);
+					if (subLen > 0) {
+						matchPrefixOffset = fileOffset;
+						matchedLen = subLen;
+					}
 				}
 			}
 		}

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
 import { enforceOutputResponseBudget, nodeOutputSnapshot } from "../factory/viewer/output.ts";
-import { collectArtifactPathTokens, sanitizeOperatorText, sanitizeOutputText } from "../factory/viewer/sanitize.ts";
+import { collectArtifactPathTokens, compileArtifactRedactionMatcher, sanitizeOperatorText, sanitizeOutputText } from "../factory/viewer/sanitize.ts";
 import { createViewerReader } from "../factory/viewer/server.ts";
 import { atomicJson, completionRecord, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
 import { handoffOfferPath } from "./handoff.ts";
@@ -2095,18 +2095,93 @@ test("Round 3 unit hardening: R3-B1 line/anchor suffixes and file: prefix, R3-B2
 	const elapsed = performance.now() - t0;
 	assert.ok(elapsed < 500, `spaced-artifact unit scrub took too long: ${elapsed.toFixed(0)}ms`);
 
-	// N1: dotted prose words e.g, i.e, v1.2, a.ts are not redacted as bare dotted paths
+	// N1 / R4-N3: dotted prose words e.g, i.e, v1.2, x.12, a.c are not redacted as bare dotted paths,
+	// while >=3-char dotfiles (.env, .gitignore) and 1-char stems with >=2-letter extensions (x.py, a.ts) are redacted
 	const n1Tokens = collectArtifactPathTokens(
-		[{ path: "e.g" }, { path: "i.e" }, { path: "v1.2" }, { path: "a.ts" }, { path: "secret-file.ts" }],
+		[{ path: "e.g" }, { path: "i.e" }, { path: "v1.2" }, { path: "x.12" }, { path: "a.c" }, { path: "a.ts" }, { path: "x.py" }, { path: ".env" }, { path: ".gitignore" }, { path: "secret-file.ts" }],
 		cwd,
 	);
 	assert.equal(
-		sanitizeOutputText("e.g i.e v1.2 a.ts and secret-file.ts", 1000, blocked, n1Tokens),
-		"e.g i.e v1.2 a.ts and [redacted-path]",
+		sanitizeOutputText("e.g i.e v1.2 x.12 a.c vs a.ts x.py .env .gitignore secret-file.ts", 1000, blocked, n1Tokens),
+		"e.g i.e v1.2 x.12 a.c vs [redacted-path] [redacted-path] [redacted-path] [redacted-path] [redacted-path]",
 	);
 	assert.equal(
-		sanitizeOperatorText("e.g i.e v1.2 a.ts and secret-file.ts", 1000, blocked, n1Tokens),
-		"e.g i.e v1.2 a.ts and [redacted-path]",
+		sanitizeOperatorText("e.g i.e v1.2 x.12 a.c vs a.ts x.py .env .gitignore secret-file.ts", 1000, blocked, n1Tokens),
+		"e.g i.e v1.2 x.12 a.c vs [redacted-path] [redacted-path] [redacted-path] [redacted-path] [redacted-path]",
+	);
+});
+
+test("Round 4 unit hardening: R4-B1 non-ASCII punctuation delimiters, N1 leading sigils, N2 $/^ and first .digit splits, N3 dotfiles/short stems", () => {
+	const cwd = "/home/alice/proj";
+	const blocked = ["/home/alice", cwd];
+	const tokens = collectArtifactPathTokens([{ path: "src/a.ts" }], cwd);
+
+	// R4-B1: non-ASCII punctuation delimits like ASCII punctuation in both scrubbers
+	const uniCases: Array<[string, string]> = [
+		["“src/a.ts”", "“[redacted-path]”"],
+		["‘src/a.ts’", "‘[redacted-path]’"],
+		["«src/a.ts»", "«[redacted-path]»"],
+		["（src/a.ts）", "（[redacted-path]）"],
+		["src/a.ts—x", "[redacted-path]—x"],
+		["src/a.ts…", "[redacted-path]…"],
+		["src/a.ts’s", "[redacted-path]’s"],
+		["src/a.ts。", "[redacted-path]。"],
+		["src/a.ts、x", "[redacted-path]、x"],
+		["src/a.ts→x", "[redacted-path]→x"],
+		["→src/a.ts", "→[redacted-path]"],
+		["•src/a.ts", "•[redacted-path]"],
+		["🚀src/a.ts🚀", "🚀[redacted-path]🚀"],
+	];
+	for (const [input, expected] of uniCases) {
+		assert.equal(sanitizeOutputText(input, 1000, blocked, tokens), expected, `output failed on ${input}`);
+		assert.equal(sanitizeOperatorText(input, 1000, blocked, tokens), expected, `operator failed on ${input}`);
+	}
+
+	// R4-B1: ASCII word boundaries and non-ASCII letters still extend words (must stay untouched)
+	const nonMatches = "mysrc/a.tsx src/a.tsx xsrc/a.ts src/a.ts.bak src/a.tsfoo a.ts foo:src/a.ts ésrc/a.ts src/a.tsé e\u0301src/a.ts";
+	assert.equal(sanitizeOutputText(nonMatches, 1000, blocked, tokens), nonMatches);
+	assert.equal(sanitizeOperatorText(nonMatches, 1000, blocked, tokens), nonMatches);
+
+	// R4-B1: hasArtifactDelim agrees with scanning on non-ASCII punctuation / surrogate halves
+	assert.deepEqual(collectArtifactPathTokens([{ path: "src/a—b.ts" }, { path: "src/🚀.ts" }], cwd), []);
+
+	// N1: leading @, #, &, % prefixes redact while preserving prefix and leaving foo:src/a.ts untouched
+	const sigilInput = "@src/a.ts @src/a.ts:12 #src/a.ts &src/a.ts %src/a.ts @file:src/a.ts:3 foo:src/a.ts";
+	const sigilExpected = "@[redacted-path] @[redacted-path]:12 #[redacted-path] &[redacted-path] %[redacted-path] @file:[redacted-path]:3 foo:src/a.ts";
+	assert.equal(sanitizeOutputText(sigilInput, 1000, blocked, tokens), sigilExpected);
+	assert.equal(sanitizeOperatorText(sigilInput, 1000, blocked, tokens), sigilExpected);
+
+	// N2: $ and ^ split chars, plus first .digit split for multi-segment .1.2 / .1.1.1
+	const n2Tokens = collectArtifactPathTokens(
+		[{ path: "src/a.ts" }, { path: "a/b.ts" }, { path: "src/v1" }],
+		cwd,
+	);
+	const n2Input = "src/a.ts$x src/a.ts^x src/a.ts.1.2 a/b.ts.1.1.1 src/v1.2.3";
+	const n2Expected = "[redacted-path]$x [redacted-path]^x [redacted-path].1.2 [redacted-path].1.1.1 [redacted-path].2.3";
+	assert.equal(sanitizeOutputText(n2Input, 1000, blocked, n2Tokens), n2Expected);
+	assert.equal(sanitizeOperatorText(n2Input, 1000, blocked, n2Tokens), n2Expected);
+	const n2Untouched = "a/b.tsx.1 src/a.ts.bak a/b.ts.x1 a/b.ts.bak.1";
+	assert.equal(sanitizeOutputText(n2Untouched, 1000, blocked, n2Tokens), n2Untouched);
+	assert.equal(sanitizeOperatorText(n2Untouched, 1000, blocked, n2Tokens), n2Untouched);
+
+	// N2 perf: 200k runs of $, ^, and dots stay linear
+	const matcher = compileArtifactRedactionMatcher(n2Tokens);
+	const t0 = performance.now();
+	for (const unit of ["$", "^", ".", "src/a.ts$x "]) {
+		const big = unit.repeat(Math.ceil(200_000 / unit.length)).slice(0, 200_000);
+		sanitizeOutputText(big, 200_000, blocked, matcher);
+		sanitizeOperatorText(big, 1000, blocked, matcher);
+	}
+	assert.ok(performance.now() - t0 < 500, "200k split-char run took too long");
+
+	// N3: dotfiles >=3 chars and 1-char stem with >=2-letter extension; keep x.y / a.c / .a / .12 out
+	const n3Tokens = collectArtifactPathTokens(
+		[{ path: ".env" }, { path: ".gitignore" }, { path: "x.py" }, { path: "a.ts" }, { path: "a.c" }, { path: "e.g" }, { path: "i.e" }, { path: "v1.2" }, { path: "x.12" }, { path: ".a" }, { path: ".12" }],
+		cwd,
+	);
+	assert.equal(
+		sanitizeOutputText(".env .gitignore x.py a.ts a.c e.g i.e v1.2 x.12 .a .12", 1000, blocked, n3Tokens),
+		"[redacted-path] [redacted-path] [redacted-path] [redacted-path] a.c e.g i.e v1.2 x.12 .a .12",
 	);
 });
 
@@ -2246,6 +2321,116 @@ test("GET /api/factories/:id/output and /live redact R3-B1 path:line/#L/@/file: 
 			const spacedBody = JSON.parse(spacedText);
 			assert.equal("path" in spacedBody.latest_attempt.artifacts.items[0], false);
 			assert.equal(spacedText.includes("/z0"), false);
+		},
+	);
+});
+
+test("GET /api/factories/:id/output and /live redact R4-B1 non-ASCII punctuation, N1 @, N2 $/^/.1.2, and N3 .env/x.py across all fields", async t => {
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_R4_PROMPT",
+		agents: [
+			{ node_id: "uni", persona: "builder", sub_task: "PRIVATE_R4_UNI" },
+		],
+	};
+	const fac = ops({ action: "publish", name: "r4-fixes-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-r4-fixes" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "r4-ref", brief: "PRIVATE_R4_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const uniEntry = launched.manifest.pane_manifest.find(e => e.node_id === "uni")!;
+	const uniCfg = readJson<WorkerConfig>(join(dir, `${uniEntry.instance_id}.config.json`));
+
+	const textPayload = "“src/a.ts” src/a.ts—x src/a.ts… （src/a.ts） src/a.ts。 @src/a.ts src/a.ts$x src/a.ts^x src/a.ts.1.2 .env x.py | keep ésrc/a.ts src/a.tsé foo:src/a.ts mysrc/a.tsx src/a.ts.bak";
+	const expectedRedacted = "“[redacted-path]” [redacted-path]—x [redacted-path]… （[redacted-path]） [redacted-path]。 @[redacted-path] [redacted-path]$x [redacted-path]^x [redacted-path].1.2 [redacted-path] [redacted-path] | keep ésrc/a.ts src/a.tsé foo:src/a.ts mysrc/a.tsx src/a.ts.bak";
+
+	atomicJson(
+		resultPath(dir, uniEntry.instance_id),
+		completionRecord(
+			uniCfg,
+			{
+				agent_name: uniEntry.persona_name,
+				node_id: "uni",
+				status: "success",
+				summary: textPayload,
+				detail: textPayload,
+				verification: [{ check_id: "chk-uni", result: "pass", reason: textPayload }],
+				warnings: [textPayload],
+				next_steps: [textPayload],
+				outputs: {
+					quoted: "“src/a.ts”",
+					dash: "src/a.ts—x",
+					ellipsis: "src/a.ts…",
+					fullwidth: "（src/a.ts）",
+					cjk: "src/a.ts。",
+					mention: "@src/a.ts",
+					dollar: "src/a.ts$x",
+					caret: "src/a.ts^x",
+					multiDot: "src/a.ts.1.2",
+					dotfile: ".env",
+					shortStem: "x.py",
+					keepAccent: "ésrc/a.ts src/a.tsé",
+				},
+				artifacts: [
+					{ type: "file", path: "src/a.ts", description: textPayload },
+					{ type: "file", path: ".env", description: "dotfile .env" },
+					{ type: "file", path: "x.py", description: "short x.py" },
+				],
+			},
+			"sent",
+			"2026-01-01T00:00:01.000Z",
+		),
+	);
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const liveRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
+			assert.equal(liveRes.status, 200);
+			const live = await liveRes.json() as any;
+			const liveUni = live.graph.nodes.find((n: any) => n.id === "uni");
+			assert.equal(liveUni.current_attempt.summary, expectedRedacted);
+
+			const outRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=uni`);
+			assert.equal(outRes.status, 200);
+			const outText = await outRes.text();
+			const out = JSON.parse(outText);
+			const att = out.latest_attempt;
+			assert.equal(att.summary, expectedRedacted);
+			assert.equal(att.detail, expectedRedacted);
+			assert.equal(att.verification.items[0].reason, expectedRedacted);
+			assert.equal(att.warnings.items[0], expectedRedacted);
+			assert.equal(att.next_steps.items[0], expectedRedacted);
+			assert.equal(att.artifacts.items[0].description, expectedRedacted);
+			assert.equal(att.artifacts.items[1].description, "dotfile [redacted-path]");
+			assert.equal(att.artifacts.items[2].description, "short [redacted-path]");
+			assert.ok(att.outputs_text.includes('"“[redacted-path]”"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path]—x"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path]…"'));
+			assert.ok(att.outputs_text.includes('"（[redacted-path]）"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path]。"'));
+			assert.ok(att.outputs_text.includes('"@[redacted-path]"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path]$x"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path]^x"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path].1.2"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path]"'));
+			assert.ok(att.outputs_text.includes('"ésrc/a.ts src/a.tsé"'));
+			for (const art of att.artifacts.items) {
+				assert.equal("path" in art, false);
+			}
+			for (const leakedForm of ["“src/a.ts”", "src/a.ts—", "src/a.ts…", "（src/a.ts）", "src/a.ts。", "@src/a.ts", "src/a.ts$", "src/a.ts^", "src/a.ts.1.2", "\".env\"", "\"x.py\""]) {
+				assert.equal(outText.includes(leakedForm), false, `/output leaked ${leakedForm}`);
+			}
 		},
 	);
 });
