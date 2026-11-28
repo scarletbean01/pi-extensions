@@ -13,7 +13,14 @@ import {
 	type ResolvedNodeObservation,
 } from "./attempt-resolution.ts";
 import type { TypedAbsence } from "./inspect.ts";
-import { collectArtifactPathTokens, deletionMarkerFields, reboundOutputText, sanitizeOutputText } from "./sanitize.ts";
+import {
+	collectArtifactPathTokens,
+	compileArtifactRedactionMatcher,
+	deletionMarkerFields,
+	reboundOutputText,
+	sanitizeOutputText,
+	type ArtifactRedactionMatcher,
+} from "./sanitize.ts";
 
 export const OUTPUT_SUMMARY_MAX_CHARS = 1000;
 export const OUTPUT_DETAIL_MAX_CHARS = 8000;
@@ -26,108 +33,226 @@ export const OUTPUT_ERROR_MAX_CHARS = 4000;
 export const OUTPUT_MAX_RESPONSE_BYTES = 64 * 1024;
 const OUTPUT_JSON_MAX_DEPTH = 64;
 const OUTPUT_JSON_PRINTER_BUDGET = OUTPUT_STRUCTURED_MAX_CHARS * 4 + 256;
+const OUTPUT_JSON_INDENTS = Array.from({ length: OUTPUT_JSON_MAX_DEPTH + 1 }, (_, d) => "  ".repeat(d));
 
 function cpLength(text: string): number {
 	return Array.from(text).length;
 }
 
+function jsonStringCodePointLength(s: string): number {
+	let count = 2; // opening and closing quotes
+	const len = s.length;
+	for (let i = 0; i < len; ) {
+		const code = s.charCodeAt(i);
+		if (code >= 0xd800 && code <= 0xdbff) {
+			if (i + 1 < len) {
+				const next = s.charCodeAt(i + 1);
+				if (next >= 0xdc00 && next <= 0xdfff) {
+					count += 1;
+					i += 2;
+					continue;
+				}
+			}
+			count += 6;
+			i += 1;
+			continue;
+		}
+		if (code >= 0xdc00 && code <= 0xdfff) {
+			count += 6;
+			i += 1;
+			continue;
+		}
+		if (code === 34 || code === 92 || code === 8 || code === 9 || code === 10 || code === 12 || code === 13) {
+			count += 2;
+		} else if (code < 0x20) {
+			count += 6;
+		} else {
+			count += 1;
+		}
+		i += 1;
+	}
+	return count;
+}
+
 /**
- * Iterative bounded JSON pretty-printer that caps depth and emitted length to avoid O(depth^2) expansion
- * or RangeError stack overflow on deeply nested structured outputs.
+ * Iterative bounded JSON pretty-printer that caps depth and emitted text length while still
+ * counting the full depth-bounded code-point length so truncation markers report true omitted counts.
  */
 function boundedPrettyPrintJson(
 	value: unknown,
 	maxChars = OUTPUT_JSON_PRINTER_BUDGET,
 	maxDepth = OUTPUT_JSON_MAX_DEPTH,
-): string {
+): { text: string; extraCodePoints: number } {
 	const chunks: string[] = [];
-	let totalLen = 0;
-	const push = (s: string): void => {
-		if (totalLen >= maxChars) return;
-		const remaining = maxChars - totalLen;
+	let emittedCp = 0;
+	let extraCodePoints = 0;
+
+	const pushAscii = (s: string): void => {
+		if (emittedCp >= maxChars) {
+			extraCodePoints += s.length;
+			return;
+		}
+		const remaining = maxChars - emittedCp;
 		if (s.length <= remaining) {
 			chunks.push(s);
-			totalLen += s.length;
+			emittedCp += s.length;
 		} else {
 			chunks.push(s.slice(0, remaining));
-			totalLen = maxChars;
+			emittedCp = maxChars;
+			extraCodePoints += s.length - remaining;
 		}
+	};
+
+	const pushIndent = (depth: number): void => {
+		if (depth <= 0) return;
+		if (emittedCp >= maxChars) {
+			extraCodePoints += depth * 2;
+			return;
+		}
+		pushAscii(OUTPUT_JSON_INDENTS[depth] ?? "  ".repeat(depth));
+	};
+
+	const pushJsonString = (s: string): void => {
+		const fullCpLen = jsonStringCodePointLength(s);
+		if (emittedCp >= maxChars) {
+			extraCodePoints += fullCpLen;
+			return;
+		}
+		const remaining = maxChars - emittedCp;
+		if (fullCpLen <= remaining) {
+			chunks.push(JSON.stringify(s));
+			emittedCp += fullCpLen;
+			return;
+		}
+		let sliceEnd = 0;
+		let sliceCp = 0;
+		while (sliceEnd < s.length && sliceCp < remaining) {
+			const c = s.charCodeAt(sliceEnd);
+			sliceEnd += c >= 0xd800 && c <= 0xdbff && sliceEnd + 1 < s.length ? 2 : 1;
+			sliceCp += 1;
+		}
+		const partialJson = JSON.stringify(s.slice(0, sliceEnd));
+		let cut = 0;
+		let taken = 0;
+		while (cut < partialJson.length && taken < remaining) {
+			const c = partialJson.charCodeAt(cut);
+			cut += c >= 0xd800 && c <= 0xdbff && cut + 1 < partialJson.length ? 2 : 1;
+			taken += 1;
+		}
+		chunks.push(partialJson.slice(0, cut));
+		emittedCp += taken;
+		extraCodePoints += fullCpLen - taken;
+	};
+
+	const emitPrimitive = (val: unknown): void => {
+		if (val === null || typeof val === "boolean") {
+			pushAscii(String(val));
+			return;
+		}
+		if (typeof val === "number") {
+			pushAscii(Number.isFinite(val) ? String(val) : "null");
+			return;
+		}
+		if (typeof val === "string") {
+			pushJsonString(val);
+			return;
+		}
+		pushAscii("null");
 	};
 
 	type Frame =
 		| { kind: "value"; val: unknown; depth: number }
-		| { kind: "text"; text: string };
+		| { kind: "array"; arr: readonly unknown[]; idx: number; depth: number }
+		| { kind: "object"; entries: readonly [string, unknown][]; idx: number; depth: number };
+
 	const stack: Frame[] = [{ kind: "value", val: value, depth: 0 }];
-	while (stack.length > 0 && totalLen < maxChars) {
+	while (stack.length > 0) {
 		const frame = stack.pop()!;
-		if (frame.kind === "text") {
-			push(frame.text);
-			continue;
-		}
-		const { val, depth } = frame;
-		if (val === null || typeof val === "boolean") {
-			push(String(val));
-			continue;
-		}
-		if (typeof val === "number") {
-			push(Number.isFinite(val) ? String(val) : "null");
-			continue;
-		}
-		if (typeof val === "string") {
-			const boundedStr = val.length > maxChars ? val.slice(0, maxChars) : val;
-			push(JSON.stringify(boundedStr));
-			continue;
-		}
-		if (typeof val !== "object") {
-			push("null");
-			continue;
-		}
-		if (Array.isArray(val)) {
-			if (val.length === 0) {
-				push("[]");
+		if (frame.kind === "value") {
+			const { val, depth } = frame;
+			if (val === null || typeof val !== "object") {
+				emitPrimitive(val);
+				continue;
+			}
+			if (Array.isArray(val)) {
+				if (val.length === 0) {
+					pushAscii("[]");
+					continue;
+				}
+				if (depth >= maxDepth) {
+					pushAscii('"[...]"');
+					continue;
+				}
+				pushAscii("[\n");
+				stack.push({ kind: "array", arr: val, idx: 0, depth });
+				continue;
+			}
+			const entries = Object.entries(val as Record<string, unknown>).filter(
+				([, v]) => v !== undefined && typeof v !== "function" && typeof v !== "symbol",
+			);
+			if (entries.length === 0) {
+				pushAscii("{}");
 				continue;
 			}
 			if (depth >= maxDepth) {
-				push('"[...]"');
+				pushAscii('"{...}"');
 				continue;
 			}
-			const indent = "  ".repeat(depth);
-			const childIndent = "  ".repeat(depth + 1);
-			push("[\n");
-			stack.push({ kind: "text", text: `\n${indent}]` });
-			const limit = Math.min(val.length, maxChars);
-			for (let idx = limit - 1; idx >= 0; idx--) {
-				if (idx < limit - 1) stack.push({ kind: "text", text: ",\n" });
-				stack.push({ kind: "value", val: val[idx], depth: depth + 1 });
-				stack.push({ kind: "text", text: childIndent });
+			pushAscii("{\n");
+			stack.push({ kind: "object", entries, idx: 0, depth });
+			continue;
+		}
+
+		if (frame.kind === "array") {
+			const { arr, depth } = frame;
+			let interrupted = false;
+			while (frame.idx < arr.length) {
+				const idx = frame.idx;
+				frame.idx = idx + 1;
+				if (idx > 0) pushAscii(",\n");
+				pushIndent(depth + 1);
+				const elem = arr[idx];
+				if (elem !== null && typeof elem === "object") {
+					stack.push(frame);
+					stack.push({ kind: "value", val: elem, depth: depth + 1 });
+					interrupted = true;
+					break;
+				}
+				emitPrimitive(elem);
+			}
+			if (!interrupted) {
+				pushAscii("\n");
+				pushIndent(depth);
+				pushAscii("]");
 			}
 			continue;
 		}
-		const entries = Object.entries(val as Record<string, unknown>).filter(
-			([, v]) => v !== undefined && typeof v !== "function" && typeof v !== "symbol",
-		);
-		if (entries.length === 0) {
-			push("{}");
-			continue;
-		}
-		if (depth >= maxDepth) {
-			push('"{...}"');
-			continue;
-		}
-		const indent = "  ".repeat(depth);
-		const childIndent = "  ".repeat(depth + 1);
-		push("{\n");
-		stack.push({ kind: "text", text: `\n${indent}}` });
-		const limit = Math.min(entries.length, maxChars);
-		for (let idx = limit - 1; idx >= 0; idx--) {
+
+		const { entries, depth } = frame;
+		let interrupted = false;
+		while (frame.idx < entries.length) {
+			const idx = frame.idx;
+			frame.idx = idx + 1;
+			if (idx > 0) pushAscii(",\n");
+			pushIndent(depth + 1);
 			const [k, v] = entries[idx]!;
-			if (idx < limit - 1) stack.push({ kind: "text", text: ",\n" });
-			stack.push({ kind: "value", val: v, depth: depth + 1 });
-			const safeKey = k.length > maxChars ? k.slice(0, maxChars) : k;
-			stack.push({ kind: "text", text: `${childIndent}${JSON.stringify(safeKey)}: ` });
+			pushJsonString(k);
+			pushAscii(": ");
+			if (v !== null && typeof v === "object") {
+				stack.push(frame);
+				stack.push({ kind: "value", val: v, depth: depth + 1 });
+				interrupted = true;
+				break;
+			}
+			emitPrimitive(v);
+		}
+		if (!interrupted) {
+			pushAscii("\n");
+			pushIndent(depth);
+			pushAscii("}");
 		}
 	}
-	return chunks.join("");
+	return { text: chunks.join(""), extraCodePoints };
 }
 
 export interface BoundedList<T> {
@@ -292,7 +417,7 @@ export function enforceOutputResponseBudget(body: Record<string, unknown>, maxBy
 function projectVerificationItem(
 	raw: unknown,
 	blockedPaths: readonly string[],
-	artifactTokens: readonly string[],
+	artifactMatcher: ArtifactRedactionMatcher,
 ) {
 	const v = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
 	const result = v.result === "pass" || v.result === "fail" || v.result === "error"
@@ -309,9 +434,9 @@ function projectVerificationItem(
 	const rem = Math.max(0, OUTPUT_LIST_ITEM_MAX_CHARS - fixedLen);
 
 	const rawCheckId = typeof v.check_id === "string" ? v.check_id : "";
-	let checkId = sanitizeOutputText(rawCheckId, rem, blockedPaths, artifactTokens);
+	let checkId = sanitizeOutputText(rawCheckId, rem, blockedPaths, artifactMatcher);
 	let reason = typeof v.reason === "string" && v.reason
-		? sanitizeOutputText(v.reason, rem, blockedPaths, artifactTokens)
+		? sanitizeOutputText(v.reason, rem, blockedPaths, artifactMatcher)
 		: undefined;
 	if (reason !== undefined && cpLength(checkId) + cpLength(reason) > rem) {
 		const checkCap = Math.min(cpLength(checkId), Math.max(Math.floor(rem / 2), rem - cpLength(reason)));
@@ -332,7 +457,7 @@ function projectVerificationItem(
 function projectArtifactItem(
 	raw: unknown,
 	blockedPaths: readonly string[],
-	artifactTokens: readonly string[],
+	artifactMatcher: ArtifactRedactionMatcher,
 ) {
 	const a = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
 	const type = sanitizeOutputText(typeof a.type === "string" && a.type ? a.type : "artifact", 128, blockedPaths);
@@ -341,7 +466,7 @@ function projectArtifactItem(
 		: undefined;
 	const descBudget = Math.max(0, OUTPUT_LIST_ITEM_MAX_CHARS - cpLength(type) - (action ? cpLength(action) : 0));
 	const description = typeof a.description === "string" && a.description && descBudget > 0
-		? sanitizeOutputText(a.description, descBudget, blockedPaths, artifactTokens)
+		? sanitizeOutputText(a.description, descBudget, blockedPaths, artifactMatcher)
 		: undefined;
 	return {
 		type,
@@ -444,28 +569,32 @@ function projectAttemptFromObservation(
 	if (obs.has_result && obs.result_record) {
 		const record = obs.result_record;
 		const res = record.result;
-		const artifactTokens = collectArtifactPathTokens(res.artifacts, projectCwd);
-		const summary = sanitizeOutputText(res.summary, OUTPUT_SUMMARY_MAX_CHARS, blockedPaths, artifactTokens);
+		const artifactMatcher = compileArtifactRedactionMatcher(
+			collectArtifactPathTokens(res.artifacts, projectCwd),
+		);
+		const summary = sanitizeOutputText(res.summary, OUTPUT_SUMMARY_MAX_CHARS, blockedPaths, artifactMatcher);
 		const rawDetail = typeof res.detail === "string" ? res.detail : "";
-		const detail = sanitizeOutputText(rawDetail, OUTPUT_DETAIL_MAX_CHARS, blockedPaths, artifactTokens);
+		const detail = sanitizeOutputText(rawDetail, OUTPUT_DETAIL_MAX_CHARS, blockedPaths, artifactMatcher);
 		const verification = buildBoundedList(res.verification, OUTPUT_LIST_MAX_ITEMS, v =>
-			projectVerificationItem(v, blockedPaths, artifactTokens),
+			projectVerificationItem(v, blockedPaths, artifactMatcher),
 		);
 		const warnings = buildBoundedList(res.warnings, OUTPUT_LIST_MAX_ITEMS, w =>
-			sanitizeOutputText(typeof w === "string" ? w : "", OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths, artifactTokens),
+			sanitizeOutputText(typeof w === "string" ? w : "", OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths, artifactMatcher),
 		);
 		const nextSteps = buildBoundedList(res.next_steps, OUTPUT_LIST_MAX_ITEMS, s =>
-			sanitizeOutputText(typeof s === "string" ? s : "", OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths, artifactTokens),
+			sanitizeOutputText(typeof s === "string" ? s : "", OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths, artifactMatcher),
 		);
 		const command = projectAttemptCommand(res.command_evidence, blockedPaths);
 		let outputsText: string | undefined;
 		if (res.outputs !== undefined) {
 			try {
+				const printed = boundedPrettyPrintJson(res.outputs);
 				outputsText = sanitizeOutputText(
-					boundedPrettyPrintJson(res.outputs),
+					printed.text,
 					OUTPUT_STRUCTURED_MAX_CHARS,
 					blockedPaths,
-					artifactTokens,
+					artifactMatcher,
+					printed.extraCodePoints,
 				);
 			} catch {
 				outputsText = undefined;
@@ -473,7 +602,7 @@ function projectAttemptFromObservation(
 		}
 		// Never project artifacts[].path or host provenance paths.
 		const artifacts = buildBoundedList(res.artifacts, OUTPUT_LIST_MAX_ITEMS, a =>
-			projectArtifactItem(a, blockedPaths, artifactTokens),
+			projectArtifactItem(a, blockedPaths, artifactMatcher),
 		);
 		const completedAt = validateIsoTimestamp(record.completed_at);
 

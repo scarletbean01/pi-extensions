@@ -4,7 +4,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
 import { enforceOutputResponseBudget, nodeOutputSnapshot } from "../factory/viewer/output.ts";
-import { sanitizeOperatorText, sanitizeOutputText } from "../factory/viewer/sanitize.ts";
+import { collectArtifactPathTokens, sanitizeOperatorText, sanitizeOutputText } from "../factory/viewer/sanitize.ts";
 import { createViewerReader } from "../factory/viewer/server.ts";
 import { atomicJson, completionRecord, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
 import { handoffOfferPath } from "./handoff.ts";
@@ -1779,4 +1779,271 @@ test("GET /api/factories/:id/output and /live validate/scrub hostile timestamps,
 	assert.ok(Buffer.byteLength(JSON.stringify(overBudget), "utf8") <= 450);
 	assert.equal(overBudget.evidence, "unavailable");
 	assert.equal((overBudget.latest_attempt as any).absence, "evidence unavailable");
+});
+
+test("Round 2 unit hardening: whole-token artifact redaction after path scrub (B1), O(N) perf (B2), prose trim (N1), single-word exclusion (N2), normalized forms (N3)", () => {
+	const cwd = "/home/alice/proj";
+	const blocked = ["/home/alice", cwd];
+
+	// B1: artifact path must never break absolute/tilde/win/file path scrubbing
+	const srcTokens = collectArtifactPathTokens([{ path: "src" }], cwd);
+	const docsTokens = collectArtifactPathTokens([{ path: "docs/a.md" }], cwd);
+	for (const [tokens, text] of [
+		[srcTokens, "see /opt/src/X now"],
+		[srcTokens, "at ~bob/src/X done"],
+		[srcTokens, "at C:\\w\\src\\X done"],
+		[srcTokens, "at file:///o/src/X done"],
+		[docsTokens, "and /srv/x/docs/a.md/X ok"],
+		[docsTokens, "at ~bob/docs/a.md/X done"],
+		[docsTokens, "at C:\\w\\docs\\a.md\\X done"],
+		[docsTokens, "at file:///o/docs/a.md/X done"],
+	] as const) {
+		const out = sanitizeOutputText(text, 1000, blocked, tokens);
+		const op = sanitizeOperatorText(text, 1000, blocked, tokens);
+		assert.equal(out.includes("X"), false, `output leaked X for ${JSON.stringify(text)}: ${out}`);
+		assert.equal(op.includes("X"), false, `operator leaked X for ${JSON.stringify(text)}: ${op}`);
+		assert.equal(out.includes("~bob"), false, `output leaked ~bob for ${JSON.stringify(text)}: ${out}`);
+		assert.equal(op.includes("~bob"), false, `operator leaked ~bob for ${JSON.stringify(text)}: ${op}`);
+		assert.equal(out.includes("[redacted-path][redacted-path]"), false, `doubled marker in ${out}`);
+	}
+
+	// B1 whole-token boundaries: must not partially match inside larger path/word tokens
+	assert.equal(
+		sanitizeOutputText("foo/docs/a.md/bar x-docs/a.md docs/a.md_2 docs/a.md.bak foo:docs/a.md", 1000, blocked, docsTokens),
+		"foo/docs/a.md/bar x-docs/a.md docs/a.md_2 docs/a.md.bak foo:docs/a.md",
+	);
+	assert.equal(
+		sanitizeOutputText("see docs/a.md, (docs/a.md), \"docs\\\\a.md\", docs/a.md. and docs/a.md:", 1000, blocked, docsTokens),
+		"see [redacted-path], ([redacted-path]), \"[redacted-path]\", [redacted-path]. and [redacted-path]:",
+	);
+
+	// N1: prose containing ' /' or '(/' before cap must not drop legitimate prose
+	const apiProse = `Use the API (/ v2) for this. ${"Then more words here. ".repeat(400)}`;
+	const apiOut = sanitizeOutputText(apiProse, 100, []);
+	assert.ok(apiOut.startsWith("Use the API (/ v2) for this. "), `unexpected API prose trim: ${apiOut}`);
+	assert.equal(sanitizeOperatorText(apiProse, 50, []).startsWith("Use the API (/ v2) for this."), true);
+
+	const slashProse = `a /b ${"lorem ipsum ".repeat(200)}`;
+	const slashOut = sanitizeOutputText(slashProse, 128, []);
+	assert.ok(slashOut.startsWith("a /b lorem ipsum "), `unexpected slash prose trim: ${slashOut}`);
+	assert.ok(sanitizeOperatorText(slashProse, 128, []).startsWith("a /b lorem ipsum "));
+
+	// N2: bare single-word artifacts must not redact prose or scrubber markers
+	const wordTokens = collectArtifactPathTokens(
+		[{ path: "src" }, { path: "it" }, { path: "path" }, { path: "ctrl" }, { path: "truncated" }, { path: "a" }],
+		cwd,
+	);
+	assert.equal(sanitizeOutputText("the src folder and it is what it is", 1000, blocked, wordTokens), "the src folder and it is what it is");
+	assert.equal(sanitizeOperatorText("the src folder and it is what it is", 1000, blocked, wordTokens), "the src folder and it is what it is");
+	assert.equal(
+		sanitizeOutputText("x\u0001y path [truncated, 5 characters omitted]", 1000, blocked, wordTokens),
+		"x [ctrl] y path [truncated-marker]",
+	);
+	const dotExtTokens = collectArtifactPathTokens([{ path: "secret-file.ts" }], cwd);
+	assert.equal(sanitizeOutputText("touched secret-file.ts ok", 1000, blocked, dotExtTokens), "touched [redacted-path] ok");
+
+	// N3: trailing separator, ../ stripped form, and case-insensitive drive/backslash forms
+	const trailSingle = collectArtifactPathTokens([{ path: "src/" }], cwd);
+	assert.equal(sanitizeOutputText("src/PRIVTR.ts is new", 1000, blocked, trailSingle), "src/PRIVTR.ts is new");
+	const trailSub = collectArtifactPathTokens([{ path: "src/sub/" }], cwd);
+	assert.equal(sanitizeOutputText("see src/sub and src/sub/ and src/sub/other.ts", 1000, blocked, trailSub), "see [redacted-path] and [redacted-path] and src/sub/other.ts");
+
+	const dotDotTokens = collectArtifactPathTokens([{ path: "../PRIVUP/x.ts" }], cwd);
+	assert.equal(sanitizeOutputText("see ../PRIVUP/x.ts and PRIVUP/x.ts", 1000, blocked, dotDotTokens), "see [redacted-path] and [redacted-path]");
+
+	const caseTokens = collectArtifactPathTokens([{ path: "src/PRIVCASE.ts" }], cwd);
+	assert.equal(
+		sanitizeOutputText("SRC\\privcase.ts .\\Src\\PRIVCASE.TS SRC/privcase.ts", 1000, blocked, caseTokens),
+		"[redacted-path] [redacted-path] SRC/privcase.ts",
+	);
+	const winCaseTokens = collectArtifactPathTokens([{ path: "C:\\Work\\PRIV.ts" }], cwd);
+	assert.equal(
+		sanitizeOutputText("see \"src\\\\PRIVREL.ts\" and c:\\work\\priv.ts", 1000, blocked, collectArtifactPathTokens([{ path: "src/PRIVREL.ts" }], cwd).concat(winCaseTokens)),
+		"see \"[redacted-path]\" and [redacted-path]",
+	);
+
+	// B2: only the first 20 projected artifacts are collected into free-text tokens
+	const beyond20Arts = Array.from({ length: 25 }, (_, i) => ({ path: `src/item_${i}.ts` }));
+	const beyond20Tokens = collectArtifactPathTokens(beyond20Arts, cwd);
+	assert.equal(sanitizeOutputText("keep src/item_0.ts vs src/item_20.ts", 1000, blocked, beyond20Tokens), "keep [redacted-path] vs src/item_20.ts");
+
+	// B2: 25,000 prefix-sharing artifacts + repeated prefix text must run in well under 500ms
+	const pre = `s/${"a".repeat(8)}`;
+	const manyArts = Array.from({ length: 25_000 }, (_, i) => ({ type: "file", path: `${pre}${i}` }));
+	const manyText = `${pre}x `.repeat(4000);
+	const t0 = performance.now();
+	const manyToks = collectArtifactPathTokens(manyArts, cwd);
+	assert.ok(manyToks.length <= 512, `expected bounded token count, got ${manyToks.length}`);
+	sanitizeOperatorText(manyText, 1000, blocked, manyToks);
+	sanitizeOutputText(manyText, 8000, blocked, manyToks);
+	for (let i = 0; i < 60; i++) sanitizeOutputText(manyText, 500, blocked, manyToks);
+	const elapsed = performance.now() - t0;
+	assert.ok(elapsed < 500, `25k-artifact unit scrub took too long: ${elapsed.toFixed(0)}ms`);
+});
+
+test("GET /api/factories/:id/output and /live fix B1 mid-segment leaks, B2 19k-artifact latency, and B3 true omitted counts", async t => {
+	const { writeFileSync } = await import("node:fs");
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_R2_PROMPT",
+		agents: [
+			{ node_id: "mid", persona: "builder", sub_task: "PRIVATE_R2_MID" },
+			{ node_id: "many", persona: "builder", sub_task: "PRIVATE_R2_MANY" },
+			{ node_id: "bigstr", persona: "builder", sub_task: "PRIVATE_R2_BIGSTR" },
+			{ node_id: "wide", persona: "builder", sub_task: "PRIVATE_R2_WIDE" },
+			{ node_id: "astral", persona: "builder", sub_task: "PRIVATE_R2_ASTRAL" },
+			{ node_id: "d63", persona: "builder", sub_task: "PRIVATE_R2_D63" },
+			{ node_id: "d64", persona: "builder", sub_task: "PRIVATE_R2_D64" },
+		],
+	};
+	const fac = ops({ action: "publish", name: "r2-fixes-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-r2-fixes" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "r2-ref", brief: "PRIVATE_R2_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const entryOf = (nodeId: string) => launched.manifest.pane_manifest.find(e => e.node_id === nodeId)!;
+	const cfgOf = (e: ReturnType<typeof entryOf>) => readJson<WorkerConfig>(join(dir, `${e.instance_id}.config.json`));
+
+	// B1: mid node with artifact "src" and "docs/a.md" inside absolute/tilde/win/file paths
+	const midEntry = entryOf("mid");
+	atomicJson(
+		resultPath(dir, midEntry.instance_id),
+		completionRecord(
+			cfgOf(midEntry),
+			{
+				agent_name: midEntry.persona_name,
+				node_id: "mid",
+				status: "success",
+				summary: "Read /opt/build/src/PRIV_MID_SUM and ~bob/src/PRIV_TILDE and C:\\w\\src\\PRIV_WIN and file:///o/src/PRIV_FILE",
+				detail: "see /var/data/src/PRIV_MID_DET and /srv/x/docs/a.md/PRIV_DOC_DET",
+				artifacts: [
+					{ type: "dir", path: "src", description: "touched /etc/src/PRIV_MID_DESC and ~bob/src/PRIV_DESC_TILDE" },
+					{ type: "file", path: "docs/a.md", description: "see C:\\w\\docs\\a.md\\PRIV_DOC_DESC" },
+				],
+			},
+			"sent",
+			"2026-01-01T00:00:01.000Z",
+		),
+	);
+
+	// B2: 19,000 artifacts sharing prefix s/aaaaaaaa
+	const pre = "s/aaaaaaaa";
+	const txt = `${pre}x `.repeat(170);
+	const manyEntry = entryOf("many");
+	writeFileSync(
+		resultPath(dir, manyEntry.instance_id),
+		JSON.stringify(
+			completionRecord(
+				cfgOf(manyEntry),
+				{
+					agent_name: manyEntry.persona_name,
+					node_id: "many",
+					status: "success",
+					summary: txt,
+					detail: txt.repeat(14),
+					warnings: Array.from({ length: 20 }, () => txt),
+					next_steps: Array.from({ length: 20 }, () => txt),
+					artifacts: Array.from({ length: 19_000 }, (_, i) => ({ type: "file", path: `${pre}${i}` })),
+				},
+				"sent",
+				"2026-01-01T00:00:01.000Z",
+			),
+		),
+	);
+
+	// B3: 100k string, 100k-element array, depth 63 vs 64
+	const nest = (d: number): any => {
+		let v: any = { leaf: 1 };
+		for (let i = 0; i < d; i++) v = { k: v };
+		return v;
+	};
+	const bigStrVal = { s: "x".repeat(100_000) };
+	const wideVal = Array.from({ length: 100_000 }, (_, i) => i);
+	const astralVal = { s: "🚀".repeat(30_000) };
+	const d63Val = nest(63);
+	const d64Val = nest(64);
+	for (const [nodeId, outputs] of [
+		["bigstr", bigStrVal],
+		["wide", wideVal],
+		["astral", astralVal],
+		["d63", d63Val],
+		["d64", d64Val],
+	] as const) {
+		const ent = entryOf(nodeId);
+		writeFileSync(
+			resultPath(dir, ent.instance_id),
+			JSON.stringify(
+				completionRecord(
+					cfgOf(ent),
+					{ agent_name: ent.persona_name, node_id: nodeId, status: "success", summary: `S-${nodeId}`, detail: "D", outputs },
+					"sent",
+					"2026-01-01T00:00:01.000Z",
+				),
+			),
+		);
+	}
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			// B1 + B2 on /live
+			const tLive0 = performance.now();
+			const liveRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
+			const liveMs = performance.now() - tLive0;
+			assert.equal(liveRes.status, 200);
+			const liveText = await liveRes.text();
+			assert.equal(liveText.includes("PRIV_"), false, `live leaked PRIV_: ${liveText}`);
+			assert.equal(liveText.includes("~bob"), false, `live leaked ~bob: ${liveText}`);
+			assert.ok(liveMs < 1000, `/live with 19k artifacts took ${liveMs.toFixed(0)}ms`);
+
+			// B1 on /output?node=mid
+			const midRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=mid`);
+			assert.equal(midRes.status, 200);
+			const midText = await midRes.text();
+			assert.equal(midText.includes("PRIV_"), false, `output mid leaked PRIV_: ${midText}`);
+			assert.equal(midText.includes("~bob"), false, `output mid leaked ~bob: ${midText}`);
+			assert.equal("path" in JSON.parse(midText).latest_attempt.artifacts.items[0], false);
+
+			// B2 on /output?node=many
+			const tMany0 = performance.now();
+			const manyRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=many`);
+			const manyMs = performance.now() - tMany0;
+			assert.equal(manyRes.status, 200);
+			assert.ok(manyMs < 1000, `/output with 19k artifacts took ${manyMs.toFixed(0)}ms`);
+
+			// B3 on bigstr, wide, astral, d63, d64
+			for (const [nodeId, rawVal] of [
+				["bigstr", bigStrVal],
+				["wide", wideVal],
+				["astral", astralVal],
+				["d63", d63Val],
+			] as const) {
+				const out = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=${nodeId}`)).json() as any;
+				const txtOut: string = out.latest_attempt.outputs_text;
+				const fullLen = Array.from(JSON.stringify(rawVal, null, 2)).length;
+				const m = /… \[truncated, (\d+) characters? omitted\]$/.exec(txtOut);
+				assert.ok(m, `${nodeId} missing truncation marker`);
+				const kept = Array.from(txtOut).length - Array.from(m[0]).length;
+				assert.equal(kept + Number(m[1]), fullLen, `${nodeId} omitted count mismatch`);
+				if (nodeId === "d63") {
+					assert.equal(txtOut, sanitizeOutputText(JSON.stringify(rawVal, null, 2), 8000, [], []));
+				}
+			}
+			const d64Out = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=d64`)).json() as any;
+			const d64Txt: string = d64Out.latest_attempt.outputs_text;
+			assert.ok(d64Txt.includes('"{...}"'), `d64 should contain depth-elided "{...}"`);
+			const d64m = /… \[truncated, (\d+) characters? omitted\]$/.exec(d64Txt);
+			assert.ok(d64m);
+		},
+	);
 });

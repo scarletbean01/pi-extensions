@@ -16,7 +16,13 @@ const TRAILING_SENTENCE_PUNCTUATION = new Set([".", ",", ";", ":", "!", "?"]);
 const PRE_BOUND_MULTIPLIER = 4;
 const PRE_BOUND_TRIM_LOOKBACK = 4096;
 const PRE_BOUND_DELIM_RE = /[\s"'<>()\[\]{}`*,;|]/;
-const INCOMPLETE_TRAILING_PATH_RE = /(?:^|[^A-Za-z0-9._~/-])(\/[^/]*|~[A-Za-z0-9._-]*[\\/]?|file:\/{0,2}|[A-Za-z]:[\\/]?)$/;
+const INCOMPLETE_TRAILING_PATH_RE = /(?:^|[^A-Za-z0-9._~/-])(\/[^/\s"'<>()\[\]{}`*]*|~[A-Za-z0-9._-]*[\\/]?|file:\/{0,2}|[A-Za-z]:[\\/]?)$/;
+const MAX_ARTIFACT_TOKEN_SOURCES = 20;
+const MAX_ARTIFACT_TOKENS = 512;
+const MAX_ARTIFACT_TOKEN_CHARS = 256 * 1024;
+const HAS_SEP_OR_DOT_EXT_RE = /[\\/]|\.[A-Za-z0-9_-]+$/;
+const ARTIFACT_DELIM_CHAR_RE = /[\s"'<>()\[\]{}`*,;|!?=]/;
+const DRIVE_PREFIX_RE = /^[A-Za-z]:/;
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -91,9 +97,30 @@ function preBoundCodePoints(wellFormed: string, maxCodePoints: number): { bounde
 	return { bounded: wellFormed.slice(0, cut), droppedCodePoints };
 }
 
+export interface ArtifactRedactionMatcher {
+	exact: ReadonlySet<string>;
+	lower: ReadonlySet<string>;
+	multiPartExact: ReadonlyMap<string, readonly string[]>;
+	multiPartLower: ReadonlyMap<string, readonly string[]>;
+}
+
+const EMPTY_ARTIFACT_MATCHER: ArtifactRedactionMatcher = {
+	exact: new Set(),
+	lower: new Set(),
+	multiPartExact: new Map(),
+	multiPartLower: new Map(),
+};
+
+function isRedactableArtifactForm(token: string): boolean {
+	if (token.length < 2 || token === "." || token === ".." || token === "./" || token === ".\\") return false;
+	if (token === "[ctrl]" || token === "[redacted-path]" || token === "[truncated-marker]") return false;
+	return HAS_SEP_OR_DOT_EXT_RE.test(token);
+}
+
 /**
- * Collect normalized forms (literal, no `./`, separator-swapped, JSON-escaped, and project-joined absolute)
- * of recorded artifact paths so relative artifact paths are redacted alongside absolute paths.
+ * Collect normalized forms (literal, trailing-separator-stripped, `./`/`../`-stripped, separator-swapped,
+ * JSON-escaped, and project-joined absolute) from the projected artifacts (capped at 20 artifacts,
+ * 512 tokens, and 256 KiB), excluding bare single words without a separator or dot-extension.
  */
 export function collectArtifactPathTokens(
 	artifacts: ReadonlyArray<{ path?: unknown }> | undefined,
@@ -101,62 +128,252 @@ export function collectArtifactPathTokens(
 ): string[] {
 	if (!Array.isArray(artifacts) || artifacts.length === 0) return [];
 	const tokens = new Set<string>();
+	let totalChars = 0;
+	const pushToken = (candidate: string) => {
+		if (tokens.size >= MAX_ARTIFACT_TOKENS) return;
+		if (tokens.has(candidate)) return;
+		if (totalChars + candidate.length > MAX_ARTIFACT_TOKEN_CHARS) return;
+		tokens.add(candidate);
+		totalChars += candidate.length;
+	};
 	const addForm = (candidate: string) => {
 		const t = candidate.trim();
-		if (t.length < 2 || t === "." || t === ".." || t === "./" || t === ".\\") return;
-		tokens.add(t);
+		if (!isRedactableArtifactForm(t)) return;
+		pushToken(t);
 		const jsonEscaped = t.replace(/\\/g, "\\\\");
-		if (jsonEscaped !== t) tokens.add(jsonEscaped);
+		if (jsonEscaped !== t) pushToken(jsonEscaped);
 	};
-	for (const art of artifacts) {
+	const addSeparatorForms = (pathStr: string, includeTrailing: boolean) => {
+		addForm(pathStr);
+		const fwd = pathStr.replace(/\\/g, "/");
+		const bwd = pathStr.replace(/\//g, "\\");
+		addForm(fwd);
+		addForm(bwd);
+		if (includeTrailing && !pathStr.endsWith("/") && !pathStr.endsWith("\\")) {
+			addForm(`${fwd}/`);
+			addForm(`${bwd}\\`);
+		}
+	};
+
+	const projected = artifacts.slice(0, MAX_ARTIFACT_TOKEN_SOURCES);
+	for (const art of projected) {
+		if (tokens.size >= MAX_ARTIFACT_TOKENS) break;
 		if (!art || typeof art !== "object" || typeof art.path !== "string") continue;
 		const raw = art.path.trim();
 		if (!raw) continue;
-		addForm(raw);
-		addForm(raw.replace(/\\/g, "/"));
-		addForm(raw.replace(/\//g, "\\"));
-		const noDot = raw.replace(/^(?:\.[\\/])+/, "");
-		if (noDot) {
-			addForm(noDot);
-			const forward = noDot.replace(/\\/g, "/");
-			const backward = noDot.replace(/\//g, "\\");
-			addForm(forward);
-			addForm(backward);
-			if (!isAbsolute(noDot) && !/^[A-Za-z]:[\\/]/.test(noDot)) {
+		const hadTrailingSep = /[\\/]+$/.test(raw);
+		const normalizedRaw = raw.replace(/[\\/]+$/, "");
+		if (!normalizedRaw) continue;
+		addSeparatorForms(normalizedRaw, hadTrailingSep);
+		const noPrefix = normalizedRaw.replace(/^(?:\.\.?[\\/])+/, "");
+		if (noPrefix) {
+			addSeparatorForms(noPrefix, hadTrailingSep);
+			const forward = noPrefix.replace(/\\/g, "/");
+			const backward = noPrefix.replace(/\//g, "\\");
+			if (!isAbsolute(noPrefix) && !DRIVE_PREFIX_RE.test(noPrefix)) {
 				addForm(`./${forward}`);
 				addForm(`.\\${backward}`);
-				if (projectCwd) {
+				if (hadTrailingSep) {
+					addForm(`./${forward}/`);
+					addForm(`.\\${backward}\\`);
+				}
+				if (projectCwd && !normalizedRaw.startsWith("..")) {
 					const abs = resolve(projectCwd, forward);
-					addForm(abs);
-					addForm(abs.replace(/\\/g, "/"));
-					addForm(abs.replace(/\//g, "\\"));
+					addSeparatorForms(abs, false);
 				}
 			} else if (projectCwd) {
-				const rel = relative(resolve(projectCwd), resolve(raw));
+				const rel = relative(resolve(projectCwd), resolve(normalizedRaw));
 				if (rel && !rel.startsWith("..") && !isAbsolute(rel) && rel !== ".") {
 					const relFwd = rel.replace(/\\/g, "/");
 					const relBwd = rel.replace(/\//g, "\\");
-					addForm(relFwd);
-					addForm(relBwd);
+					addSeparatorForms(rel, hadTrailingSep);
 					addForm(`./${relFwd}`);
 					addForm(`.\\${relBwd}`);
+					if (hadTrailingSep) {
+						addForm(`./${relFwd}/`);
+						addForm(`.\\${relBwd}\\`);
+					}
 				}
 			}
 		}
 	}
-	return [...tokens].sort((a, b) => b.length - a.length);
+	return [...tokens];
 }
 
-function scrubExtraRedactedTokens(text: string, tokens: readonly string[]): string {
-	if (!tokens.length || !text) return text;
-	let cleaned = text;
-	for (const token of tokens) {
-		if (!cleaned.includes(token)) continue;
-		const leftBoundary = /^[A-Za-z0-9_]/.test(token) ? "(?<![A-Za-z0-9_])" : "";
-		const rightBoundary = /[A-Za-z0-9_]$/.test(token) ? "(?![A-Za-z0-9_])" : "";
-		cleaned = cleaned.replace(new RegExp(`${leftBoundary}${escapeRegExp(token)}${rightBoundary}`, "g"), "[redacted-path]");
+function isArtifactMatcher(value: readonly string[] | ArtifactRedactionMatcher): value is ArtifactRedactionMatcher {
+	return !Array.isArray(value) && typeof value === "object" && value !== null && "exact" in value;
+}
+
+/** Build a lookup structure once per request for linear-time whole-token artifact redaction. */
+export function compileArtifactRedactionMatcher(tokens: readonly string[] | ArtifactRedactionMatcher): ArtifactRedactionMatcher {
+	if (isArtifactMatcher(tokens)) return tokens;
+	if (!tokens.length) return EMPTY_ARTIFACT_MATCHER;
+	const exact = new Set<string>();
+	const lower = new Set<string>();
+	const multiExact = new Map<string, string[]>();
+	const multiLower = new Map<string, string[]>();
+	for (const rawToken of tokens) {
+		const t = typeof rawToken === "string" ? rawToken.trim() : "";
+		if (!isRedactableArtifactForm(t)) continue;
+		exact.add(t);
+		const isDriveOrBackslash = t.includes("\\") || DRIVE_PREFIX_RE.test(t);
+		if (isDriveOrBackslash) lower.add(t.toLowerCase());
+		const delimMatch = ARTIFACT_DELIM_CHAR_RE.exec(t);
+		if (delimMatch && delimMatch.index > 0) {
+			const prefix = t.slice(0, delimMatch.index);
+			const list = multiExact.get(prefix);
+			if (list) list.push(t);
+			else multiExact.set(prefix, [t]);
+			if (isDriveOrBackslash) {
+				const lowPrefix = prefix.toLowerCase();
+				const lowList = multiLower.get(lowPrefix);
+				const lowToken = t.toLowerCase();
+				if (lowList) lowList.push(lowToken);
+				else multiLower.set(lowPrefix, [lowToken]);
+			}
+		}
 	}
-	return cleaned;
+	for (const list of multiExact.values()) list.sort((a, b) => b.length - a.length);
+	for (const list of multiLower.values()) list.sort((a, b) => b.length - a.length);
+	return { exact, lower, multiPartExact: multiExact, multiPartLower: multiLower };
+}
+
+function isArtifactDelimChar(code: number, ch: string): boolean {
+	if (code <= 32) return true; // whitespace / control
+	return ARTIFACT_DELIM_CHAR_RE.test(ch);
+}
+
+function matchesArtifactForm(candidate: string, matcher: ArtifactRedactionMatcher): boolean {
+	if (matcher.exact.has(candidate)) return true;
+	if (matcher.lower.size > 0 && (candidate.includes("\\") || DRIVE_PREFIX_RE.test(candidate))) {
+		return matcher.lower.has(candidate.toLowerCase());
+	}
+	return false;
+}
+
+function isValidMultiPartRightBoundary(text: string, candEnd: number): boolean {
+	if (candEnd >= text.length) return true;
+	const ch = text[candEnd]!;
+	if (isArtifactDelimChar(text.charCodeAt(candEnd), ch)) return true;
+	if (ch === "\\" && candEnd + 1 < text.length && text[candEnd + 1] === '"') return true;
+	if (ch === "." || ch === ":") {
+		let k = candEnd + 1;
+		while (k < text.length && (text[k] === "." || text[k] === ":")) k++;
+		if (k >= text.length) return true;
+		if (isArtifactDelimChar(text.charCodeAt(k), text[k]!)) return true;
+		if (text[k] === "\\" && k + 1 < text.length && text[k + 1] === '"') return true;
+	}
+	return false;
+}
+
+function scrubExtraRedactedTokens(text: string, matcher: ArtifactRedactionMatcher): string {
+	if (!text || (matcher.exact.size === 0 && matcher.lower.size === 0)) return text;
+	const len = text.length;
+	const out: string[] = [];
+	let lastEmit = 0;
+	let i = 0;
+	const hasMultiExact = matcher.multiPartExact.size > 0;
+	const hasMultiLower = matcher.multiPartLower.size > 0;
+
+	while (i < len) {
+		const ch = text[i]!;
+		if (ch === "[") {
+			if (text.startsWith("[redacted-path]", i)) {
+				i += 15;
+				continue;
+			}
+			if (text.startsWith("[ctrl]", i)) {
+				i += 6;
+				continue;
+			}
+			if (text.startsWith("[truncated-marker]", i)) {
+				i += 18;
+				continue;
+			}
+		}
+		if (isArtifactDelimChar(text.charCodeAt(i), ch)) {
+			i += 1;
+			continue;
+		}
+		const start = i;
+		let end = i + 1;
+		while (end < len && !isArtifactDelimChar(text.charCodeAt(end), text[end]!)) {
+			end += 1;
+		}
+		let delimAdvanceAt = end;
+		if (end < len && text.charCodeAt(end) === 34 /* '"' */) {
+			let bs = 0;
+			while (end - 1 - bs >= start && text.charCodeAt(end - 1 - bs) === 92 /* '\\' */) {
+				bs += 1;
+			}
+			if (bs % 2 === 1) {
+				end -= 1;
+				delimAdvanceAt = end + 2;
+			}
+		}
+		if (end === start) {
+			i = delimAdvanceAt;
+			continue;
+		}
+		const tok = text.slice(start, end);
+
+		let matchedMultiEnd = -1;
+		if (hasMultiExact) {
+			const cands = matcher.multiPartExact.get(tok);
+			if (cands) {
+				for (const cand of cands) {
+					if (text.startsWith(cand, start) && isValidMultiPartRightBoundary(text, start + cand.length)) {
+						matchedMultiEnd = start + cand.length;
+						break;
+					}
+				}
+			}
+		}
+		if (matchedMultiEnd < 0 && hasMultiLower && (tok.includes("\\") || DRIVE_PREFIX_RE.test(tok))) {
+			const cands = matcher.multiPartLower.get(tok.toLowerCase());
+			if (cands) {
+				for (const cand of cands) {
+					if (
+						start + cand.length <= len &&
+						text.slice(start, start + cand.length).toLowerCase() === cand &&
+						isValidMultiPartRightBoundary(text, start + cand.length)
+					) {
+						matchedMultiEnd = start + cand.length;
+						break;
+					}
+				}
+			}
+		}
+		if (matchedMultiEnd >= 0) {
+			out.push(text.slice(lastEmit, start), "[redacted-path]");
+			lastEmit = matchedMultiEnd;
+			i = matchedMultiEnd;
+			continue;
+		}
+
+		if (matchesArtifactForm(tok, matcher)) {
+			out.push(text.slice(lastEmit, start), "[redacted-path]");
+			lastEmit = end;
+			i = end;
+			continue;
+		}
+
+		let coreEnd = tok.length;
+		while (coreEnd > 0 && (tok[coreEnd - 1] === "." || tok[coreEnd - 1] === ":")) {
+			coreEnd -= 1;
+		}
+		if (coreEnd > 0 && coreEnd < tok.length && matchesArtifactForm(tok.slice(0, coreEnd), matcher)) {
+			out.push(text.slice(lastEmit, start), "[redacted-path]");
+			lastEmit = start + coreEnd;
+			i = end;
+			continue;
+		}
+
+		i = delimAdvanceAt;
+	}
+	if (lastEmit === 0) return text;
+	out.push(text.slice(lastEmit));
+	return out.join("");
 }
 
 function scrubBlockedAndGenericPaths(text: string, blockedPaths: readonly string[]): string {
@@ -230,7 +447,7 @@ export function sanitizeOperatorText(
 	value: string,
 	maxChars: number,
 	blockedPaths: readonly string[] = [],
-	extraRedactedTokens: readonly string[] = [],
+	extraRedactedTokens: readonly string[] | ArtifactRedactionMatcher = [],
 ): string {
 	if (maxChars <= 0) return "";
 	const stripped = value.toWellFormed().replace(VARIATION_SELECTORS_RE, "");
@@ -240,9 +457,9 @@ export function sanitizeOperatorText(
 		.replace(CONTROL_AND_FORMAT_RE, " [ctrl] ")
 		.replace(/\s+/g, " ")
 		.trim();
-	const preScrubbed = scrubExtraRedactedTokens(normalized, extraRedactedTokens);
-	const cleaned = scrubBlockedAndGenericPaths(preScrubbed, blockedPaths)
+	const pathScrubbed = scrubBlockedAndGenericPaths(normalized, blockedPaths)
 		.replace(SPOOFED_TRUNCATION_MARKER_RE, "[truncated-marker]");
+	const cleaned = scrubExtraRedactedTokens(pathScrubbed, compileArtifactRedactionMatcher(extraRedactedTokens));
 	const codePoints = Array.from(cleaned);
 	if (codePoints.length > maxChars || droppedCodePoints > 0) {
 		return maxChars === 1 ? "…" : `${codePoints.slice(0, maxChars - 1).join("")}…`;
@@ -258,7 +475,8 @@ export function sanitizeOutputText(
 	value: string,
 	maxChars: number,
 	blockedPaths: readonly string[] = [],
-	extraRedactedTokens: readonly string[] = [],
+	extraRedactedTokens: readonly string[] | ArtifactRedactionMatcher = [],
+	extraDroppedCodePoints = 0,
 ): string {
 	if (maxChars <= 0) return "";
 	const stripped = value.toWellFormed().replace(VARIATION_SELECTORS_RE, "");
@@ -272,10 +490,11 @@ export function sanitizeOutputText(
 			const padRight = after !== "" && !/\s/.test(after) ? " " : "";
 			return `${padLeft}[ctrl]${padRight}`;
 		});
-	const preScrubbed = scrubExtraRedactedTokens(normalized, extraRedactedTokens);
-	const cleaned = scrubBlockedAndGenericPaths(preScrubbed, blockedPaths)
+	const pathScrubbed = scrubBlockedAndGenericPaths(normalized, blockedPaths)
 		.replace(SPOOFED_TRUNCATION_MARKER_RE, "[truncated-marker]");
-	return truncateWithOmissionMarker(Array.from(cleaned), maxChars, droppedCodePoints);
+	const cleaned = scrubExtraRedactedTokens(pathScrubbed, compileArtifactRedactionMatcher(extraRedactedTokens));
+	const extra = Number.isFinite(extraDroppedCodePoints) && extraDroppedCodePoints > 0 ? Math.floor(extraDroppedCodePoints) : 0;
+	return truncateWithOmissionMarker(Array.from(cleaned), maxChars, droppedCodePoints + extra);
 }
 
 export interface ViewerDeletionSummary {

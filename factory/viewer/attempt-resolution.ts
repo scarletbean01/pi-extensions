@@ -59,7 +59,12 @@ import {
 	type Disposition,
 	type WorkerCompletion,
 } from "../../bootstrap/session-store.ts";
-import { collectArtifactPathTokens, sanitizeOperatorText, sanitizeOutputText as sanitizeOutputTextHelper } from "./sanitize.ts";
+import {
+	collectArtifactPathTokens,
+	compileArtifactRedactionMatcher,
+	sanitizeOperatorText,
+	sanitizeOutputText as sanitizeOutputTextHelper,
+} from "./sanitize.ts";
 
 export const MAX_EVIDENCE_FILE_BYTES = 1024 * 1024;
 
@@ -604,9 +609,11 @@ export function resolveNodeObservation(
 				throw new Error("Result record could not be read");
 			}
 			const record = parseCompletion(resRead.value, expected);
-			const artifactTokens = collectArtifactPathTokens(record.result.artifacts, manifest.project_cwd);
+			const artifactMatcher = compileArtifactRedactionMatcher(
+				collectArtifactPathTokens(record.result.artifacts, manifest.project_cwd),
+			);
 			const scrubbedSummary = record.result.summary
-				? sanitizeOperatorText(record.result.summary, 1000, blockedPaths, artifactTokens)
+				? sanitizeOperatorText(record.result.summary, 1000, blockedPaths, artifactMatcher)
 				: undefined;
 			const scrubbedResult = scrubbedSummary !== undefined
 				? { ...record.result, summary: scrubbedSummary }
