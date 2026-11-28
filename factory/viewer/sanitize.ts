@@ -20,8 +20,10 @@ const INCOMPLETE_TRAILING_PATH_RE = /(?:^|[^A-Za-z0-9._~/-])(\/[^/\s"'<>()\[\]{}
 const MAX_ARTIFACT_TOKEN_SOURCES = 20;
 const MAX_ARTIFACT_TOKENS = 512;
 const MAX_ARTIFACT_TOKEN_CHARS = 256 * 1024;
-const HAS_SEP_OR_DOT_EXT_RE = /[\\/]|\.[A-Za-z0-9_-]+$/;
+const HAS_SEP_RE = /[\\/]/;
+const DOT_EXT_RE = /^\.[A-Za-z][A-Za-z0-9_-]{0,9}$/;
 const ARTIFACT_DELIM_CHAR_RE = /[\s"'<>()\[\]{}`*,;|!?=]/;
+const ARTIFACT_SUFFIX_SPLIT_CHARS = [":", "#", "@", "~", "+", "&", "%"] as const;
 const DRIVE_PREFIX_RE = /^[A-Za-z]:/;
 
 function escapeRegExp(value: string): string {
@@ -100,27 +102,35 @@ function preBoundCodePoints(wellFormed: string, maxCodePoints: number): { bounde
 export interface ArtifactRedactionMatcher {
 	exact: ReadonlySet<string>;
 	lower: ReadonlySet<string>;
-	multiPartExact: ReadonlyMap<string, readonly string[]>;
-	multiPartLower: ReadonlyMap<string, readonly string[]>;
 }
 
 const EMPTY_ARTIFACT_MATCHER: ArtifactRedactionMatcher = {
 	exact: new Set(),
 	lower: new Set(),
-	multiPartExact: new Map(),
-	multiPartLower: new Map(),
 };
+
+function hasArtifactDelim(token: string): boolean {
+	if (ARTIFACT_DELIM_CHAR_RE.test(token)) return true;
+	for (let i = 0; i < token.length; i++) {
+		if (token.charCodeAt(i) <= 32) return true;
+	}
+	return false;
+}
 
 function isRedactableArtifactForm(token: string): boolean {
 	if (token.length < 2 || token === "." || token === ".." || token === "./" || token === ".\\") return false;
 	if (token === "[ctrl]" || token === "[redacted-path]" || token === "[truncated-marker]") return false;
-	return HAS_SEP_OR_DOT_EXT_RE.test(token);
+	if (hasArtifactDelim(token)) return false;
+	if (HAS_SEP_RE.test(token)) return true;
+	const lastDot = token.lastIndexOf(".");
+	return lastDot >= 2 && DOT_EXT_RE.test(token.slice(lastDot));
 }
 
 /**
  * Collect normalized forms (literal, trailing-separator-stripped, `./`/`../`-stripped, separator-swapped,
  * JSON-escaped, and project-joined absolute) from the projected artifacts (capped at 20 artifacts,
- * 512 tokens, and 256 KiB), excluding bare single words without a separator or dot-extension.
+ * 512 tokens, and 256 KiB), excluding delimiter-containing forms and bare single words without a separator
+ * or 1–10-char letter-led dot-extension on a 2+-char stem.
  */
 export function collectArtifactPathTokens(
 	artifacts: ReadonlyArray<{ path?: unknown }> | undefined,
@@ -210,32 +220,15 @@ export function compileArtifactRedactionMatcher(tokens: readonly string[] | Arti
 	if (!tokens.length) return EMPTY_ARTIFACT_MATCHER;
 	const exact = new Set<string>();
 	const lower = new Set<string>();
-	const multiExact = new Map<string, string[]>();
-	const multiLower = new Map<string, string[]>();
 	for (const rawToken of tokens) {
 		const t = typeof rawToken === "string" ? rawToken.trim() : "";
 		if (!isRedactableArtifactForm(t)) continue;
 		exact.add(t);
-		const isDriveOrBackslash = t.includes("\\") || DRIVE_PREFIX_RE.test(t);
-		if (isDriveOrBackslash) lower.add(t.toLowerCase());
-		const delimMatch = ARTIFACT_DELIM_CHAR_RE.exec(t);
-		if (delimMatch && delimMatch.index > 0) {
-			const prefix = t.slice(0, delimMatch.index);
-			const list = multiExact.get(prefix);
-			if (list) list.push(t);
-			else multiExact.set(prefix, [t]);
-			if (isDriveOrBackslash) {
-				const lowPrefix = prefix.toLowerCase();
-				const lowList = multiLower.get(lowPrefix);
-				const lowToken = t.toLowerCase();
-				if (lowList) lowList.push(lowToken);
-				else multiLower.set(lowPrefix, [lowToken]);
-			}
+		if (t.includes("\\") || DRIVE_PREFIX_RE.test(t)) {
+			lower.add(t.toLowerCase());
 		}
 	}
-	for (const list of multiExact.values()) list.sort((a, b) => b.length - a.length);
-	for (const list of multiLower.values()) list.sort((a, b) => b.length - a.length);
-	return { exact, lower, multiPartExact: multiExact, multiPartLower: multiLower };
+	return { exact, lower };
 }
 
 function isArtifactDelimChar(code: number, ch: string): boolean {
@@ -243,27 +236,85 @@ function isArtifactDelimChar(code: number, ch: string): boolean {
 	return ARTIFACT_DELIM_CHAR_RE.test(ch);
 }
 
-function matchesArtifactForm(candidate: string, matcher: ArtifactRedactionMatcher): boolean {
-	if (matcher.exact.has(candidate)) return true;
-	if (matcher.lower.size > 0 && (candidate.includes("\\") || DRIVE_PREFIX_RE.test(candidate))) {
-		return matcher.lower.has(candidate.toLowerCase());
+function matchesCandidatePrefix(
+	cand: string,
+	splitLen: number,
+	matcher: ArtifactRedactionMatcher,
+	lowerCand: string | undefined,
+): boolean {
+	const prefix = splitLen === cand.length ? cand : cand.slice(0, splitLen);
+	if (matcher.exact.has(prefix)) return true;
+	if (lowerCand !== undefined) {
+		const lowerPrefix = lowerCand.length === cand.length
+			? (splitLen === cand.length ? lowerCand : lowerCand.slice(0, splitLen))
+			: prefix.toLowerCase();
+		return matcher.lower.has(lowerPrefix);
 	}
 	return false;
 }
 
-function isValidMultiPartRightBoundary(text: string, candEnd: number): boolean {
-	if (candEnd >= text.length) return true;
-	const ch = text[candEnd]!;
-	if (isArtifactDelimChar(text.charCodeAt(candEnd), ch)) return true;
-	if (ch === "\\" && candEnd + 1 < text.length && text[candEnd + 1] === '"') return true;
-	if (ch === "." || ch === ":") {
-		let k = candEnd + 1;
-		while (k < text.length && (text[k] === "." || text[k] === ":")) k++;
-		if (k >= text.length) return true;
-		if (isArtifactDelimChar(text.charCodeAt(k), text[k]!)) return true;
-		if (text[k] === "\\" && k + 1 < text.length && text[k + 1] === '"') return true;
+function findMatchedPrefixEnd(cand: string, matcher: ArtifactRedactionMatcher): number {
+	const hasLower = matcher.lower.size > 0 && (cand.includes("\\") || DRIVE_PREFIX_RE.test(cand));
+	const lowerCand = hasLower ? cand.toLowerCase() : undefined;
+
+	if (matchesCandidatePrefix(cand, cand.length, matcher, lowerCand)) {
+		return cand.length;
 	}
-	return false;
+
+	const splitLengths: number[] = [];
+	let coreEnd = cand.length;
+	while (coreEnd > 0 && (cand[coreEnd - 1] === "." || cand[coreEnd - 1] === ":" || cand[coreEnd - 1] === "/")) {
+		coreEnd -= 1;
+	}
+	if (coreEnd > 0 && coreEnd < cand.length) {
+		splitLengths.push(coreEnd);
+	}
+
+	for (const ch of ARTIFACT_SUFFIX_SPLIT_CHARS) {
+		const first = cand.indexOf(ch);
+		if (first > 0) {
+			splitLengths.push(first);
+			if (first > 1 && cand[first - 1] === "/") {
+				splitLengths.push(first - 1);
+			}
+		}
+		if (ch === ":" && first === 1 && DRIVE_PREFIX_RE.test(cand)) {
+			const afterDrive = cand.indexOf(":", 2);
+			if (afterDrive > 0) {
+				splitLengths.push(afterDrive);
+				if (afterDrive > 1 && cand[afterDrive - 1] === "/") {
+					splitLengths.push(afterDrive - 1);
+				}
+			}
+		}
+		const last = cand.lastIndexOf(ch);
+		if (last > 0 && last !== first) {
+			splitLengths.push(last);
+			if (last > 1 && cand[last - 1] === "/") {
+				splitLengths.push(last - 1);
+			}
+		}
+	}
+
+	const lastDot = cand.lastIndexOf(".");
+	if (lastDot > 0 && lastDot + 1 < cand.length) {
+		const nextCode = cand.charCodeAt(lastDot + 1);
+		if (nextCode >= 48 && nextCode <= 57) {
+			splitLengths.push(lastDot);
+		}
+	}
+
+	if (splitLengths.length === 0) return -1;
+	splitLengths.sort((a, b) => b - a);
+	let prev = -1;
+	for (const splitLen of splitLengths) {
+		if (splitLen === prev) continue;
+		prev = splitLen;
+		if (matchesCandidatePrefix(cand, splitLen, matcher, lowerCand)) {
+			return splitLen;
+		}
+	}
+	return -1;
 }
 
 function scrubExtraRedactedTokens(text: string, matcher: ArtifactRedactionMatcher): string {
@@ -272,8 +323,6 @@ function scrubExtraRedactedTokens(text: string, matcher: ArtifactRedactionMatche
 	const out: string[] = [];
 	let lastEmit = 0;
 	let i = 0;
-	const hasMultiExact = matcher.multiPartExact.size > 0;
-	const hasMultiLower = matcher.multiPartLower.size > 0;
 
 	while (i < len) {
 		const ch = text[i]!;
@@ -317,56 +366,21 @@ function scrubExtraRedactedTokens(text: string, matcher: ArtifactRedactionMatche
 		}
 		const tok = text.slice(start, end);
 
-		let matchedMultiEnd = -1;
-		if (hasMultiExact) {
-			const cands = matcher.multiPartExact.get(tok);
-			if (cands) {
-				for (const cand of cands) {
-					if (text.startsWith(cand, start) && isValidMultiPartRightBoundary(text, start + cand.length)) {
-						matchedMultiEnd = start + cand.length;
-						break;
-					}
+		let matchPrefixOffset = 0;
+		let matchedLen = findMatchedPrefixEnd(tok, matcher);
+		if (matchedLen < 0 && tok.length > 5 && tok.slice(0, 5).toLowerCase() === "file:") {
+			const offset = tok.startsWith("//", 5) ? 7 : 5;
+			if (offset < tok.length) {
+				const subLen = findMatchedPrefixEnd(tok.slice(offset), matcher);
+				if (subLen > 0) {
+					matchPrefixOffset = offset;
+					matchedLen = subLen;
 				}
 			}
 		}
-		if (matchedMultiEnd < 0 && hasMultiLower && (tok.includes("\\") || DRIVE_PREFIX_RE.test(tok))) {
-			const cands = matcher.multiPartLower.get(tok.toLowerCase());
-			if (cands) {
-				for (const cand of cands) {
-					if (
-						start + cand.length <= len &&
-						text.slice(start, start + cand.length).toLowerCase() === cand &&
-						isValidMultiPartRightBoundary(text, start + cand.length)
-					) {
-						matchedMultiEnd = start + cand.length;
-						break;
-					}
-				}
-			}
-		}
-		if (matchedMultiEnd >= 0) {
-			out.push(text.slice(lastEmit, start), "[redacted-path]");
-			lastEmit = matchedMultiEnd;
-			i = matchedMultiEnd;
-			continue;
-		}
-
-		if (matchesArtifactForm(tok, matcher)) {
-			out.push(text.slice(lastEmit, start), "[redacted-path]");
-			lastEmit = end;
-			i = end;
-			continue;
-		}
-
-		let coreEnd = tok.length;
-		while (coreEnd > 0 && (tok[coreEnd - 1] === "." || tok[coreEnd - 1] === ":")) {
-			coreEnd -= 1;
-		}
-		if (coreEnd > 0 && coreEnd < tok.length && matchesArtifactForm(tok.slice(0, coreEnd), matcher)) {
-			out.push(text.slice(lastEmit, start), "[redacted-path]");
-			lastEmit = start + coreEnd;
-			i = end;
-			continue;
+		if (matchedLen > 0) {
+			out.push(text.slice(lastEmit, start + matchPrefixOffset), "[redacted-path]");
+			lastEmit = start + matchPrefixOffset + matchedLen;
 		}
 
 		i = delimAdvanceAt;

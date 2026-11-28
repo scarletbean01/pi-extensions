@@ -2047,3 +2047,205 @@ test("GET /api/factories/:id/output and /live fix B1 mid-segment leaks, B2 19k-a
 		},
 	);
 });
+
+test("Round 3 unit hardening: R3-B1 line/anchor suffixes and file: prefix, R3-B2 drop multi-part with O(N) perf, N1 dotted stem/ext", () => {
+	const cwd = "/home/alice/proj";
+	const blocked = ["/home/alice", cwd];
+	const tokens = collectArtifactPathTokens(
+		[{ path: "src/PRIV_A.ts" }, { path: "src/@scope/PRIV_AT.ts" }, { path: "C:\\W\\Proj\\PRIV_WIN.ts" }, { path: "src\\PRIV_BS.ts" }],
+		cwd,
+	);
+
+	// R3-B1: suffixes and file: prefix redact in both scrubbers
+	const lineRefInput = "fixed src/PRIV_A.ts:12 and src/PRIV_A.ts:12:3, src/PRIV_A.ts#L5, src/PRIV_A.ts@HEAD, src/PRIV_A.ts/ , src/PRIV_A.ts~ , file:src/PRIV_A.ts, file:src/PRIV_A.ts:12, src/PRIV_A.ts&x, src/PRIV_A.ts+1, src/PRIV_A.ts%20, src/@scope/PRIV_AT.ts#L5, src\\PRIV_BS.ts:9, SRC\\priv_bs.ts@HEAD";
+	const lineRefExpected = "fixed [redacted-path]:12 and [redacted-path]:12:3, [redacted-path]#L5, [redacted-path]@HEAD, [redacted-path]/ , [redacted-path]~ , file:[redacted-path], file:[redacted-path]:12, [redacted-path]&x, [redacted-path]+1, [redacted-path]%20, [redacted-path]#L5, [redacted-path]:9, [redacted-path]@HEAD";
+	assert.equal(sanitizeOutputText(lineRefInput, 2000, blocked, tokens), lineRefExpected);
+	assert.equal(sanitizeOperatorText(lineRefInput, 2000, blocked, tokens), lineRefExpected);
+
+	// R3-B1: untouched non-matching words and subpaths
+	const untouched = "mysrc/PRIV_A.tsx src/PRIV_A.tsx xsrc/PRIV_A.ts src/PRIV_A.ts.bak src/PRIV_A.tsfoo PRIV_A.ts foo:src/PRIV_A.ts";
+	assert.equal(sanitizeOutputText(untouched, 2000, blocked, tokens), untouched);
+	assert.equal(sanitizeOperatorText(untouched, 2000, blocked, tokens), untouched);
+
+	// R3-B2: delimiter-containing artifact paths are excluded from free-text matching (and their pieces are not matched),
+	// while absolute/tilde/drive paths still scrub via generic scrubber
+	const multiTokens = collectArtifactPathTokens(
+		[{ path: "docs/my plan.md" }, { path: "a]b/c.ts" }, { path: "x[1]/y.ts" }],
+		cwd,
+	);
+	assert.deepEqual(multiTokens, []);
+	assert.equal(
+		sanitizeOutputText("docs/my plan.md and docs/my and plan.md and a]b/c.ts and x[1]/y.ts", 1000, blocked, multiTokens),
+		"docs/my plan.md and docs/my and plan.md and a]b/c.ts and x[1]/y.ts",
+	);
+	assert.equal(
+		sanitizeOutputText("at /opt/docs/my plan.md and ~bob/docs/my plan.md", 1000, blocked, multiTokens),
+		"at [redacted-path] plan.md and [redacted-path] plan.md",
+	);
+
+	// R3-B2: spaced prefix-sharing artifact paths + long repeating text run in linear time
+	const spacedArts = Array.from({ length: 20 }, (_, i) => ({ path: `${"a ".repeat(350)}/z${i}` }));
+	const spacedTokens = collectArtifactPathTokens(spacedArts, cwd);
+	assert.deepEqual(spacedTokens, []);
+	const spacedText = "a ".repeat(20_000);
+	const t0 = performance.now();
+	sanitizeOutputText(spacedText, 8000, blocked, spacedTokens);
+	for (let i = 0; i < 80; i++) sanitizeOutputText("a ".repeat(1000), 500, blocked, spacedTokens);
+	sanitizeOperatorText(spacedText, 1000, blocked, spacedTokens);
+	const elapsed = performance.now() - t0;
+	assert.ok(elapsed < 500, `spaced-artifact unit scrub took too long: ${elapsed.toFixed(0)}ms`);
+
+	// N1: dotted prose words e.g, i.e, v1.2, a.ts are not redacted as bare dotted paths
+	const n1Tokens = collectArtifactPathTokens(
+		[{ path: "e.g" }, { path: "i.e" }, { path: "v1.2" }, { path: "a.ts" }, { path: "secret-file.ts" }],
+		cwd,
+	);
+	assert.equal(
+		sanitizeOutputText("e.g i.e v1.2 a.ts and secret-file.ts", 1000, blocked, n1Tokens),
+		"e.g i.e v1.2 a.ts and [redacted-path]",
+	);
+	assert.equal(
+		sanitizeOperatorText("e.g i.e v1.2 a.ts and secret-file.ts", 1000, blocked, n1Tokens),
+		"e.g i.e v1.2 a.ts and [redacted-path]",
+	);
+});
+
+test("GET /api/factories/:id/output and /live redact R3-B1 path:line/#L/@/file: forms across all fields and stay fast on spaced artifacts (R3-B2)", async t => {
+	const { writeFileSync } = await import("node:fs");
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_R3_PROMPT",
+		agents: [
+			{ node_id: "lineref", persona: "builder", sub_task: "PRIVATE_R3_LINE" },
+			{ node_id: "spaced", persona: "builder", sub_task: "PRIVATE_R3_SPACED" },
+		],
+	};
+	const fac = ops({ action: "publish", name: "r3-fixes-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-r3-fixes" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "r3-ref", brief: "PRIVATE_R3_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const entryOf = (nodeId: string) => launched.manifest.pane_manifest.find(e => e.node_id === nodeId)!;
+	const cfgOf = (e: ReturnType<typeof entryOf>) => readJson<WorkerConfig>(join(dir, `${e.instance_id}.config.json`));
+
+	// R3-B1: path:line, path:line:col, path#L5, path@HEAD, file:path across summary, detail, lists, outputs, artifact description, and /live summary
+	const lineEntry = entryOf("lineref");
+	atomicJson(
+		resultPath(dir, lineEntry.instance_id),
+		completionRecord(
+			cfgOf(lineEntry),
+			{
+				agent_name: lineEntry.persona_name,
+				node_id: "lineref",
+				status: "success",
+				summary: "Fixed src/PRIV_R3.ts:12 and src/PRIV_R3.ts:12:3 and src/PRIV_R3.ts#L5 and src/PRIV_R3.ts@HEAD and file:src/PRIV_R3.ts",
+				detail: "Details: src/PRIV_R3.ts:12 src/PRIV_R3.ts:12:3 src/PRIV_R3.ts#L5 src/PRIV_R3.ts@HEAD file:src/PRIV_R3.ts; keep mysrc/PRIV_R3.tsx src/PRIV_R3.ts.bak",
+				verification: [{ check_id: "chk src/PRIV_R3.ts:12", result: "pass", reason: "verified src/PRIV_R3.ts#L5 and file:src/PRIV_R3.ts" }],
+				warnings: ["warn src/PRIV_R3.ts:12:3 and src/PRIV_R3.ts@HEAD"],
+				next_steps: ["next file:src/PRIV_R3.ts and src/PRIV_R3.ts:99"],
+				outputs: { ref: "src/PRIV_R3.ts:12", anchor: "src/PRIV_R3.ts#L5", rev: "src/PRIV_R3.ts@HEAD", uri: "file:src/PRIV_R3.ts", safe: "src/PRIV_R3.tsx" },
+				artifacts: [{ type: "file", path: "src/PRIV_R3.ts", description: "desc src/PRIV_R3.ts:12 src/PRIV_R3.ts:12:3 src/PRIV_R3.ts#L5 src/PRIV_R3.ts@HEAD file:src/PRIV_R3.ts" }],
+			},
+			"sent",
+			"2026-01-01T00:00:01.000Z",
+		),
+	);
+
+	// R3-B2: route8-shape 339 KB record with 20 spaced prefix-sharing artifacts and long repeating text
+	const repeatTxt = "a ".repeat(2000);
+	const spacedEntry = entryOf("spaced");
+	writeFileSync(
+		resultPath(dir, spacedEntry.instance_id),
+		JSON.stringify(
+			completionRecord(
+				cfgOf(spacedEntry),
+				{
+					agent_name: spacedEntry.persona_name,
+					node_id: "spaced",
+					status: "success",
+					summary: repeatTxt,
+					detail: "a ".repeat(20_000),
+					outputs: { k: "a ".repeat(20_000) },
+					warnings: Array.from({ length: 20 }, () => repeatTxt),
+					next_steps: Array.from({ length: 20 }, () => repeatTxt),
+					artifacts: Array.from({ length: 20 }, (_, i) => ({
+						type: "file",
+						path: `${"a ".repeat(350)}/z${i}`,
+						description: repeatTxt,
+					})),
+				},
+				"sent",
+				"2026-01-01T00:00:01.000Z",
+			),
+		),
+	);
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const tLive0 = performance.now();
+			const liveRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
+			const liveMs = performance.now() - tLive0;
+			assert.equal(liveRes.status, 200);
+			const liveText = await liveRes.text();
+			assert.ok(liveMs < 1000, `/live with spaced artifacts took ${liveMs.toFixed(0)}ms`);
+			const live = JSON.parse(liveText);
+			const liveLine = live.graph.nodes.find((n: any) => n.id === "lineref");
+			assert.equal(
+				liveLine.current_attempt.summary,
+				"Fixed [redacted-path]:12 and [redacted-path]:12:3 and [redacted-path]#L5 and [redacted-path]@HEAD and file:[redacted-path]",
+			);
+
+			const lineOutRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=lineref`);
+			assert.equal(lineOutRes.status, 200);
+			const lineOutText = await lineOutRes.text();
+			const lineOut = JSON.parse(lineOutText);
+			const att = lineOut.latest_attempt;
+			assert.equal(
+				att.summary,
+				"Fixed [redacted-path]:12 and [redacted-path]:12:3 and [redacted-path]#L5 and [redacted-path]@HEAD and file:[redacted-path]",
+			);
+			assert.equal(
+				att.detail,
+				"Details: [redacted-path]:12 [redacted-path]:12:3 [redacted-path]#L5 [redacted-path]@HEAD file:[redacted-path]; keep mysrc/PRIV_R3.tsx src/PRIV_R3.ts.bak",
+			);
+			assert.match(att.verification.items[0].reason, /\[redacted-path\]#L5 and file:\[redacted-path\]/);
+			assert.equal(att.warnings.items[0], "warn [redacted-path]:12:3 and [redacted-path]@HEAD");
+			assert.equal(att.next_steps.items[0], "next file:[redacted-path] and [redacted-path]:99");
+			assert.ok(att.outputs_text.includes('"[redacted-path]:12"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path]#L5"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path]@HEAD"'));
+			assert.ok(att.outputs_text.includes('"file:[redacted-path]"'));
+			assert.ok(att.outputs_text.includes('"src/PRIV_R3.tsx"'));
+			assert.equal(
+				att.artifacts.items[0].description,
+				"desc [redacted-path]:12 [redacted-path]:12:3 [redacted-path]#L5 [redacted-path]@HEAD file:[redacted-path]",
+			);
+			assert.equal("path" in att.artifacts.items[0], false);
+			assert.equal(lineOutText.includes("src/PRIV_R3.ts:"), false);
+			assert.equal(lineOutText.includes("src/PRIV_R3.ts#"), false);
+			assert.equal(lineOutText.includes("src/PRIV_R3.ts@"), false);
+			assert.equal(lineOutText.includes("file:src/PRIV_R3.ts"), false);
+
+			const tSpaced0 = performance.now();
+			const spacedRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=spaced`);
+			const spacedMs = performance.now() - tSpaced0;
+			assert.equal(spacedRes.status, 200);
+			const spacedText = await spacedRes.text();
+			assert.ok(spacedMs < 1000, `/output with spaced artifacts took ${spacedMs.toFixed(0)}ms`);
+			const spacedBody = JSON.parse(spacedText);
+			assert.equal("path" in spacedBody.latest_attempt.artifacts.items[0], false);
+			assert.equal(spacedText.includes("/z0"), false);
+		},
+	);
+});
