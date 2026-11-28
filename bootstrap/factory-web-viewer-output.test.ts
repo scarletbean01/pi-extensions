@@ -3628,3 +3628,921 @@ test("Fix round 1 (B1, B2, B3, N3, N5): verified attempt numbers, context-failur
 	assert.equal(droppedAtt.omitted_characters, 500);
 	assert.equal(droppedAtt.summary, "S".repeat(280));
 });
+
+test("Fix round 1 (ticket 05 B1): artifact-path redaction runs on command excerpts/errors, disposition reasons, error messages, and causes in /output, and 11-attempt prefix timing stays < 1s", async t => {
+	const { writeFileSync } = await import("node:fs");
+	const { runCancelPath } = await import("./cancellation.ts");
+	const { handoffClaimPath, inputDigest } = await import("./handoff.ts");
+	const { finalizePath } = await import("./review-loop.ts");
+
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_T05_B1_PROMPT",
+		agents: [
+			{
+				node_id: "cmd_json_ok",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "0"],
+				working_directory: f.cwd,
+				sub_task: "PRIVATE_T05_CMD_OK",
+			},
+			{
+				node_id: "cmd_json_fail",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "process.exit(1)"],
+				working_directory: f.cwd,
+				sub_task: "PRIVATE_T05_CMD_FAIL",
+			},
+			{ node_id: "build", persona: "builder", sub_task: "PRIVATE_T05_BUILD" },
+			{
+				node_id: "review",
+				persona: "reviewer",
+				depends_on: ["build"],
+				sub_task: "PRIVATE_T05_REV",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 4, on_exhausted: "failed" },
+			},
+			{ node_id: "cancel_loop", persona: "builder", sub_task: "PRIVATE_T05_CL" },
+			{
+				node_id: "cancel_rev",
+				persona: "reviewer",
+				depends_on: ["cancel_loop"],
+				sub_task: "PRIVATE_T05_CREV",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "cancel_loop", max_revisions: 2, on_exhausted: "failed" },
+			},
+			{
+				node_id: "cmd_loop",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "0"],
+				working_directory: f.cwd,
+				sub_task: "PRIVATE_T05_CMDL",
+			},
+			{
+				node_id: "cmd_rev",
+				persona: "reviewer",
+				depends_on: ["cmd_loop"],
+				sub_task: "PRIVATE_T05_CMDREV",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "cmd_loop", max_revisions: 2, on_exhausted: "failed" },
+			},
+		],
+	};
+
+	const fac = ops({ action: "publish", name: "t05-b1-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-t05-b1" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "t05-b1-ref", brief: "PRIVATE_T05_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const entryOf = (nodeId: string) => launched.manifest.pane_manifest.find(e => e.node_id === nodeId)!;
+	const cfgOf = (e: ReturnType<typeof entryOf>) => readJson<WorkerConfig>(join(dir, `${e.instance_id}.config.json`));
+
+	// 1. Single-attempt successful command node whose stdout JSON contains the artifact path and line ref, > 4000 chars
+	const cmdOkEntry = entryOf("cmd_json_ok");
+	const longJsonStdout = `{"artifacts":[{"path":"src/PRIV_ART.ts","description":"cmd"}]} ref src/PRIV_ART.ts:12\n${"X".repeat(4200)} tail src/PRIV_ART.ts`;
+	atomicJson(
+		resultPath(dir, cmdOkEntry.attempt_id ?? cmdOkEntry.instance_id),
+		completionRecord(
+			cfgOf(cmdOkEntry),
+			{
+				agent_name: cmdOkEntry.persona_name,
+				node_id: "cmd_json_ok",
+				status: "success",
+				summary: "Command succeeded",
+				detail: "Parsed JSON from stdout",
+				artifacts: [{ type: "file", path: "src/PRIV_ART.ts", action: "created", description: "Command output artifact" }],
+				command_evidence: {
+					version: 1,
+					command: process.execPath,
+					args: ["-e", "0"],
+					working_directory: f.cwd,
+					exit_code: 0,
+					signal: null,
+					started_at: "2026-11-28T13:00:00.000Z",
+					finished_at: "2026-11-28T13:00:01.000Z",
+					duration_ms: 1000,
+					stdout_bytes: longJsonStdout.length,
+					stderr_bytes: 0,
+					stdout_excerpt: longJsonStdout,
+					stderr_excerpt: "",
+				},
+			},
+			"not_required",
+			"2026-11-28T13:00:01.000Z",
+		),
+	);
+
+	// 2. Single-attempt failed command node whose stderr, stdout, spawn_error, and termination_error name an artifact path
+	const cmdFailEntry = entryOf("cmd_json_fail");
+	atomicJson(
+		resultPath(dir, cmdFailEntry.attempt_id ?? cmdFailEntry.instance_id),
+		completionRecord(
+			cfgOf(cmdFailEntry),
+			{
+				agent_name: cmdFailEntry.persona_name,
+				node_id: "cmd_json_fail",
+				status: "failure",
+				summary: "Command failed",
+				detail: "Command failed with partial artifact",
+				artifacts: [{ type: "file", path: "src/PRIV_FAIL_ART.ts", action: "modified", description: "Failed command artifact" }],
+				command_evidence: {
+					version: 1,
+					command: process.execPath,
+					args: ["-e", "process.exit(1)"],
+					working_directory: f.cwd,
+					exit_code: 1,
+					signal: "SIGTERM",
+					started_at: "2026-11-28T13:00:00.000Z",
+					finished_at: "2026-11-28T13:00:02.000Z",
+					duration_ms: 2000,
+					stdout_bytes: 128,
+					stderr_bytes: 128,
+					stdout_excerpt: "partial src/PRIV_FAIL_ART.ts:5",
+					stderr_excerpt: "Compile error in src/PRIV_FAIL_ART.ts and src/PRIV_FAIL_ART.ts:12",
+					spawn_error: "Spawn failed near src/PRIV_FAIL_ART.ts",
+					termination_error: "Kill failed near src/PRIV_FAIL_ART.ts",
+				},
+			},
+			"not_required",
+			"2026-11-28T13:00:02.000Z",
+		),
+	);
+
+	// 3. Multi-attempt node `build`: Attempt 1 has artifacts, Attempt 2 has disposition (reason, causes, command_evidence), Attempt 3 has error.json
+	const buildEntry = entryOf("build");
+	const revEntry = entryOf("review");
+	const buildCfg = cfgOf(buildEntry);
+	const revCfg = cfgOf(revEntry);
+
+	const b1Rec = completionRecord(
+		{ ...buildCfg, attempt_id: `${buildEntry.instance_id}.1` },
+		{
+			agent_name: buildEntry.persona_name,
+			node_id: "build",
+			status: "success",
+			summary: "Attempt 1 built",
+			detail: "Built file",
+			artifacts: [{ type: "file", path: "src/PRIV_LOOP_ART.ts", action: "created", description: "Loop artifact" }],
+		},
+		"sent",
+		"2026-11-28T13:01:00.000Z",
+	);
+	atomicJson(resultPath(dir, `${buildEntry.instance_id}.1`), b1Rec);
+	atomicJson(resultPath(dir, `${revEntry.instance_id}.1`), completionRecord(
+		{ ...revCfg, attempt_id: `${revEntry.instance_id}.1` },
+		{ agent_name: revEntry.persona_name, node_id: "review", status: "success", summary: "Revise 1", outputs: { verdict: "revise" } },
+		"sent",
+		"2026-11-28T13:01:01.000Z",
+	));
+	atomicJson(handoffClaimPath(dir, `${revEntry.instance_id}.1`, buildEntry.instance_id), {
+		version: 1,
+		handoff_id: "hf-r1",
+		state: "accepted",
+		run_id: launched.task_id,
+		source: { node_id: "build", attempt_id: `${buildEntry.instance_id}.1`, instance_id: buildEntry.instance_id, session_id: "sb" },
+		destination: { node_id: "review", attempt_id: `${revEntry.instance_id}.1`, instance_id: revEntry.instance_id },
+		input_digest: inputDigest(b1Rec.result),
+		offer: "matched",
+		accepted_at: "2026-11-28T13:01:01.000Z",
+	});
+
+	// Attempt 2: disposition (blocked) with reason, causes, and command_evidence naming src/PRIV_LOOP_ART.ts
+	atomicJson(join(dir, `${revEntry.instance_id}.2.revision.json`), {
+		version: 1,
+		run_id: launched.task_id,
+		reviewer: revEntry.instance_id,
+		attempt: 2,
+	});
+	atomicJson(handoffClaimPath(dir, `${buildEntry.instance_id}.2`, revEntry.instance_id), {
+		version: 1,
+		handoff_id: "hf-b2",
+		state: "accepted",
+		run_id: launched.task_id,
+		source: { node_id: "review", attempt_id: `${revEntry.instance_id}.1`, instance_id: revEntry.instance_id, session_id: "sr" },
+		destination: { node_id: "build", attempt_id: `${buildEntry.instance_id}.2`, instance_id: buildEntry.instance_id },
+		input_digest: "0".repeat(64),
+		offer: "matched",
+		accepted_at: "2026-11-28T13:01:02.000Z",
+	});
+	atomicJson(dispositionPath(dir, `${buildEntry.instance_id}.2`), dispositionRecord(
+		{ ...buildEntry, attempt_id: `${buildEntry.instance_id}.2`, task_id: launched.task_id },
+		"blocked",
+		"Blocked on src/PRIV_LOOP_ART.ts and src/PRIV_LOOP_ART.ts:44",
+		[{
+			node_id: "src/PRIV_LOOP_ART.ts",
+			state: "failed",
+			reason: "Broken in src/PRIV_LOOP_ART.ts",
+			check: { name: "check src/PRIV_LOOP_ART.ts", evidence: "failed" },
+		}],
+		"2026-11-28T13:01:03.000Z",
+	));
+	atomicJson(resultPath(dir, `${revEntry.instance_id}.2`), completionRecord(
+		{ ...revCfg, attempt_id: `${revEntry.instance_id}.2` },
+		{ agent_name: revEntry.persona_name, node_id: "review", status: "success", summary: "Revise 2", outputs: { verdict: "revise" } },
+		"sent",
+		"2026-11-28T13:01:04.000Z",
+	));
+	atomicJson(handoffClaimPath(dir, `${revEntry.instance_id}.2`, buildEntry.instance_id), {
+		version: 1,
+		handoff_id: "hf-r2",
+		state: "accepted",
+		run_id: launched.task_id,
+		source: { node_id: "build", attempt_id: `${buildEntry.instance_id}.2`, instance_id: buildEntry.instance_id, session_id: "sb" },
+		destination: { node_id: "review", attempt_id: `${revEntry.instance_id}.2`, instance_id: revEntry.instance_id },
+		input_digest: "0".repeat(64),
+		offer: "matched",
+		accepted_at: "2026-11-28T13:01:04.000Z",
+	});
+
+	// Attempt 3: error.json naming src/PRIV_LOOP_ART.ts
+	atomicJson(join(dir, `${revEntry.instance_id}.3.revision.json`), {
+		version: 1,
+		run_id: launched.task_id,
+		reviewer: revEntry.instance_id,
+		attempt: 3,
+	});
+	atomicJson(handoffClaimPath(dir, `${buildEntry.instance_id}.3`, revEntry.instance_id), {
+		version: 1,
+		handoff_id: "hf-b3",
+		state: "accepted",
+		run_id: launched.task_id,
+		source: { node_id: "review", attempt_id: `${revEntry.instance_id}.2`, instance_id: revEntry.instance_id, session_id: "sr" },
+		destination: { node_id: "build", attempt_id: `${buildEntry.instance_id}.3`, instance_id: buildEntry.instance_id },
+		input_digest: "0".repeat(64),
+		offer: "matched",
+		accepted_at: "2026-11-28T13:01:05.000Z",
+	});
+	atomicJson(join(dir, `${buildEntry.instance_id}.3.error.json`), {
+		error: "Execution failed at src/PRIV_LOOP_ART.ts:99",
+	});
+
+	// 4. Multi-attempt node `cancel_loop`: Attempt 1 has artifacts, Attempt 2 is cancelled naming src/PRIV_CAN_ART.ts
+	const clEntry = entryOf("cancel_loop");
+	const crEntry = entryOf("cancel_rev");
+	const clCfg = cfgOf(clEntry);
+	const crCfg = cfgOf(crEntry);
+	const cl1Rec = completionRecord(
+		{ ...clCfg, attempt_id: `${clEntry.instance_id}.1` },
+		{
+			agent_name: clEntry.persona_name,
+			node_id: "cancel_loop",
+			status: "success",
+			summary: "Cancel loop 1",
+			artifacts: [{ type: "file", path: "src/PRIV_CAN_ART.ts", action: "created", description: "Cancel loop artifact" }],
+		},
+		"sent",
+		"2026-11-28T13:02:00.000Z",
+	);
+	atomicJson(resultPath(dir, `${clEntry.instance_id}.1`), cl1Rec);
+	atomicJson(resultPath(dir, `${crEntry.instance_id}.1`), completionRecord(
+		{ ...crCfg, attempt_id: `${crEntry.instance_id}.1` },
+		{ agent_name: crEntry.persona_name, node_id: "cancel_rev", status: "success", summary: "Revise cl", outputs: { verdict: "revise" } },
+		"sent",
+		"2026-11-28T13:02:01.000Z",
+	));
+	atomicJson(handoffClaimPath(dir, `${crEntry.instance_id}.1`, clEntry.instance_id), {
+		version: 1,
+		handoff_id: "hf-cr1",
+		state: "accepted",
+		run_id: launched.task_id,
+		source: { node_id: "cancel_loop", attempt_id: `${clEntry.instance_id}.1`, instance_id: clEntry.instance_id, session_id: "scl" },
+		destination: { node_id: "cancel_rev", attempt_id: `${crEntry.instance_id}.1`, instance_id: crEntry.instance_id },
+		input_digest: inputDigest(cl1Rec.result),
+		offer: "matched",
+		accepted_at: "2026-11-28T13:02:01.000Z",
+	});
+	atomicJson(join(dir, `${crEntry.instance_id}.2.revision.json`), {
+		version: 1,
+		run_id: launched.task_id,
+		reviewer: crEntry.instance_id,
+		attempt: 2,
+	});
+	atomicJson(handoffClaimPath(dir, `${clEntry.instance_id}.2`, crEntry.instance_id), {
+		version: 1,
+		handoff_id: "hf-cl2",
+		state: "accepted",
+		run_id: launched.task_id,
+		source: { node_id: "cancel_rev", attempt_id: `${crEntry.instance_id}.1`, instance_id: crEntry.instance_id, session_id: "scr" },
+		destination: { node_id: "cancel_loop", attempt_id: `${clEntry.instance_id}.2`, instance_id: clEntry.instance_id },
+		input_digest: "0".repeat(64),
+		offer: "matched",
+		accepted_at: "2026-11-28T13:02:02.000Z",
+	});
+	atomicJson(runCancelPath(dir), {
+		version: 1,
+		run_id: launched.task_id,
+		reason: "Cancelled while editing src/PRIV_CAN_ART.ts",
+		requested_at: "2026-11-28T13:02:03.000Z",
+		grace_ms: 1000,
+		force_close_after: "2026-11-28T13:02:04.000Z",
+	});
+
+	// 5. Multi-attempt command node `cmd_loop`: Attempt 1 has artifacts, Attempt 2 has disposition with command_evidence
+	const cmdLoopEntry = entryOf("cmd_loop");
+	const cmdRevEntry = entryOf("cmd_rev");
+	const cmdLoopCfg = cfgOf(cmdLoopEntry);
+	const cmdRevCfg = cfgOf(cmdRevEntry);
+	const cmdLoop1Rec = completionRecord(
+		{ ...cmdLoopCfg, attempt_id: `${cmdLoopEntry.instance_id}.1` },
+		{
+			agent_name: cmdLoopEntry.persona_name,
+			node_id: "cmd_loop",
+			status: "success",
+			summary: "Cmd loop 1",
+			artifacts: [{ type: "file", path: "src/PRIV_CMD_LOOP.ts", action: "created", description: "Cmd loop artifact" }],
+			command_evidence: {
+				version: 1,
+				command: process.execPath,
+				args: ["-e", "0"],
+				working_directory: f.cwd,
+				exit_code: 0,
+				signal: null,
+				started_at: "2026-11-28T13:03:00.000Z",
+				finished_at: "2026-11-28T13:03:00.500Z",
+				duration_ms: 500,
+				stdout_bytes: 42,
+				stderr_bytes: 0,
+				stdout_excerpt: '{"artifacts":[{"path":"src/PRIV_CMD_LOOP.ts"}]}',
+				stderr_excerpt: "",
+			},
+		},
+		"not_required",
+		"2026-11-28T13:03:00.500Z",
+	);
+	atomicJson(resultPath(dir, `${cmdLoopEntry.instance_id}.1`), cmdLoop1Rec);
+	atomicJson(resultPath(dir, `${cmdRevEntry.instance_id}.1`), completionRecord(
+		{ ...cmdRevCfg, attempt_id: `${cmdRevEntry.instance_id}.1` },
+		{ agent_name: cmdRevEntry.persona_name, node_id: "cmd_rev", status: "success", summary: "Revise cmd", outputs: { verdict: "revise" } },
+		"sent",
+		"2026-11-28T13:03:01.000Z",
+	));
+	atomicJson(handoffClaimPath(dir, `${cmdRevEntry.instance_id}.1`, cmdLoopEntry.instance_id), {
+		version: 1,
+		handoff_id: "hf-cmdr1",
+		state: "accepted",
+		run_id: launched.task_id,
+		source: { node_id: "cmd_loop", attempt_id: `${cmdLoopEntry.instance_id}.1`, instance_id: cmdLoopEntry.instance_id, session_id: "scmdl" },
+		destination: { node_id: "cmd_rev", attempt_id: `${cmdRevEntry.instance_id}.1`, instance_id: cmdRevEntry.instance_id },
+		input_digest: inputDigest(cmdLoop1Rec.result),
+		offer: "matched",
+		accepted_at: "2026-11-28T13:03:01.000Z",
+	});
+	atomicJson(join(dir, `${cmdRevEntry.instance_id}.2.revision.json`), {
+		version: 1,
+		run_id: launched.task_id,
+		reviewer: cmdRevEntry.instance_id,
+		attempt: 2,
+	});
+	atomicJson(handoffClaimPath(dir, `${cmdLoopEntry.instance_id}.2`, cmdRevEntry.instance_id), {
+		version: 1,
+		handoff_id: "hf-cmdl2",
+		state: "accepted",
+		run_id: launched.task_id,
+		source: { node_id: "cmd_rev", attempt_id: `${cmdRevEntry.instance_id}.1`, instance_id: cmdRevEntry.instance_id, session_id: "scmdr" },
+		destination: { node_id: "cmd_loop", attempt_id: `${cmdLoopEntry.instance_id}.2`, instance_id: cmdLoopEntry.instance_id },
+		input_digest: "0".repeat(64),
+		offer: "matched",
+		accepted_at: "2026-11-28T13:03:02.000Z",
+	});
+	atomicJson(dispositionPath(dir, `${cmdLoopEntry.instance_id}.2`), dispositionRecord(
+		{ ...cmdLoopEntry, attempt_id: `${cmdLoopEntry.instance_id}.2`, task_id: launched.task_id },
+		"needs_attention",
+		"Termination unverified near src/PRIV_CMD_LOOP.ts",
+		[],
+		"2026-11-28T13:03:03.000Z",
+		{
+			version: 1,
+			command: process.execPath,
+			args: ["-e", "0"],
+			working_directory: f.cwd,
+			exit_code: null,
+			signal: "SIGTERM",
+			started_at: "2026-11-28T13:03:02.000Z",
+			finished_at: "2026-11-28T13:03:03.000Z",
+			duration_ms: 1000,
+			stdout_bytes: 64,
+			stderr_bytes: 64,
+			stdout_excerpt: '{"artifacts":[{"path":"src/PRIV_CMD_LOOP.ts"}]}',
+			stderr_excerpt: "stderr src/PRIV_CMD_LOOP.ts:12",
+			spawn_error: "spawn src/PRIV_CMD_LOOP.ts",
+			termination_error: "term src/PRIV_CMD_LOOP.ts",
+		},
+	));
+
+	const sentinels = ["PRIV_ART", "PRIV_FAIL_ART", "PRIV_LOOP_ART", "PRIV_CAN_ART", "PRIV_CMD_LOOP", f.root, f.cwd, f.home, dir];
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			// Single-attempt cmd_json_ok: stdout JSON artifact path and :12 redacted before 4,000-char cap
+			const okRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_json_ok`);
+			assert.equal(okRes.status, 200);
+			const okText = await okRes.text();
+			scanSentinels(okText, sentinels, "cmd_json_ok");
+			const okBody = JSON.parse(okText);
+			const okExcerpt: string = okBody.attempts[0].command.stdout_excerpt;
+			assert.match(okExcerpt, /\{"artifacts":\[\{"path":"\[redacted-path\]","description":"cmd"\}\]\} ref \[redacted-path\]:12\n/);
+			assert.ok(Array.from(okExcerpt).length <= 4000);
+			assert.match(okExcerpt, /… \[truncated, \d+ characters? omitted\]$/);
+
+			// Single-attempt cmd_json_fail: stderr, stdout, spawn_error, termination_error all redacted
+			const failRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_json_fail`);
+			assert.equal(failRes.status, 200);
+			const failText = await failRes.text();
+			scanSentinels(failText, sentinels, "cmd_json_fail");
+			const failBody = JSON.parse(failText);
+			assert.equal(failBody.attempts[0].command.stdout_excerpt, "partial [redacted-path]:5");
+			assert.equal(failBody.attempts[0].command.stderr_excerpt, "Compile error in [redacted-path] and [redacted-path]:12");
+			assert.equal(failBody.attempts[0].command.spawn_error, "Spawn failed near [redacted-path]");
+			assert.equal(failBody.attempts[0].command.termination_error, "Kill failed near [redacted-path]");
+
+			// Multi-attempt build: error_message, disposition_reason, causes, and disposition command_evidence redacted
+			const buildRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`);
+			assert.equal(buildRes.status, 200);
+			const buildText = await buildRes.text();
+			scanSentinels(buildText, sentinels, "multi-attempt build");
+			const buildBody = JSON.parse(buildText);
+			assert.equal(buildBody.attempts.length, 3);
+			assert.equal(buildBody.attempts[0].attempt_number, 3);
+			assert.equal(buildBody.attempts[0].error_message, "Execution failed at [redacted-path]:99");
+			assert.equal(buildBody.attempts[1].attempt_number, 2);
+			assert.equal(buildBody.attempts[1].disposition_reason, "Blocked on [redacted-path] and [redacted-path]:44");
+			assert.equal(buildBody.attempts[1].causes.items[0].node_id, "[redacted-path]");
+			assert.equal(buildBody.attempts[1].causes.items[0].reason, "Broken in [redacted-path]");
+			assert.equal(buildBody.attempts[1].causes.items[0].check.name, "check [redacted-path]");
+			assert.equal(buildBody.attempts[2].attempt_number, 1);
+			assert.equal(buildBody.attempts[2].evidence, "available");
+
+			// Multi-attempt cmd_loop: disposition command_evidence and reason redacted
+			const cmdLoopRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_loop`);
+			assert.equal(cmdLoopRes.status, 200);
+			const cmdLoopText = await cmdLoopRes.text();
+			scanSentinels(cmdLoopText, sentinels, "multi-attempt cmd_loop");
+			const cmdLoopBody = JSON.parse(cmdLoopText);
+			assert.equal(cmdLoopBody.attempts.length, 2);
+			assert.equal(cmdLoopBody.attempts[0].disposition_reason, "Termination unverified near [redacted-path]");
+			assert.equal(cmdLoopBody.attempts[0].command.stdout_excerpt, '{"artifacts":[{"path":"[redacted-path]"}]}');
+			assert.equal(cmdLoopBody.attempts[0].command.stderr_excerpt, "stderr [redacted-path]:12");
+			assert.equal(cmdLoopBody.attempts[0].command.spawn_error, "spawn [redacted-path]");
+			assert.equal(cmdLoopBody.attempts[0].command.termination_error, "term [redacted-path]");
+			assert.equal(cmdLoopBody.attempts[1].command.stdout_excerpt, '{"artifacts":[{"path":"[redacted-path]"}]}');
+
+			// Multi-attempt cancel_loop: cancelled disposition_reason redacted
+			const cancelRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cancel_loop`);
+			assert.equal(cancelRes.status, 200);
+			const cancelText = await cancelRes.text();
+			scanSentinels(cancelText, sentinels, "multi-attempt cancel_loop");
+			const cancelBody = JSON.parse(cancelText);
+			assert.equal(cancelBody.attempts[0].disposition_reason, "Cancelled while editing [redacted-path]");
+		},
+	);
+
+	// 5. Timing test (N2): 11 maximal command attempts on /output with 4,000-char excerpts containing real artifact tokens
+	const fPerf = serviceFixture(t, ["builder", "reviewer"]);
+	const statePerf = join(fPerf.root, "factories.sqlite");
+	const coordPerf = join(fPerf.root, "factory-coordination.sqlite");
+	const envPerf = { PATH: join(fPerf.root, "bin"), PI_BOOTSTRAP_STATE_DIR: fPerf.stateDir };
+	const opsPerf = factoryOperations(statePerf, fPerf.service, { coordinationPath: coordPerf });
+	const draftPerf: GenerateRequest = {
+		project_cwd: fPerf.cwd,
+		topology: "graph",
+		task: "PRIVATE_PERF11_PROMPT",
+		agents: [
+			{
+				node_id: "build",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "0"],
+				working_directory: fPerf.cwd,
+				sub_task: "PRIVATE_PERF11_B",
+			},
+			{
+				node_id: "review",
+				persona: "reviewer",
+				depends_on: ["build"],
+				sub_task: "PRIVATE_PERF11_R",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 10, on_exhausted: "needs_attention" },
+			},
+		],
+	};
+	const facPerf = opsPerf({ action: "publish", name: "t05-perf11-fac", draft: draftPerf, sessionModel });
+	const authPerf = createManagerAuthority({ pi_session_id: "sess-t05-perf11" });
+	opsPerf({ action: "resume", factory_id: facPerf.factory_id, authority: authPerf });
+	opsPerf({ action: "submit", factory_id: facPerf.factory_id, authority: authPerf, reference: "t05-perf11-ref", brief: "PRIVATE_PERF11_BRIEF" });
+	const launchedPerf = await opsPerf({ action: "launch", factory_id: facPerf.factory_id, authority: authPerf });
+	revokeManagerAuthority(authPerf);
+
+	const dirPerf = launchedPerf.manifest.session_dir;
+	const pBuild = launchedPerf.manifest.pane_manifest.find(e => e.node_id === "build")!;
+	const pRev = launchedPerf.manifest.pane_manifest.find(e => e.node_id === "review")!;
+	const pBuildCfg = readJson<WorkerConfig>(join(dirPerf, `${pBuild.instance_id}.config.json`));
+	const pRevCfg = readJson<WorkerConfig>(join(dirPerf, `${pRev.instance_id}.config.json`));
+	const prefix = "src/shared/PRIVPFX/aaaaaaaa";
+
+	for (let n = 1; n <= 11; n++) {
+		const bId = `${pBuild.instance_id}.${n}`;
+		const rId = `${pRev.instance_id}.${n}`;
+		const ts = `2026-11-28T14:00:${String(n).padStart(2, "0")}.000Z`;
+		const unit = `${prefix}${n}_0.ts ${prefix}${n}_1.ts:12 @${prefix}${n}_2.ts# "${prefix}${n}_3.ts" ${prefix}${n}_0.js ${prefix}${n}_ `;
+		const excerpt = unit.repeat(Math.ceil(4000 / unit.length)).slice(0, 4000);
+		const rec = completionRecord(
+			{ ...pBuildCfg, attempt_id: bId },
+			{
+				agent_name: pBuild.persona_name,
+				node_id: "build",
+				status: n === 11 ? "success" : "partial",
+				summary: `Perf summary ${n}`,
+				detail: `Perf detail ${n}`,
+				artifacts: Array.from({ length: 20 }, (_, i) => ({
+					type: "file",
+					path: `${prefix}${n}_${i}.ts`,
+					description: `Artifact ${n}-${i}`,
+				})),
+				command_evidence: {
+					version: 1,
+					command: process.execPath,
+					args: ["-e", "0"],
+					working_directory: fPerf.cwd,
+					exit_code: n === 11 ? 0 : 1,
+					signal: null,
+					started_at: ts,
+					finished_at: ts,
+					duration_ms: 100,
+					stdout_bytes: 4000,
+					stderr_bytes: 4000,
+					stdout_excerpt: excerpt,
+					stderr_excerpt: excerpt,
+				},
+			},
+			"sent",
+			ts,
+		);
+		writeFileSync(resultPath(dirPerf, bId), JSON.stringify(rec));
+		if (n >= 2) {
+			atomicJson(join(dirPerf, `${pRev.instance_id}.${n}.revision.json`), {
+				version: 1,
+				run_id: launchedPerf.task_id,
+				reviewer: pRev.instance_id,
+				attempt: n,
+			});
+			atomicJson(handoffClaimPath(dirPerf, bId, pRev.instance_id), {
+				version: 1,
+				handoff_id: `hp-fb-${n}`,
+				state: "accepted",
+				run_id: launchedPerf.task_id,
+				source: { node_id: "review", attempt_id: `${pRev.instance_id}.${n - 1}`, instance_id: pRev.instance_id, session_id: "sr" },
+				destination: { node_id: "build", attempt_id: bId, instance_id: pBuild.instance_id },
+				input_digest: "0".repeat(64),
+				offer: "matched",
+				accepted_at: ts,
+			});
+		}
+		atomicJson(resultPath(dirPerf, rId), completionRecord(
+			{ ...pRevCfg, attempt_id: rId },
+			{ agent_name: pRev.persona_name, node_id: "review", status: "success", summary: `R${n}`, outputs: { verdict: n === 11 ? "approve" : "revise" } },
+			"sent",
+			ts,
+		));
+		atomicJson(handoffClaimPath(dirPerf, rId, pBuild.instance_id), {
+			version: 1,
+			handoff_id: `hp-r-${n}`,
+			state: "accepted",
+			run_id: launchedPerf.task_id,
+			source: { node_id: "build", attempt_id: bId, instance_id: pBuild.instance_id, session_id: "sb" },
+			destination: { node_id: "review", attempt_id: rId, instance_id: pRev.instance_id },
+			input_digest: inputDigest(rec.result),
+			offer: "matched",
+			accepted_at: ts,
+		});
+	}
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: fPerf.root, viewerOptions: { statePath: statePerf, coordinationPath: coordPerf, env: envPerf, home: fPerf.home } },
+		async viewer => {
+			// Verify real attempts are returned and redaction is active BEFORE timing
+			const checkRes = await fetch(`${viewer.url}/api/factories/${facPerf.factory_id}/output?node=build`);
+			assert.equal(checkRes.status, 200);
+			const checkText = await checkRes.text();
+			const checkBody = JSON.parse(checkText);
+			assert.notEqual(checkBody.evidence, "unavailable", `Unexpected unavailable output: ${checkBody.explanation ?? checkText}`);
+			assert.ok(Array.isArray(checkBody.attempts) && checkBody.attempts.length > 1, `Expected >1 attempts, got ${checkBody.attempts?.length}`);
+			assert.equal(checkBody.attempts[0].attempt_number, 11);
+			scanSentinels(checkText, ["PRIVATE_", `${prefix}11_0.ts`, `${prefix}11_1.ts`, `${prefix}11_2.ts`, `${prefix}11_3.ts`], "perf11");
+			for (const att of checkBody.attempts as Array<Record<string, any>>) {
+				const ownRe = new RegExp(`aaaaaaaa${att.attempt_number}_\\d+\\.ts(?:$|[^A-Za-z0-9_])`);
+				for (const field of ["stdout_excerpt", "stderr_excerpt"] as const) {
+					const val = att.command?.[field];
+					if (typeof val === "string") {
+						assert.doesNotMatch(val, ownRe, `Attempt ${att.attempt_number} leaked own artifact in ${field}`);
+					}
+				}
+			}
+			const newestOut: string = checkBody.attempts[0].command.stdout_excerpt;
+			assert.match(newestOut, /\[redacted-path\] \[redacted-path\]:12 @\[redacted-path\]# "\[redacted-path\]" src\/shared\/PRIVPFX\/aaaaaaaa11_0\.js/);
+
+			const t0 = performance.now();
+			const res = await fetch(`${viewer.url}/api/factories/${facPerf.factory_id}/output?node=build`);
+			const elapsedMs = performance.now() - t0;
+			assert.equal(res.status, 200);
+			const text = await res.text();
+			const body = JSON.parse(text);
+			assert.notEqual(body.evidence, "unavailable");
+			assert.ok(Array.isArray(body.attempts) && body.attempts.length > 1);
+			assert.ok(elapsedMs < 1000, `11 maximal command attempts with 4000-char artifact-laden excerpts took ${elapsedMs.toFixed(0)}ms`);
+			assert.ok(Buffer.byteLength(text, "utf8") <= 64 * 1024);
+		},
+	);
+});
+
+test("Fix round 2 (ticket 05 B1 & N6): runner-clipped command excerpts drop trailing partial path without over-trimming prose, and command signal redacts artifacts", async t => {
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_T05_R2_PROMPT",
+		agents: [
+			{
+				node_id: "cmd_clip_json",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "0"],
+				working_directory: f.cwd,
+				sub_task: "PRIVATE_CLIP_JSON",
+			},
+			{
+				node_id: "cmd_clip_prefix",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "0"],
+				working_directory: f.cwd,
+				sub_task: "PRIVATE_CLIP_PREFIX",
+			},
+			{
+				node_id: "cmd_clip_slash_prose",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "0"],
+				working_directory: f.cwd,
+				sub_task: "PRIVATE_CLIP_SLASH_PROSE",
+			},
+			{
+				node_id: "cmd_clip_long",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "0"],
+				working_directory: f.cwd,
+				sub_task: "PRIVATE_CLIP_LONG",
+			},
+		],
+	};
+	const fac = ops({ action: "publish", name: "t05-r2-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-t05-r2" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "t05-r2-ref", brief: "PRIVATE_T05_R2_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const entryOf = (nodeId: string) => launched.manifest.pane_manifest.find(e => e.node_id === nodeId)!;
+	const cfgOf = (e: ReturnType<typeof entryOf>) => readJson<WorkerConfig>(join(dir, `${e.instance_id}.config.json`));
+
+	// 1. Reviewer end-to-end case: 980 filler chars + JSON artifact path clipped at `…`, plus stderr clip and N6 signal
+	const jsonEntry = entryOf("cmd_clip_json");
+	atomicJson(
+		resultPath(dir, jsonEntry.instance_id),
+		completionRecord(
+			cfgOf(jsonEntry),
+			{
+				agent_name: jsonEntry.persona_name,
+				node_id: "cmd_clip_json",
+				status: "failure",
+				summary: "Clipped command",
+				detail: "Runner clipped stdout and stderr",
+				artifacts: [{ type: "file", path: "src/PRIV_ART.ts", action: "created", description: "Clipped artifact" }],
+				command_evidence: {
+					version: 1,
+					command: process.execPath,
+					args: ["-e", "0"],
+					working_directory: f.cwd,
+					exit_code: 1,
+					signal: "src/PRIV_ART.ts",
+					started_at: "2026-11-28T15:00:00.000Z",
+					finished_at: "2026-11-28T15:00:01.000Z",
+					duration_ms: 1000,
+					stdout_bytes: 2048,
+					stderr_bytes: 2048,
+					stdout_excerpt: `${"Y".repeat(980)}{"artifacts":[{"path":"src/PRIV_ART…`,
+					stderr_excerpt: `${"E".repeat(980)} src/PRIV_ART…`,
+				},
+			},
+			"not_required",
+			"2026-11-28T15:00:01.000Z",
+		),
+	);
+
+	// 2. Clip after `src/app/` prefix
+	const prefixEntry = entryOf("cmd_clip_prefix");
+	atomicJson(
+		resultPath(dir, prefixEntry.instance_id),
+		completionRecord(
+			cfgOf(prefixEntry),
+			{
+				agent_name: prefixEntry.persona_name,
+				node_id: "cmd_clip_prefix",
+				status: "failure",
+				summary: "Prefix clip",
+				detail: "Clipped after src/app/",
+				artifacts: [{ type: "file", path: "src/app/PRIV_APP_ART.ts", action: "modified", description: "App artifact" }],
+				command_evidence: {
+					version: 1,
+					command: process.execPath,
+					args: ["-e", "0"],
+					working_directory: f.cwd,
+					exit_code: 1,
+					signal: "SIGTERM",
+					started_at: "2026-11-28T15:00:00.000Z",
+					finished_at: "2026-11-28T15:00:01.000Z",
+					duration_ms: 1000,
+					stdout_bytes: 1200,
+					stderr_bytes: 0,
+					stdout_excerpt: "prefix src/app/PRIV_APP_ART…",
+					stderr_excerpt: "",
+				},
+			},
+			"not_required",
+			"2026-11-28T15:00:01.000Z",
+		),
+	);
+
+	// 3. Clip right after `/` (raw ends `src/…`) and ordinary prose clip (`…`)
+	const slashProseEntry = entryOf("cmd_clip_slash_prose");
+	atomicJson(
+		resultPath(dir, slashProseEntry.instance_id),
+		completionRecord(
+			cfgOf(slashProseEntry),
+			{
+				agent_name: slashProseEntry.persona_name,
+				node_id: "cmd_clip_slash_prose",
+				status: "success",
+				summary: "Slash and prose clips",
+				detail: "Slash clip and ordinary prose clip",
+				artifacts: [{ type: "file", path: "src/PRIV_SLASH.ts", action: "created", description: "Slash artifact" }],
+				command_evidence: {
+					version: 1,
+					command: process.execPath,
+					args: ["-e", "0"],
+					working_directory: f.cwd,
+					exit_code: 0,
+					signal: null,
+					started_at: "2026-11-28T15:00:00.000Z",
+					finished_at: "2026-11-28T15:00:01.000Z",
+					duration_ms: 1000,
+					stdout_bytes: 1024,
+					stderr_bytes: 1024,
+					stdout_excerpt: "prefix src/…",
+					stderr_excerpt: "Keep this ordinary prose clippedword…",
+				},
+			},
+			"not_required",
+			"2026-11-28T15:00:01.000Z",
+		),
+	);
+
+	// 4. Long (>4000 chars) excerpt ending with ` src/PRIV_LONG…` to verify exact 4,000-cap marker arithmetic
+	const longEntry = entryOf("cmd_clip_long");
+	atomicJson(
+		resultPath(dir, longEntry.instance_id),
+		completionRecord(
+			cfgOf(longEntry),
+			{
+				agent_name: longEntry.persona_name,
+				node_id: "cmd_clip_long",
+				status: "success",
+				summary: "Long clip",
+				detail: "Over 4000 chars ending in partial path clip",
+				artifacts: [{ type: "file", path: "src/PRIV_LONG.ts", action: "created", description: "Long artifact" }],
+				command_evidence: {
+					version: 1,
+					command: process.execPath,
+					args: ["-e", "0"],
+					working_directory: f.cwd,
+					exit_code: 0,
+					signal: null,
+					started_at: "2026-11-28T15:00:00.000Z",
+					finished_at: "2026-11-28T15:00:01.000Z",
+					duration_ms: 1000,
+					stdout_bytes: 4500,
+					stderr_bytes: 0,
+					stdout_excerpt: `${"A".repeat(4200)} src/PRIV_LONG…`,
+					stderr_excerpt: "",
+				},
+			},
+			"not_required",
+			"2026-11-28T15:00:01.000Z",
+		),
+	);
+
+	const sentinels = ["PRIV_ART", "PRIV_APP_ART", "PRIV_SLASH", "PRIV_LONG", "PRIVATE_T05_R2", f.root, f.cwd, f.home, dir];
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const jsonRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_clip_json`);
+			assert.equal(jsonRes.status, 200);
+			const jsonText = await jsonRes.text();
+			scanSentinels(jsonText, sentinels, "cmd_clip_json");
+			const jsonBody = JSON.parse(jsonText);
+			assert.equal(jsonBody.attempts[0].command.stdout_excerpt, `${"Y".repeat(980)}{"artifacts":[{"path":"…`);
+			assert.equal(jsonBody.attempts[0].command.stderr_excerpt, `${"E".repeat(980)} …`);
+			assert.equal(jsonBody.attempts[0].command.signal, "[redacted-path]");
+
+			const prefixRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_clip_prefix`);
+			assert.equal(prefixRes.status, 200);
+			const prefixText = await prefixRes.text();
+			scanSentinels(prefixText, sentinels, "cmd_clip_prefix");
+			const prefixBody = JSON.parse(prefixText);
+			assert.equal(prefixBody.attempts[0].command.stdout_excerpt, "prefix …");
+			assert.equal(prefixBody.attempts[0].command.signal, "SIGTERM");
+
+			const slashRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_clip_slash_prose`);
+			assert.equal(slashRes.status, 200);
+			const slashText = await slashRes.text();
+			scanSentinels(slashText, sentinels, "cmd_clip_slash_prose");
+			const slashBody = JSON.parse(slashText);
+			assert.equal(slashBody.attempts[0].command.stdout_excerpt, "prefix …");
+			const proseOut: string = slashBody.attempts[0].command.stderr_excerpt;
+			assert.ok(proseOut.startsWith("Keep this ordinary prose "), `Unexpected prose over-trim: ${proseOut}`);
+			assert.ok(proseOut.endsWith("…"));
+
+			const longRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_clip_long`);
+			assert.equal(longRes.status, 200);
+			const longText = await longRes.text();
+			scanSentinels(longText, sentinels, "cmd_clip_long");
+			const longBody = JSON.parse(longText);
+			const longOut: string = longBody.attempts[0].command.stdout_excerpt;
+			assert.equal(Array.from(longOut).length, 4000);
+			const markerMatch = /… \[truncated, (\d+) characters? omitted\]$/.exec(longOut);
+			assert.ok(markerMatch, `Expected counted truncation marker in ${longOut.slice(-60)}`);
+			const kept = Array.from(longOut.slice(0, markerMatch.index)).length;
+			const omitted = Number(markerMatch[1]);
+			assert.equal(kept + omitted, 4202);
+		},
+	);
+
+	// 64 KB budget arithmetic on a runner-clipped excerpt
+	const budgetBody = enforceOutputResponseBudget(
+		{
+			factory_id: "f-clip",
+			node_id: "cmd_clip_json",
+			evidence: "available",
+			total_attempts: 1,
+			omitted_attempts: 0,
+			attempts: [
+				{
+					attempt_id: "a.1",
+					attempt_number: 1,
+					max_attempts: 1,
+					status: "succeeded",
+					status_text: "Succeeded",
+					evidence: "available",
+					summary: "Clipped budget check",
+					command: {
+						exit_code: 0,
+						signal: null,
+						duration_ms: 10,
+						stdout_bytes: 2048,
+						stderr_bytes: 0,
+						stdout_excerpt: `${"Y".repeat(980)}{"artifacts":[{"path":"…`,
+					},
+				},
+			],
+		},
+		450,
+	);
+	assert.ok(Buffer.byteLength(JSON.stringify(budgetBody), "utf8") <= 450);
+	const trimmedClipped = (budgetBody.attempts as any[])[0].command.stdout_excerpt as string;
+	const budgetMarker = /… \[truncated, (\d+) characters? omitted\]$/.exec(trimmedClipped);
+	assert.ok(budgetMarker, `Expected counted marker after budget trim: ${trimmedClipped}`);
+	assert.equal(
+		Array.from(trimmedClipped.slice(0, budgetMarker.index)).length + Number(budgetMarker[1]),
+		`${"Y".repeat(980)}{"artifacts":[{"path":"…`.length,
+	);
+});

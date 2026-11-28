@@ -64,6 +64,7 @@ import {
 	compileArtifactRedactionMatcher,
 	sanitizeOperatorText,
 	sanitizeOutputText as sanitizeOutputTextHelper,
+	type ArtifactRedactionMatcher,
 } from "./sanitize.ts";
 
 export const MAX_EVIDENCE_FILE_BYTES = 1024 * 1024;
@@ -95,14 +96,15 @@ export function sanitizeCommandSignal(
 	signal: unknown,
 	blockedPaths: readonly string[],
 	mode: "operator" | "output",
+	extraRedactedTokens: readonly string[] | ArtifactRedactionMatcher = [],
 ): string | null {
 	if (signal === null || signal === undefined) return null;
 	const raw = typeof signal === "string" ? signal : "";
 	if (!raw) return null;
 	if (raw.length <= 35 && SIGNAL_RE.test(raw)) return raw;
 	return mode === "output"
-		? sanitizeOutputTextHelper(raw, 128, blockedPaths)
-		: sanitizeOperatorText(raw, 128, blockedPaths);
+		? sanitizeOutputTextHelper(raw, 128, blockedPaths, extraRedactedTokens)
+		: sanitizeOperatorText(raw, 128, blockedPaths, extraRedactedTokens);
 }
 
 export const STATUS_TEXT: Record<ExecutionState, string> = {

@@ -778,14 +778,36 @@ export function createLiveFixtureAdvancer(
 		}
 		completed = true;
 		const rightCfg = readJson<WorkerConfig>(join(fixture.run.sessionDir, `${fixture.run.rightInstanceId}.config.json`));
+		const completedAt = new Date().toISOString();
 		atomicJson(
 			resultPath(fixture.run.sessionDir, fixture.run.rightAttemptId),
 			completionRecord(rightCfg, {
 				agent_name: rightCfg.persona_name,
 				node_id: "right",
 				status: "success",
-				summary: "Right branch succeeded during live manual check.",
-			}, "not_required", new Date().toISOString()),
+				summary: "Synthetic right-branch completion during the live manual check.",
+				detail: [
+					"Synthetic live-completion detail; this fixture runs no model.",
+					"FAKE_DETAIL_LINE_2: the output appears after the next poll.",
+					"- FAKE_DETAIL_LIST_ITEM: all values are illustrative.",
+				].join("\n"),
+				verification: [{
+					check_id: "FAKE_LIVE_CHECK",
+					result: "pass",
+					attempt_id: fixture.run.rightAttemptId,
+					completed_at: completedAt,
+					scope_kind: "declared",
+					applicability: "current",
+					reason: "FAKE_VERIFICATION: synthetic fixture check passed.",
+				}],
+				warnings: ["FAKE_WARNING: synthetic manual acceptance data only."],
+				next_steps: ["FAKE_NEXT_STEP: continue the manual browser check."],
+				outputs: {
+					fixture_only: true,
+					fake_id: "FAKE_STRUCTURED_OUTPUT_05",
+					values: ["FAKE_VALUE_ALPHA", "FAKE_VALUE_BETA"],
+				},
+			}, "not_required", completedAt),
 		);
 		log(`Updated node 'right' (${fixture.run.rightAttemptId}) to succeeded in ${fixture.run.taskId}.`);
 		return true;

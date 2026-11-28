@@ -601,6 +601,33 @@ test("docs/factory-web-viewer.md, links, and GLOSSARY Run graph entry match the 
 	assert.match(glossary, /\*\*Run graph\*\*:\s+A view of one run’s nodes and edges[\s\S]*bound to that run’s input/);
 
 	assertViewerDocMatchesSource(viewerDoc);
+	const attemptOutputMatch = /^### Attempt output\n([\s\S]*?)(?=^### |^---)/m.exec(viewerDoc);
+	assert.ok(attemptOutputMatch, "Missing consolidated Attempt output section");
+	const attemptOutput = attemptOutputMatch[1]!;
+	const attemptOutputLower = attemptOutput.toLowerCase();
+	assert.match(attemptOutput, /Attempt output is allowed in scrubbed, bounded form/);
+	assert.match(
+		attemptOutput,
+		/raw prompts,\s*(?:full\s+)?input briefs,\s*tokens,\s*endpoint paths,\s*worker configuration,\s*metrics,\s*artifact paths,?\s*and canonical checkout paths remain excluded\b/,
+		"Attempt output privacy statement must preserve the full exclusion sentence",
+	);
+	assert.match(
+		attemptOutput,
+		/Session transcripts,\s*terminal capture,\s*thinking text,?\s*and any log are also excluded/,
+		"Attempt output privacy statement must preserve the transcripts/log exclusion sentence",
+	);
+	assert.doesNotMatch(
+		viewerDoc,
+		/(?:responses?|the viewer)\s+(?:still\s+)?exclude[^\n]*\b(?:logs?|internal records)\b/i,
+		"Viewer guide privacy wording must not exclude logs or internal records wholesale",
+	);
+	for (const privacyTerm of [
+		"raw prompts", "input briefs", "tokens", "endpoint paths", "worker configuration", "metrics",
+		"artifact paths", "canonical checkout paths", "session transcripts", "terminal capture",
+		"thinking text", "any log", "unprojected internal records",
+	]) {
+		assert.ok(attemptOutputLower.includes(privacyTerm.toLowerCase()), `Attempt output privacy statement missing: ${privacyTerm}`);
+	}
 
 	for (const snippet of [
 		"127.0.0.1",

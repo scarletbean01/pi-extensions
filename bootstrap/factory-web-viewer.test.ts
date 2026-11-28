@@ -913,6 +913,18 @@ test("manual acceptance fixture helper covers scenarios 1-5 read-only without se
 				attemptOutputBodies.set(nodeId, await getChecked(`/api/factories/${fixture.factories.attemptOutput}/output?node=${nodeId}`));
 			}
 			assert.equal(attemptOutputBodies.get("attempt_history").evidence, "available");
+			for (const nodeId of ["command_exit", "command_signal", "attempt_review"]) {
+				assert.equal(attemptOutputBodies.get(nodeId).evidence, "available", `${nodeId} attempt evidence should be available`);
+			}
+			for (const nodeId of ["command_exit", "command_signal"]) {
+				const latest = attemptOutputBodies.get(nodeId).attempts[0];
+				assert.equal(latest.status_text, "Failed", `${nodeId} should expose its failed command status`);
+				assert.equal(latest.evidence, "available", `${nodeId} should expose its recorded command evidence`);
+			}
+			const reviewAttempts = attemptOutputBodies.get("attempt_review").attempts;
+			assert.equal(reviewAttempts.length, 3, "manual review fixture should return all three review attempts");
+			assert.ok(reviewAttempts.every((attempt: any) => attempt.evidence === "available"), "each review attempt should have verified output evidence");
+			assert.equal(reviewAttempts[0].status_text, "Succeeded", "the newest successful review attempt keeps its own status while parked");
 			assert.equal(attemptOutputBodies.get("missing_result").evidence, "unavailable");
 			assert.equal(attemptOutputBodies.get("still_running").evidence, "not applicable");
 
@@ -1096,12 +1108,56 @@ test("createLiveFixtureAdvancer updates once and second invocation is harmless",
 	const advance = createLiveFixtureAdvancer(fixture, msg => logs.push(msg));
 	assert.equal(advance(), true);
 	const resultFile = join(fixture.run.sessionDir, `${fixture.run.rightAttemptId}.result.json`);
-	const firstWrite = readFileSync(resultFile, "utf8");
+	const firstWriteText = readFileSync(resultFile, "utf8");
+	const firstWrite = JSON.parse(firstWriteText);
+	assert.match(firstWrite.result.detail, /FAKE_DETAIL_LINE_2[\s\S]*\n- FAKE_DETAIL_LIST_ITEM/);
+	assert.equal(firstWrite.result.verification[0].check_id, "FAKE_LIVE_CHECK");
+	assert.match(firstWrite.result.verification[0].reason, /FAKE_VERIFICATION/);
+	assert.match(firstWrite.result.warnings[0], /FAKE_WARNING/);
+	assert.match(firstWrite.result.next_steps[0], /FAKE_NEXT_STEP/);
+	assert.deepEqual(firstWrite.result.outputs, {
+		fixture_only: true,
+		fake_id: "FAKE_STRUCTURED_OUTPUT_05",
+		values: ["FAKE_VALUE_ALPHA", "FAKE_VALUE_BETA"],
+	});
 	assert.equal(advance(), false);
-	assert.equal(readFileSync(resultFile, "utf8"), firstWrite);
+	assert.equal(readFileSync(resultFile, "utf8"), firstWriteText);
 	assert.equal(logs.length, 2);
 	assert.match(logs[0]!, /Updated node 'right'/);
 	assert.match(logs[1]!, /already updated to succeeded/);
+
+	await verifyReadOnlyViewer(
+		{
+			stateDirs: fixture.root,
+			viewerOptions: {
+				statePath: fixture.statePath,
+				coordinationPath: fixture.coordinationPath,
+				env: fixture.env,
+				home: fixture.home,
+			},
+		},
+		async viewer => {
+			const res = await fetch(`${viewer.url}/api/factories/${fixture.factories.alphaLiveV2}/output?node=right`);
+			assert.equal(res.status, 200);
+			const text = await res.text();
+			for (const s of fixture.sentinels) {
+				assert.equal(text.includes(s), false, `right /output leaked sentinel ${JSON.stringify(s)}`);
+			}
+			const out = JSON.parse(text);
+			assert.equal(out.evidence, "available");
+			const att = out.attempts[0];
+			assert.equal(att.status_text, "Succeeded");
+			assert.equal(att.evidence, "available");
+			assert.match(att.detail, /FAKE_DETAIL_LINE_2[\s\S]*\n- FAKE_DETAIL_LIST_ITEM/);
+			assert.equal(att.verification.items[0].check_id, "FAKE_LIVE_CHECK");
+			assert.match(att.verification.items[0].reason, /FAKE_VERIFICATION/);
+			assert.match(att.warnings.items[0], /FAKE_WARNING/);
+			assert.match(att.next_steps.items[0], /FAKE_NEXT_STEP/);
+			assert.match(att.outputs_text, /FAKE_STRUCTURED_OUTPUT_05/);
+			assert.match(att.outputs_text, /FAKE_VALUE_ALPHA/);
+			assert.match(att.outputs_text, /FAKE_VALUE_BETA/);
+		},
+	);
 });
 
 test("manual acceptance fixture CLI cleans up temp dir on signals during build and supports relative TMPDIR", async t => {
