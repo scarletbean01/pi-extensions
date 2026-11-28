@@ -188,6 +188,7 @@ function verifyReleaseMatchesDefinition(factoryId: string, release: ReleasedFact
 	return roster;
 }
 
+// Note: attempt/status derivation mirrors nodeObservation in ./live.ts; extracting a shared resolver is deferred to ticket 02.
 function latestAttemptOutputForNode(
 	manifest: BootstrapManifest,
 	entry: AgentLaunch,
@@ -200,13 +201,15 @@ function latestAttemptOutputForNode(
 	const unavailable = (
 		attemptId: string | undefined,
 		attemptNumberVal: number,
+		status: ExecutionState,
+		statusText: string,
 		explanation: string,
 	) => ({
 		attempt_id: attemptId ?? { absence: "evidence unavailable" as TypedAbsence, explanation: "Attempt identity could not be verified." },
 		attempt_number: attemptNumberVal,
 		max_attempts: maxAttempts,
-		status: "needs_attention" as ExecutionState,
-		status_text: OUTPUT_STATUS_TEXT.needs_attention,
+		status,
+		status_text: statusText,
 		evidence: "unavailable" as const,
 		absence: "evidence unavailable" as TypedAbsence,
 		explanation,
@@ -356,11 +359,11 @@ function latestAttemptOutputForNode(
 		if (hasDisposition) {
 			const dispRead = readBoundedRegularJsonIfExists<unknown>(dir, dispFile, "node disposition");
 			if (!dispRead.exists) {
-				return unavailable(attemptId, attemptNum, "Disposition record could not be read.");
+				return unavailable(attemptId, attemptNum, "needs_attention", OUTPUT_STATUS_TEXT.needs_attention, "Disposition record could not be read.");
 			}
 			const disp = parseDisposition(dispRead.value, expected);
 			if (disp.state === "needs_attention") {
-				return unavailable(attemptId, attemptNum, "Attempt ended with unresolved evidence and no recorded result.");
+				return unavailable(attemptId, attemptNum, "needs_attention", OUTPUT_STATUS_TEXT.needs_attention, "Attempt ended with unresolved evidence and no recorded result.");
 			}
 			return notApplicable(
 				attemptId,
@@ -374,7 +377,7 @@ function latestAttemptOutputForNode(
 		if (hasResult) {
 			const resRead = readBoundedRegularJsonIfExists<unknown>(dir, resFile, "node result");
 			if (!resRead.exists) {
-				return unavailable(attemptId, attemptNum, "Result record could not be read.");
+				return unavailable(attemptId, attemptNum, "needs_attention", OUTPUT_STATUS_TEXT.needs_attention, "Result record could not be read.");
 			}
 			const record = parseCompletion(resRead.value, expected);
 			const baseState = executionFromResult(record.result.status).state;
@@ -407,66 +410,48 @@ function latestAttemptOutputForNode(
 			: scopedErrorFile;
 		if (pathEntryExists(errorFile)) {
 			readBoundedRegularJsonIfExists<unknown>(dir, errorFile, "node error");
-			return unavailable(attemptId, attemptNum, "The attempt recorded an execution error without a verified result.");
+			return unavailable(attemptId, attemptNum, "needs_attention", OUTPUT_STATUS_TEXT.needs_attention, "The attempt recorded an execution error without a verified result.");
 		}
 		if (entry.error) {
-			return unavailable(attemptId, attemptNum, "The attempt launch recorded an error without a verified result.");
-		}
-		if (claimInfo.claim?.outcome === "completed") {
-			return unavailable(attemptId, attemptNum, "The attempt recorded completion without a readable result record.");
+			return unavailable(attemptId, attemptNum, "needs_attention", OUTPUT_STATUS_TEXT.needs_attention, "The attempt launch recorded an error without a verified result.");
 		}
 
 		const matchingNodeCancel = cancelInfo.record && (!review_plan || !cancelInfo.record.identity.attempt_id || cancelInfo.record.identity.attempt_id === attemptId)
 			? cancelInfo.record
 			: undefined;
 		const activeCancel = matchingNodeCancel ?? (claimInfo.claim?.outcome === "completed" ? undefined : runCancelInfo.record);
-		if (activeCancel) {
-			if (matchingProgress?.state === "working" && readyAlive && entry.status !== "closed") {
-				return notApplicable(
-					attemptId,
-					attemptNum,
-					"running",
-					"Running (cancelling)",
-					"Attempt output is recorded when the attempt finishes.",
-				);
+		const deriveNonResultState = (): { status: ExecutionState; statusText: string; kind: "unavailable" | "not_applicable"; explanation: string } => {
+			if (activeCancel) {
+				if (matchingProgress?.state === "working" && readyAlive && entry.status !== "closed") {
+					return { status: "running", statusText: "Running (cancelling)", kind: "not_applicable", explanation: "Attempt output is recorded when the attempt finishes." };
+				}
+				return { status: "cancelled", statusText: OUTPUT_STATUS_TEXT.cancelled, kind: "not_applicable", explanation: "No attempt result was recorded because the attempt was cancelled." };
 			}
-			return notApplicable(
-				attemptId,
-				attemptNum,
-				"cancelled",
-				OUTPUT_STATUS_TEXT.cancelled,
-				"No attempt result was recorded because the attempt was cancelled.",
-			);
-		}
+			if (processState === "exited" || entry.status === "closed") {
+				return { status: "needs_attention", statusText: OUTPUT_STATUS_TEXT.needs_attention, kind: "unavailable", explanation: "The attempt ended before a verified result record was saved." };
+			}
+			if (readyAlive && matchingProgress) {
+				const status: ExecutionState = matchingProgress.state === "working" && matchingProgress.waiting_for_human_since === undefined
+					? "running"
+					: "waiting";
+				return { status, statusText: OUTPUT_STATUS_TEXT[status], kind: "not_applicable", explanation: "Attempt output is recorded when the attempt finishes." };
+			}
+			return { status: "pending", statusText: OUTPUT_STATUS_TEXT.pending, kind: "not_applicable", explanation: "Attempt output is recorded when the attempt finishes." };
+		};
 
-		if (processState === "exited" || entry.status === "closed") {
-			return unavailable(attemptId, attemptNum, "The attempt ended before a verified result record was saved.");
+		const nonResult = deriveNonResultState();
+		if (claimInfo.claim?.outcome === "completed") {
+			return unavailable(attemptId, attemptNum, nonResult.status, nonResult.statusText, "The attempt recorded completion without a readable result record.");
 		}
-
-		if (readyAlive && matchingProgress) {
-			const status: ExecutionState = matchingProgress.state === "working" && matchingProgress.waiting_for_human_since === undefined
-				? "running"
-				: "waiting";
-			return notApplicable(
-				attemptId,
-				attemptNum,
-				status,
-				OUTPUT_STATUS_TEXT[status],
-				"Attempt output is recorded when the attempt finishes.",
-			);
-		}
-
-		return notApplicable(
-			attemptId,
-			attemptNum,
-			"pending",
-			OUTPUT_STATUS_TEXT.pending,
-			"Attempt output is recorded when the attempt finishes.",
-		);
+		return nonResult.kind === "unavailable"
+			? unavailable(attemptId, attemptNum, nonResult.status, nonResult.statusText, nonResult.explanation)
+			: notApplicable(attemptId, attemptNum, nonResult.status, nonResult.statusText, nonResult.explanation);
 	} catch {
 		return unavailable(
 			resolvedAttemptId,
 			resolvedAttemptNum,
+			"needs_attention",
+			OUTPUT_STATUS_TEXT.needs_attention,
 			"Attempt output evidence is unavailable because the result record is missing, damaged, unreadable, or fails verification.",
 		);
 	}
@@ -490,6 +475,9 @@ export function nodeOutputSnapshot(
 		return { kind: "not_found", error: "Node not found in displayed run" };
 	}
 	if (consistent.state === "uncertain") {
+		if (releases.length > 0 && !releases.some(r => r.definition.agents.some(entry => entry.node.node_id === nodeId))) {
+			return { kind: "not_found", error: "Node not found in displayed run" };
+		}
 		return {
 			kind: "ok",
 			body: {
@@ -504,6 +492,9 @@ export function nodeOutputSnapshot(
 	}
 
 	const release = consistent.release;
+	if (!release.definition.agents.some(entry => entry.node.node_id === nodeId)) {
+		return { kind: "not_found", error: "Node not found in displayed run" };
+	}
 	let roster: Map<string, AgentLaunch>;
 	try {
 		roster = verifyReleaseMatchesDefinition(factoryId, release);

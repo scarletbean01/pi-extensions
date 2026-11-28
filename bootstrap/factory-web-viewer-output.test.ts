@@ -3,7 +3,9 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
+import { nodeOutputSnapshot } from "../factory/viewer/output.ts";
 import { sanitizeOperatorText, sanitizeOutputText } from "../factory/viewer/sanitize.ts";
+import { createViewerReader } from "../factory/viewer/server.ts";
 import { atomicJson, completionRecord, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
 import type { GenerateRequest } from "./lifecycle.ts";
 import { serviceFixture, workerFromConfig, notification } from "./test-support/chain-fixture.ts";
@@ -59,6 +61,38 @@ test("sanitizeOutputText preserves line breaks, scrubs blocked/generic paths and
 	// Compare with sanitizeOperatorText (one-line)
 	const single = sanitizeOperatorText("a\nb\tc", 100, []);
 	assert.equal(single, "a b c");
+
+	// B1: markdown-wrapped generic and blocked paths must be redacted while preserving closing backtick / '*'
+	const mdRaw = [
+		"Changed `/opt/probe_gen/secret.key` and **/var/probe_gen/y**, <p>/srv/probe_gen/z</p>, a,/usr/probe_gen/w",
+		"semi;/etc/probe_gen/s pipe|/usr/local/probe_gen/p",
+		"see `/home/alice/project/sub` and **/home/alice/project/star** here",
+	].join("\n");
+	const mdOut = sanitizeOutputText(mdRaw, 8000, blocked);
+	assert.equal(mdOut, [
+		"Changed `[redacted-path]` and **[redacted-path]**, <p>[redacted-path]</p>, a,[redacted-path]",
+		"semi;[redacted-path] pipe|[redacted-path]",
+		"see `[redacted-path]` and **[redacted-path]** here",
+	].join("\n"));
+	const mdOp = sanitizeOperatorText("see `/etc/probe_gen/x.conf` and **/var/probe_gen/y** and `/home/alice/project/z`", 1000, blocked);
+	assert.equal(mdOp, "see `[redacted-path]` and **[redacted-path]** and `[redacted-path]`");
+
+	// N7: Hangul fillers (U+3164, U+115F) and variation selectors (U+FE00..U+FE0F) are neutralised like other control/format chars
+	const invisRaw = "a\u3164b\u115Fc\uFE00d\uFE0Fe";
+	assert.equal(sanitizeOutputText(invisRaw, 8000, []), "a [ctrl] b [ctrl] c [ctrl] d [ctrl] e");
+	assert.equal(sanitizeOperatorText(invisRaw, 1000, []), "a [ctrl] b [ctrl] c [ctrl] d [ctrl] e");
+
+	// N8: literal truncation-marker patterns in agent text are neutralised before capping
+	const spoofShort = "Result ok … [truncated, 99999 characters omitted] and [truncated, 1 character omitted] end";
+	const spoofOut = sanitizeOutputText(spoofShort, 8000, []);
+	assert.doesNotMatch(spoofOut, /\[truncated,\s*\d+\s+characters?\s+omitted\]/i);
+	assert.equal(spoofOut.includes("99999"), false);
+	assert.doesNotMatch(sanitizeOperatorText(spoofShort, 1000, []), /\[truncated,\s*\d+\s+characters?\s+omitted\]/i);
+	const spoofAndLong = `Prefix … [truncated, 99999 characters omitted] ${"Q".repeat(1100)}`;
+	const spoofLongOut = sanitizeOutputText(spoofAndLong, 1000, []);
+	assert.ok(Array.from(spoofLongOut).length <= 1000);
+	assert.equal(spoofLongOut.includes("99999"), false);
+	assert.match(spoofLongOut, /^Prefix \[truncated-marker\] Q+… \[truncated, \d+ characters? omitted\]$/);
 });
 
 test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summary/detail/live-summary, caps fields, and handles absence and hostile files", async t => {
@@ -120,8 +154,8 @@ test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summa
 				agent_name: doneEntry.persona_name,
 				node_id: "done_node",
 				status: "success",
-				summary: `Summary at ${dir} and ${f.cwd}/src/a.ts\nwith\u202ectrl\u200b`,
-				detail: `Line 1 in ${f.home}/.pi/file\nLine 2 in ${statePath}\nLine 3 /etc/shadow \u0007alert <script>alert(1)</script>`,
+				summary: `Summary at ${dir} and ${f.cwd}/src/a.ts and \`/etc/probe_gen/x.conf\` and **/opt/probe_gen/sum**\nwith\u202ectrl\u200b\u3164\uFE0F`,
+				detail: `Line 1 in ${f.home}/.pi/file\nLine 2 in ${statePath}\nLine 3 /etc/shadow \u0007alert <script>alert(1)</script>\nChanged \`/opt/probe_gen/secret.key\` and **/var/probe_gen/y**, <p>/srv/probe_gen/z</p>, a,/usr/probe_gen/w\nSpoof … [truncated, 99999 characters omitted]`,
 				metrics: { PRIVATE_METRIC: 99 },
 				artifacts: [{ type: "file", path: join(f.cwd, "PRIVATE_ARTIFACT_PATH.txt"), description: "Out file" }],
 			},
@@ -267,6 +301,12 @@ test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summa
 		statePath,
 		coordinationPath,
 		"/etc/shadow",
+		"/etc/probe_gen/x.conf",
+		"/opt/probe_gen/sum",
+		"/opt/probe_gen/secret.key",
+		"/var/probe_gen/y",
+		"/srv/probe_gen/z",
+		"/usr/probe_gen/w",
 		"--sentinel-cmd-arg",
 		"/tmp/PRIVATE_ENDPOINT_SOCKET",
 	];
@@ -308,8 +348,12 @@ test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summa
 			const live = JSON.parse(liveText);
 			const liveDone = live.graph.nodes.find((n: any) => n.id === "done_node");
 			assert.match(liveDone.current_attempt.summary, /\[redacted-path\]/);
+			assert.ok(liveDone.current_attempt.summary.includes("`[redacted-path]`"), "closing backtick must survive in live summary");
+			assert.ok(liveDone.current_attempt.summary.includes("**[redacted-path]**"), "closing ** must survive in live summary");
 			assert.match(liveDone.current_attempt.summary, /\[ctrl\]/);
 			assert.equal(liveDone.current_attempt.summary.includes("\n"), false);
+			assert.equal(liveDone.current_attempt.summary.includes("\u3164"), false);
+			assert.equal(liveDone.current_attempt.summary.includes("\uFE0F"), false);
 			const liveLong = live.graph.nodes.find((n: any) => n.id === "long_node");
 			assert.ok(Array.from(liveLong.current_attempt.summary).length <= 1000);
 
@@ -326,8 +370,13 @@ test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summa
 			assert.equal(doneOut.latest_attempt.status, "succeeded");
 			assert.match(doneOut.latest_attempt.summary, /\n/);
 			assert.match(doneOut.latest_attempt.summary, /\[redacted-path\]/);
+			assert.ok(doneOut.latest_attempt.summary.includes("`[redacted-path]`"));
+			assert.ok(doneOut.latest_attempt.summary.includes("**[redacted-path]**"));
 			assert.match(doneOut.latest_attempt.summary, /\[ctrl\]/);
-			assert.match(doneOut.latest_attempt.detail, /^Line 1 in \[redacted-path\]\nLine 2 in \[redacted-path\]\nLine 3 \[redacted-path\] \[ctrl\] alert <script>alert\(1\)<\/script>$/);
+			assert.equal(
+				doneOut.latest_attempt.detail,
+				"Line 1 in [redacted-path]\nLine 2 in [redacted-path]\nLine 3 [redacted-path] [ctrl] alert <script>alert(1)</script>\nChanged `[redacted-path]` and **[redacted-path]**, <p>[redacted-path]</p>, a,[redacted-path]\nSpoof [truncated-marker]",
+			);
 
 			// /output for long_node: caps 1,000 summary & 8,000 detail with omission markers and valid surrogate pairs
 			const longRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=long_node`);
@@ -514,6 +563,174 @@ test("GET /api/factories/:id/output tracks latest attempt in review loops and fa
 			const out = JSON.parse(text);
 			assert.equal(out.evidence, "unavailable");
 			assert.equal(out.absence, "evidence unavailable");
+		},
+	);
+});
+
+test("GET /api/factories/:id/output returns 404 for unknown node on uncertain or topology-mismatch runs when a release exists (N2)", async t => {
+	const { readFileSync } = await import("node:fs");
+	const { DatabaseSync } = await import("node:sqlite");
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_N2_PROMPT",
+		agents: [{ node_id: "build", persona: "builder", sub_task: "PRIVATE_N2_SUB" }],
+	};
+	const fac = ops({ action: "publish", name: "n2-output-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-n2-out" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "n2-ref", brief: "PRIVATE_N2_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	// 1. Uncertain run where a release still exists (e.g. checkout slot becomes uncertain while release is observed):
+	const reader = createViewerReader({ statePath, coordinationPath, env: viewerEnv, home: f.home });
+	const { inspection, releases } = reader.inspectLive(fac.factory_id);
+	assert.equal(releases.length, 1);
+	const uncertainInspection = {
+		...inspection,
+		capacity: { ...inspection.capacity, checkout_slot: "uncertain" as const },
+	};
+	const nfOutcome = nodeOutputSnapshot(fac.factory_id, "typo_not_in_run", uncertainInspection, releases);
+	assert.equal(nfOutcome.kind, "not_found", "unknown node on uncertain run with release must return not_found (404)");
+	const okOutcome = nodeOutputSnapshot(fac.factory_id, "build", uncertainInspection, releases);
+	assert.equal(okOutcome.kind, "ok");
+	assert.equal(okOutcome.body.evidence, "unavailable");
+	assert.equal(okOutcome.body.absence, "evidence unavailable");
+
+	// HTTP uncertain run without a release (missing checkout hold) still documents typed absence for known node:
+	const db = new DatabaseSync(coordinationPath);
+	try { db.prepare("DELETE FROM checkout_holds WHERE factory_id = ?").run(fac.factory_id); } finally { db.close(); }
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const knownRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`);
+			assert.equal(knownRes.status, 200);
+			const knownBody = await knownRes.json() as any;
+			assert.equal(knownBody.evidence, "unavailable");
+			assert.equal(knownBody.absence, "evidence unavailable");
+		},
+	);
+
+	// 2. Topology-mismatch run (manifest topology differs from bound definition) while release exists:
+	const f2 = serviceFixture(t, ["builder"]);
+	const statePath2 = join(f2.root, "factories.sqlite");
+	const coordinationPath2 = join(f2.root, "factory-coordination.sqlite");
+	const viewerEnv2 = { PATH: join(f2.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f2.stateDir };
+	const ops2 = factoryOperations(statePath2, f2.service, { coordinationPath: coordinationPath2 });
+	const fac2 = ops2({ action: "publish", name: "n2-topo-fac", draft: { ...draft, project_cwd: f2.cwd }, sessionModel });
+	const auth2 = createManagerAuthority({ pi_session_id: "sess-n2-topo" });
+	ops2({ action: "resume", factory_id: fac2.factory_id, authority: auth2 });
+	ops2({ action: "submit", factory_id: fac2.factory_id, authority: auth2, reference: "n2-topo-ref", brief: "PRIVATE_N2_TOPO_BRIEF" });
+	const launched2 = await ops2({ action: "launch", factory_id: fac2.factory_id, authority: auth2 });
+	revokeManagerAuthority(auth2);
+
+	const manifestPath2 = join(launched2.manifest.session_dir, "manifest.json");
+	const manifestObj = JSON.parse(readFileSync(manifestPath2, "utf8"));
+	manifestObj.pane_manifest[0].node_id = "tampered_node";
+	atomicJson(manifestPath2, manifestObj);
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f2.root, viewerOptions: { statePath: statePath2, coordinationPath: coordinationPath2, env: viewerEnv2, home: f2.home } },
+		async viewer => {
+			const nfRes = await fetch(`${viewer.url}/api/factories/${fac2.factory_id}/output?node=typo_not_in_run`);
+			assert.equal(nfRes.status, 404, "unknown node on topology-mismatch run must return 404");
+
+			const knownRes = await fetch(`${viewer.url}/api/factories/${fac2.factory_id}/output?node=build`);
+			assert.equal(knownRes.status, 200);
+			const knownBody = await knownRes.json() as any;
+			assert.equal(knownBody.evidence, "unavailable");
+			assert.equal(knownBody.absence, "evidence unavailable");
+		},
+	);
+});
+
+test("GET /api/factories/:id/output keeps Live execution status alongside evidence unavailable for error.json, exited worker, and missing result (N3)", async t => {
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_N3_PROMPT",
+		agents: [
+			{ node_id: "err_node", persona: "builder", sub_task: "PRIVATE_N3_ERR" },
+			{ node_id: "exited_node", persona: "builder", sub_task: "PRIVATE_N3_EXIT" },
+			{ node_id: "claim_only_node", persona: "builder", sub_task: "PRIVATE_N3_CLAIM" },
+		],
+	};
+	const fac = ops({ action: "publish", name: "n3-output-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-n3-out" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "n3-ref", brief: "PRIVATE_N3_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const entryOf = (nodeId: string) => launched.manifest.pane_manifest.find(e => e.node_id === nodeId)!;
+
+	const errEntry = entryOf("err_node");
+	atomicJson(join(dir, `${errEntry.instance_id}.error.json`), { error: "PRIVATE_ERR_JSON_MSG" });
+
+	const exitedEntry = entryOf("exited_node");
+	atomicJson(readyPath(dir, exitedEntry.instance_id), {
+		version: 2,
+		direction_incarnation: "inc-exit",
+		task_id: launched.task_id,
+		token: launched.manifest.token,
+		instance_id: exitedEntry.instance_id,
+		pid: 2_147_483_646,
+		session_id: "sess-exit",
+		name: exitedEntry.instance_id,
+		endpoint: "/tmp/PRIVATE_EXIT_EP",
+		model: "test-provider/test-model",
+	});
+
+	const claimEntry = entryOf("claim_only_node");
+	atomicJson(join(dir, `${claimEntry.instance_id}.outcome-claim.json`), {
+		version: 1,
+		identity: {
+			run_id: launched.task_id,
+			node_id: "claim_only_node",
+			persona_name: claimEntry.persona_name,
+			attempt_id: claimEntry.attempt_id!,
+			instance_id: claimEntry.instance_id,
+		},
+		outcome: "completed",
+		claimed_at: "2026-01-01T00:00:03.000Z",
+	});
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const liveRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
+			assert.equal(liveRes.status, 200);
+			const live = await liveRes.json() as any;
+			const liveById = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
+
+			for (const nodeId of ["err_node", "exited_node", "claim_only_node"]) {
+				const outRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=${nodeId}`);
+				assert.equal(outRes.status, 200);
+				const outText = await outRes.text();
+				assert.equal(outText.includes("PRIVATE_"), false, `output for ${nodeId} leaked private sentinel`);
+				const out = JSON.parse(outText);
+				const liveNode = liveById.get(nodeId);
+				assert.ok(liveNode, `missing ${nodeId} in live snapshot`);
+				assert.equal(out.latest_attempt.evidence, "unavailable", nodeId);
+				assert.equal(out.latest_attempt.absence, "evidence unavailable", nodeId);
+				assert.equal(out.latest_attempt.status, liveNode.status, `${nodeId} status must match Live`);
+				assert.equal(out.latest_attempt.status_text, liveNode.status_text, `${nodeId} status_text must match Live`);
+			}
 		},
 	);
 });

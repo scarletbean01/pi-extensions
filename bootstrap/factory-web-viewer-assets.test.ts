@@ -2582,7 +2582,163 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				assert.ok(collectTextNodes(appOut.content).some(t => t.includes("Fac2 <script>alert('xss')</script>\n  indented")));
 				const outBlocks = collectAllElements(appOut.content).filter(e => e.classList.contains("output-text"));
 				assert.equal(outBlocks.length, 2, "Summary and detail must use .output-text");
+
+				// N5/N6: outputBody must not carry nested aria-live inside detailPanel, and status chip renders once (in <summary>, not in body facts <dl>)
+				const outputHeading = collectAllElements(appOut.content).find(e => e.tagName === "h4" && e.textContent === "Attempt output")!;
+				assert.ok(outputHeading, "Expected Attempt output heading");
+				const outputSection = collectAllElements(appOut.content).find(e => e.tagName === "section" && e.children.some(c => c.children.includes(outputHeading)))!;
+				assert.ok(outputSection, "Expected Attempt output section");
+				const nestedAriaLive = collectAllElements(outputSection).filter(e => e.hasAttribute("aria-live"));
+				assert.equal(nestedAriaLive.length, 0, "Attempt output section must not nest aria-live inside detailPanel");
+				const outputDetails = collectAllElements(outputSection).find(e => e.tagName === "details")!;
+				assert.ok(outputDetails);
+				const statusChipsInDetails = collectAllElements(outputDetails).filter(e => e.classList.contains("chip"));
+				assert.equal(statusChipsInDetails.length, 1, "Status chip must render once (in <summary>), not duplicated in body facts");
+				assert.equal(collectAllElements(outputDetails).some(e => e.tagName === "dt" && e.textContent === "Status"), false, "Body facts must not duplicate Status");
 				appOut.assertSafeDom();
+			}
+
+			// J. N1: same-factory reload while /output is in flight must not leave Attempt output stuck on "Loading attempt output…"
+			{
+				let outputCalls = 0;
+				let resolveOutput!: (r: any) => void;
+				let resolveLiveReload!: (r: any) => void;
+				let liveCalls = 0;
+
+				const snap = {
+					factory_id: "fac_1",
+					current_version: "v1",
+					checked_at: "2026-11-28T12:00:00Z",
+					state: "running",
+					reason: "Running",
+					run: { run_id: "run-n1", attempt_id: "att-n1", bound_version: "v1" },
+					outcome: "incomplete",
+					settlement: "unsettled",
+					capacity_release: "held",
+					graph: {
+						evidence: "available",
+						bound_version: "v1",
+						topology: "graph",
+						nodes: [
+							{ id: "node_a", kind: "agent", status: "succeeded", status_text: "Succeeded", current_attempt: { attempt_id: "a.1", attempt_number: 1, max_attempts: 1, instance_id: "i-a", process_state: "exited", resource_state: "closed" } },
+						],
+						edges: [],
+					},
+				};
+
+				const appN1 = bootApp("?factory=fac_1&view=live", async (url, init) => {
+					if (url === "/api/factories") {
+						return jsonResp(200, [{ factory_id: "fac_1", name: "Fac1", current_version: "v1", management: "managed" }]);
+					}
+					if (url === "/api/factories/fac_1/live") {
+						liveCalls++;
+						if (liveCalls === 1) return jsonResp(200, snap);
+						return new Promise(res => { resolveLiveReload = res; });
+					}
+					if (url === "/api/factories/fac_1/output?node=node_a") {
+						outputCalls++;
+						return new Promise((res, rej) => {
+							resolveOutput = res;
+							init?.signal?.addEventListener("abort", () => {
+								const err = new Error("The operation was aborted");
+								err.name = "AbortError";
+								rej(err);
+							});
+						});
+					}
+					throw new Error(`Unexpected URL ${url}`);
+				});
+				await flushMicrotasks();
+
+				const gNode = collectAllElements(appN1.content).find(e => e.getAttribute("data-node-id") === "node_a")!;
+				for (const fn of gNode.listeners.get("click") ?? []) fn({});
+				await flushMicrotasks();
+				assert.equal(outputCalls, 1);
+				assert.match(appN1.content.textContent, /Loading attempt output/);
+
+				// Trigger same-factory reload (click Live Graph tab) while output request is in flight
+				const liveTab = appN1.viewsNav.querySelectorAll("[data-view]").find(t => t.getAttribute("data-view") === "live")!;
+				for (const fn of liveTab.listeners.get("click") ?? []) fn({ button: 0, preventDefault() {} });
+				await flushMicrotasks();
+
+				resolveLiveReload(jsonResp(200, snap));
+				await flushMicrotasks();
+
+				// Resolve whichever output request is active (original if preserved, or re-issued if aborted)
+				resolveOutput(jsonResp(200, {
+					factory_id: "fac_1",
+					node_id: "node_a",
+					evidence: "available",
+					latest_attempt: {
+						attempt_id: "a.1",
+						attempt_number: 1,
+						max_attempts: 1,
+						status: "succeeded",
+						status_text: "Succeeded",
+						evidence: "available",
+						summary: "Recovered summary after reload",
+						detail: "Recovered detail after reload",
+					},
+				}));
+				await flushMicrotasks();
+
+				assert.equal(appN1.content.textContent.includes("Loading attempt output"), false, "Attempt output must not stay stuck loading after same-factory reload");
+				assert.match(appN1.content.textContent, /Recovered summary after reload/);
+				assert.match(appN1.content.textContent, /Recovered detail after reload/);
+				appN1.assertSafeDom();
+
+				// Also verify AbortError recovery: if an output request aborts without rendering, the next live patch re-issues /output
+				let abortPhaseCalls = 0;
+				let abortPhaseLiveCalls = 0;
+				const appN1Abort = bootApp("?factory=fac_1&view=live", async (url) => {
+					if (url === "/api/factories") {
+						return jsonResp(200, [{ factory_id: "fac_1", name: "Fac1", current_version: "v1", management: "managed" }]);
+					}
+					if (url === "/api/factories/fac_1/live") {
+						abortPhaseLiveCalls++;
+						return jsonResp(200, snap);
+					}
+					if (url === "/api/factories/fac_1/output?node=node_a") {
+						abortPhaseCalls++;
+						if (abortPhaseCalls === 1) {
+							const err = new Error("The operation was aborted");
+							err.name = "AbortError";
+							throw err;
+						}
+						return jsonResp(200, {
+							factory_id: "fac_1",
+							node_id: "node_a",
+							evidence: "available",
+							latest_attempt: {
+								attempt_id: "a.1",
+								attempt_number: 1,
+								max_attempts: 1,
+								status: "succeeded",
+								status_text: "Succeeded",
+								evidence: "available",
+								summary: "Re-fetched after abort",
+								detail: "Re-fetched detail",
+							},
+						});
+					}
+					throw new Error(`Unexpected URL ${url}`);
+				});
+				await flushMicrotasks();
+
+				const gNodeAbort = collectAllElements(appN1Abort.content).find(e => e.getAttribute("data-node-id") === "node_a")!;
+				for (const fn of gNodeAbort.listeners.get("click") ?? []) fn({});
+				await flushMicrotasks();
+				assert.equal(abortPhaseCalls, 1);
+				assert.match(appN1Abort.content.textContent, /Loading attempt output/);
+
+				const liveTabAbort = appN1Abort.viewsNav.querySelectorAll("[data-view]").find(t => t.getAttribute("data-view") === "live")!;
+				for (const fn of liveTabAbort.listeners.get("click") ?? []) fn({ button: 0, preventDefault() {} });
+				await flushMicrotasks();
+				assert.ok(abortPhaseLiveCalls >= 2);
+				assert.equal(abortPhaseCalls, 2, "Next live patch must re-issue /output after an aborted request");
+				assert.equal(appN1Abort.content.textContent.includes("Loading attempt output"), false);
+				assert.match(appN1Abort.content.textContent, /Re-fetched after abort/);
+				appN1Abort.assertSafeDom();
 			}
 		},
 	);

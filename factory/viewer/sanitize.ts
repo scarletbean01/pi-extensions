@@ -2,8 +2,9 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import type { FactoryDeletionInfo } from "../operations.ts";
 
-const CONTROL_AND_FORMAT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u2028\u2029\p{Cf}]+/gu;
-const GENERIC_PATH_RE = /(^|[\s"'(\[{:=])((?:file:\/\/[^\s"'<>()\[\]{}]+|\/(?:[^\s"'<>()\[\]{}/]+\/)+[^\s"'<>()\[\]{}]*|~[A-Za-z0-9._-]*[\\/][^\s"'<>()\[\]{}]+|[A-Za-z]:[\\/][^\s"'<>()\[\]{}]+))/g;
+const CONTROL_AND_FORMAT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u115F\u1160\u3164\uFE00-\uFE0F\uFFA0\u2028\u2029\p{Cf}]+/gu;
+const GENERIC_PATH_RE = /(^|[^A-Za-z0-9._~/-])((?:file:\/\/[^\s"'<>()\[\]{}`*]+|\/(?:[^\s"'<>()\[\]{}`*/]+\/)+[^\s"'<>()\[\]{}`*]*|~[A-Za-z0-9._-]*[\\/][^\s"'<>()\[\]{}`*]+|[A-Za-z]:[\\/][^\s"'<>()\[\]{}`*]+))/g;
+const SPOOFED_TRUNCATION_MARKER_RE = /(?:…\s*)?\[truncated,\s*\d+\s+characters?\s+omitted\]/gi;
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -25,7 +26,7 @@ function scrubBlockedAndGenericPaths(text: string, blockedPaths: readonly string
 	)].sort((a, b) => b.length - a.length);
 	for (const blocked of uniquePaths) {
 		if (!cleaned.includes(blocked)) continue;
-		const re = new RegExp(`${escapeRegExp(blocked)}[^\\s"'<>()\\[\\]{}]*`, "g");
+		const re = new RegExp(`${escapeRegExp(blocked)}[^\\s"'<>()\\[\\]{}\`*]*`, "g");
 		cleaned = cleaned.replace(re, match => {
 			const { trailing } = splitTrailingSentencePunctuation(match);
 			return `[redacted-path]${trailing}`;
@@ -72,7 +73,8 @@ export function sanitizeOperatorText(value: string, maxChars: number, blockedPat
 		.replace(CONTROL_AND_FORMAT_RE, " [ctrl] ")
 		.replace(/\s+/g, " ")
 		.trim();
-	const cleaned = scrubBlockedAndGenericPaths(normalized, blockedPaths);
+	const cleaned = scrubBlockedAndGenericPaths(normalized, blockedPaths)
+		.replace(SPOOFED_TRUNCATION_MARKER_RE, "[truncated-marker]");
 	const codePoints = Array.from(cleaned);
 	if (maxChars <= 0) return "";
 	if (codePoints.length > maxChars) {
@@ -96,7 +98,8 @@ export function sanitizeOutputText(value: string, maxChars: number, blockedPaths
 			const padRight = after !== "" && !/\s/.test(after) ? " " : "";
 			return `${padLeft}[ctrl]${padRight}`;
 		});
-	const cleaned = scrubBlockedAndGenericPaths(normalized, blockedPaths);
+	const cleaned = scrubBlockedAndGenericPaths(normalized, blockedPaths)
+		.replace(SPOOFED_TRUNCATION_MARKER_RE, "[truncated-marker]");
 	return truncateWithOmissionMarker(Array.from(cleaned), maxChars);
 }
 

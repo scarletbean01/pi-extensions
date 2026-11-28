@@ -793,7 +793,6 @@ function renderAttemptOutputBody(slot, data, errorInfo) {
     const facts = el("dl", undefined, { class: "row" });
     facts.append(
       factItem("Attempt ID", isAbsenceObject(att.attempt_id) ? absenceNode(att.attempt_id) : el("code", att.attempt_id)),
-      factItem("Status", statusPill(att.status, att.status_text || att.status)),
     );
     if (att.completed_at) facts.append(factItem("Completed at", att.completed_at));
     body.append(facts);
@@ -822,6 +821,8 @@ async function requestNodeOutput(factoryId, nodeId, ds) {
   abortOutputRequest();
   const slot = ds.outputBody;
   if (!slot) return;
+  const outputKey = `${factoryId}\u0000${nodeId}`;
+  ds.outputLoadedKey = "";
   const url = outputApiUrl(factoryId, nodeId);
   if (!url) {
     renderAttemptOutputBody(slot, null, {
@@ -829,6 +830,7 @@ async function requestNodeOutput(factoryId, nodeId, ds) {
       message: "Invalid factory or node identifier",
       detail: "Unable to request attempt output without valid identifiers.",
     });
+    ds.outputLoadedKey = outputKey;
     return;
   }
   const seq = ++state.outputRequestSeq;
@@ -847,9 +849,11 @@ async function requestNodeOutput(factoryId, nodeId, ds) {
         message: "Output response did not match the selected node",
         detail: `Expected factory "${factoryId}" node "${nodeId}" but received "${gotFactory}" / "${gotNode}".`,
       });
+      ds.outputLoadedKey = outputKey;
       return;
     }
     renderAttemptOutputBody(slot, data, null);
+    ds.outputLoadedKey = outputKey;
   } catch (err) {
     if (err && err.name === "AbortError") return;
     if (seq !== state.outputRequestSeq || factoryId !== state.selectedFactoryId || nodeId !== state.selectedGraphNodeId || state.activeView !== "live") return;
@@ -858,6 +862,7 @@ async function requestNodeOutput(factoryId, nodeId, ds) {
       message: err?.message || "Failed to load attempt output",
       detail: err?.detail || "Unable to fetch attempt output from the local viewer.",
     });
+    ds.outputLoadedKey = outputKey;
   } finally {
     if (seq === state.outputRequestSeq && state.outputController === controller) {
       state.outputController = null;
@@ -989,11 +994,10 @@ function patchLiveNodeDetail(detailEl, node, boundVersion, detailState) {
     ds.outputSec = el("section", undefined, { class: "card" });
     const outputCardBody = el("div", undefined, { class: "card-content" });
     outputCardBody.append(el("h4", "Attempt output", { class: "card-title" }));
-    ds.outputBody = el("div", undefined, { "aria-live": "polite", "aria-busy": "false" });
+    ds.outputBody = el("div", undefined, { "aria-busy": "false" });
     outputCardBody.append(ds.outputBody);
     ds.outputSec.append(outputCardBody);
-    const outputKey = `${state.selectedFactoryId}\u0000${node.id}`;
-    ds.outputLoadedKey = outputKey;
+    ds.outputLoadedKey = "";
     ds.actionsEl = el("div", undefined, { class: "section" });
     if (cfgLink && isAbsenceObject(cfgLink)) {
       ds.actionsEl.append(absenceNode(cfgLink));
@@ -1088,6 +1092,10 @@ function patchLiveNodeDetail(detailEl, node, boundVersion, detailState) {
     }
   }
   ds.sigs = nextSigs;
+  const outputKey = `${state.selectedFactoryId}\u0000${node.id}`;
+  if (ds.outputLoadedKey !== outputKey && !state.outputController) {
+    void requestNodeOutput(state.selectedFactoryId, node.id, ds);
+  }
   return ds;
 }
 
@@ -2859,15 +2867,16 @@ async function fetchLiveView({ isPoll }) {
 
 async function loadCurrentView() {
   clearPollTimer();
-  abortOutputRequest();
+  const reqFactory = state.selectedFactoryId;
+  const reqView = state.activeView;
+  if (reqView !== "live" || !state.liveDom || state.liveDom.factoryId !== reqFactory) {
+    abortOutputRequest();
+  }
   if (state.controller) {
     state.controller.abort();
     state.controller = null;
   }
   state.liveInFlight = false;
-
-  const reqFactory = state.selectedFactoryId;
-  const reqView = state.activeView;
 
   updateChrome();
   renderSidebarFactories();
