@@ -817,24 +817,8 @@ function renderBoundedTextListSection(title, listObj) {
   return sec;
 }
 
-function renderAttemptOutputBody(slot, data, errorInfo) {
-  slot.setAttribute("aria-busy", "false");
-  if (errorInfo) {
-    slot.replaceChildren(errorBanner(errorInfo.status, errorInfo.message, errorInfo.detail));
-    return;
-  }
-  if (!data || typeof data !== "object") {
-    slot.replaceChildren(absenceNode({ absence: "evidence unavailable", explanation: "Attempt output response was empty or invalid." }));
-    return;
-  }
-  const att = data.latest_attempt && typeof data.latest_attempt === "object" ? data.latest_attempt : null;
-  if (!att) {
-    slot.replaceChildren(absenceNode(isAbsenceObject(data)
-      ? data
-      : { absence: "evidence unavailable", explanation: data.explanation || "Attempt output evidence is unavailable." }));
-    return;
-  }
-  const details = el("details", undefined, { class: "collapsible", open: true });
+function renderSingleAttemptDisclosure(att, isOpen) {
+  const details = el("details", undefined, { class: "collapsible", ...(isOpen ? { open: true } : {}) });
   const summaryEl = el("summary", undefined, { class: "collapsible-header" });
   summaryEl.append(
     el("h5", `Attempt ${att.attempt_number ?? "?"} of ${att.max_attempts ?? "?"}`, { class: "inline" }),
@@ -973,7 +957,33 @@ function renderAttemptOutputBody(slot, data, errorInfo) {
     }
   }
   details.append(summaryEl, body);
-  slot.replaceChildren(details);
+  return details;
+}
+
+function renderAttemptOutputBody(slot, data, errorInfo) {
+  slot.setAttribute("aria-busy", "false");
+  if (errorInfo) {
+    slot.replaceChildren(errorBanner(errorInfo.status, errorInfo.message, errorInfo.detail));
+    return;
+  }
+  if (!data || typeof data !== "object") {
+    slot.replaceChildren(absenceNode({ absence: "evidence unavailable", explanation: "Attempt output response was empty or invalid." }));
+    return;
+  }
+  const attempts = Array.isArray(data.attempts)
+    ? data.attempts.filter((a) => a && typeof a === "object")
+    : (data.latest_attempt && typeof data.latest_attempt === "object" ? [data.latest_attempt] : []);
+  if (attempts.length === 0) {
+    slot.replaceChildren(absenceNode(isAbsenceObject(data)
+      ? data
+      : { absence: "evidence unavailable", explanation: data.explanation || "Attempt output evidence is unavailable." }));
+    return;
+  }
+  const nodes = attempts.map((att, idx) => renderSingleAttemptDisclosure(att, idx === 0));
+  if (typeof data.omitted_attempts === "number" && data.omitted_attempts > 0) {
+    nodes.push(el("p", data.omitted_marker || `… [truncated, ${data.omitted_attempts} attempt${data.omitted_attempts === 1 ? "" : "s"} omitted]`, { class: "grey-text text-darken-3" }));
+  }
+  slot.replaceChildren(...nodes);
 }
 
 async function requestNodeOutput(factoryId, nodeId, ds) {

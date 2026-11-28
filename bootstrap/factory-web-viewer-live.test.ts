@@ -346,9 +346,10 @@ test("Live Graph projects bound-version topology, joins, feedback edges, current
       const prepOutText = await prepOutRes.text();
       assertNoLeaks(prepOutText, "output prep");
       const prepOut = JSON.parse(prepOutText);
-      assert.equal(prepOut.latest_attempt.detail, "PUBLIC_LOG_DETAIL");
-      assert.equal(prepOut.latest_attempt.command.stdout_excerpt, "PUBLIC_STDOUT_LOG");
-      assert.equal(prepOut.latest_attempt.command.stderr_excerpt, "PUBLIC_STDERR_LOG");
+      assert.equal(prepOut.attempts.length, 1);
+      assert.equal(prepOut.attempts[0].detail, "PUBLIC_LOG_DETAIL");
+      assert.equal(prepOut.attempts[0].command.stdout_excerpt, "PUBLIC_STDOUT_LOG");
+      assert.equal(prepOut.attempts[0].command.stderr_excerpt, "PUBLIC_STDERR_LOG");
 
       // Factory isolation: other factory returns only its own launched graph and never leaks fac's ids/nodes.
       const otherText = await (await fetch(`${viewer.url}/api/factories/${otherFac.factory_id}/live`)).text();

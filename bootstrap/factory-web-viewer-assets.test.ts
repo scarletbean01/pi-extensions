@@ -2946,6 +2946,203 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				assert.ok(collectTextNodes(errOutSection).some(t => t.includes("Worker crashed <err>")));
 				appT02.assertSafeDom();
 			}
+
+			// L. Ticket 03 Attempt output multi-attempt UI: newest first, only newest open, others collapsed & one click away, real headings, tone classes, omitted marker, mixed finished/unfinished/damaged attempts
+			{
+				const snap = {
+					factory_id: "fac_t03",
+					current_version: "v1",
+					checked_at: "2026-11-28T12:00:00Z",
+					state: "running",
+					reason: "Running",
+					run: { run_id: "run-t03", attempt_id: "att-t03", bound_version: "v1" },
+					outcome: "incomplete",
+					settlement: "unsettled",
+					capacity_release: "held",
+					graph: {
+						evidence: "available",
+						bound_version: "v1",
+						topology: "graph",
+						nodes: [
+							{ id: "loop_node", kind: "agent", status: "succeeded", status_text: "Succeeded", current_attempt: { attempt_id: "l.3", attempt_number: 3, max_attempts: 5, instance_id: "i-l", process_state: "exited", resource_state: "closed" } },
+							{ id: "single_node", kind: "agent", status: "succeeded", status_text: "Succeeded", current_attempt: { attempt_id: "s.1", attempt_number: 1, max_attempts: 1, instance_id: "i-s", process_state: "exited", resource_state: "closed" } },
+							{ id: "mixed_node", kind: "agent", status: "running", status_text: "Running", current_attempt: { attempt_id: "m.3", attempt_number: 3, max_attempts: 4, instance_id: "i-m", process_state: "alive", resource_state: "released" } },
+						],
+						edges: [],
+					},
+				};
+
+				const appT03 = bootApp("?factory=fac_t03&view=live", async (url) => {
+					if (url === "/api/factories") return jsonResp(200, [{ factory_id: "fac_t03", name: "FacT03", current_version: "v1", management: "managed" }]);
+					if (url === "/api/factories/fac_t03/live") return jsonResp(200, snap);
+					if (url === "/api/factories/fac_t03/output?node=loop_node") {
+						return jsonResp(200, {
+							factory_id: "fac_t03",
+							node_id: "loop_node",
+							evidence: "available",
+							total_attempts: 22,
+							omitted_attempts: 2,
+							omitted_marker: "… [truncated, 2 attempts omitted]",
+							attempts: [
+								{
+									attempt_id: "l.22",
+									attempt_number: 22,
+									max_attempts: 25,
+									status: "succeeded",
+									status_text: "Succeeded",
+									evidence: "available",
+									summary: "Attempt 22 newest summary",
+									detail: "Attempt 22 detail",
+								},
+								{
+									attempt_id: "l.21",
+									attempt_number: 21,
+									max_attempts: 25,
+									status: "partial",
+									status_text: "Partial",
+									evidence: "available",
+									summary: "Attempt 21 older summary",
+									detail: "Attempt 21 detail",
+								},
+								{
+									attempt_id: "l.20",
+									attempt_number: 20,
+									max_attempts: 25,
+									status: "failed",
+									status_text: "Failed",
+									evidence: "available",
+									summary: "Attempt 20 oldest shown",
+									detail: "Attempt 20 detail",
+								},
+							],
+						});
+					}
+					if (url === "/api/factories/fac_t03/output?node=single_node") {
+						return jsonResp(200, {
+							factory_id: "fac_t03",
+							node_id: "single_node",
+							evidence: "available",
+							total_attempts: 1,
+							omitted_attempts: 0,
+							attempts: [
+								{
+									attempt_id: "s.1",
+									attempt_number: 1,
+									max_attempts: 1,
+									status: "succeeded",
+									status_text: "Succeeded",
+									evidence: "available",
+									summary: "Single attempt summary",
+									detail: "Single attempt detail",
+								},
+							],
+						});
+					}
+					if (url === "/api/factories/fac_t03/output?node=mixed_node") {
+						return jsonResp(200, {
+							factory_id: "fac_t03",
+							node_id: "mixed_node",
+							evidence: "not applicable",
+							total_attempts: 3,
+							omitted_attempts: 0,
+							attempts: [
+								{
+									attempt_id: "m.3",
+									attempt_number: 3,
+									max_attempts: 4,
+									status: "running",
+									status_text: "Running",
+									evidence: "not applicable",
+									absence: "not applicable",
+									explanation: "Attempt output is recorded when the attempt finishes.",
+								},
+								{
+									attempt_id: { absence: "evidence unavailable", explanation: "Attempt identity could not be verified." },
+									attempt_number: 1,
+									max_attempts: 4,
+									status: "needs_attention",
+									status_text: "Uncertain",
+									evidence: "unavailable",
+									absence: "evidence unavailable",
+									explanation: "Attempt 2 result record is damaged.",
+								},
+								{
+									attempt_id: "m.1",
+									attempt_number: 1,
+									max_attempts: 4,
+									status: "succeeded",
+									status_text: "Succeeded",
+									evidence: "available",
+									summary: "Attempt 1 survived",
+									detail: "Attempt 1 detail survived",
+								},
+							],
+						});
+					}
+					throw new Error(`Unexpected URL ${url}`);
+				});
+				await flushMicrotasks();
+
+				const clickNode = async (id: string) => {
+					const g = collectAllElements(appT03.content).find(e => e.getAttribute("data-node-id") === id)!;
+					for (const fn of g.listeners.get("click") ?? []) fn({});
+					await flushMicrotasks();
+				};
+				const getOutputSection = () => {
+					const h = collectAllElements(appT03.content).find(e => e.tagName === "h4" && e.textContent === "Attempt output")!;
+					return collectAllElements(appT03.content).find(e => e.tagName === "section" && e.children.some(c => c.children.includes(h)))!;
+				};
+
+				// 1. Multi-attempt node: 3 disclosures newest first, only newest open, older collapsed & keyboard-reachable summaries with h5 + tone chips + omitted marker
+				await clickNode("loop_node");
+				const loopSec = getOutputSection();
+				const loopDetails = collectAllElements(loopSec).filter(e => e.tagName === "details");
+				assert.equal(loopDetails.length, 3);
+				assert.equal(loopDetails[0]!.hasAttribute("open"), true, "Newest attempt disclosure must be open");
+				assert.equal(loopDetails[1]!.hasAttribute("open"), false, "Older attempt 21 must start collapsed");
+				assert.equal(loopDetails[2]!.hasAttribute("open"), false, "Older attempt 20 must start collapsed");
+				const headings = loopDetails.map(d => d.children[0] as FakeElement);
+				assert.match(headings[0]!.textContent, /Attempt 22 of 25.*✓ Succeeded/);
+				assert.match(headings[1]!.textContent, /Attempt 21 of 25.*◐ Partial/);
+				assert.match(headings[2]!.textContent, /Attempt 20 of 25.*✕ Failed/);
+				for (const summaryEl of headings) {
+					assert.equal(summaryEl.tagName, "summary");
+					assert.ok(collectAllElements(summaryEl).some(e => e.tagName === "h5"));
+					const chip = collectAllElements(summaryEl).find(e => e.classList.contains("chip"))!;
+					assert.ok(chip);
+					assert.ok(chip.classList.contains("lighten-5") || chip.classList.contains("lighten-4") || chip.classList.contains("lighten-3"));
+				}
+				assert.match(loopSec.textContent, /… \[truncated, 2 attempts omitted\]/);
+				// Older attempt body is present inside its collapsed <details> (one click away)
+				assert.match(loopDetails[1]!.textContent, /Attempt 21 older summary/);
+				loopDetails[1]!.setAttribute("open", "");
+				assert.equal(loopDetails[1]!.hasAttribute("open"), true);
+				appT03.assertSafeDom();
+
+				// 2. Single-attempt node: 1 disclosure, open
+				await clickNode("single_node");
+				const singleSec = getOutputSection();
+				const singleDetails = collectAllElements(singleSec).filter(e => e.tagName === "details");
+				assert.equal(singleDetails.length, 1);
+				assert.equal(singleDetails[0]!.hasAttribute("open"), true);
+				assert.equal(singleSec.textContent.includes("attempts omitted"), false);
+				appT03.assertSafeDom();
+
+				// 3. Mixed finished / unfinished / damaged attempts: each renders its own independent typed state
+				await clickNode("mixed_node");
+				const mixedSec = getOutputSection();
+				const mixedDetails = collectAllElements(mixedSec).filter(e => e.tagName === "details");
+				assert.equal(mixedDetails.length, 3);
+				assert.equal(mixedDetails[0]!.hasAttribute("open"), true);
+				assert.equal(mixedDetails[1]!.hasAttribute("open"), false);
+				assert.equal(mixedDetails[2]!.hasAttribute("open"), false);
+				assert.match(mixedDetails[0]!.textContent, /— Not applicable/);
+				assert.match(mixedDetails[0]!.textContent, /Attempt output is recorded when the attempt finishes\./);
+				assert.match(mixedDetails[1]!.textContent, /! Evidence unavailable/);
+				assert.match(mixedDetails[1]!.textContent, /Attempt 2 result record is damaged\./);
+				assert.match(mixedDetails[2]!.textContent, /Attempt 1 survived/);
+				appT03.assertSafeDom();
+			}
 		},
 	);
 });

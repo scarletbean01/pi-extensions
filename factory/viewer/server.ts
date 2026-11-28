@@ -8,7 +8,7 @@ import { parseVersionToken } from "../../bootstrap/factory-records.ts";
 import { factoryOperations, validateSubmissionReference, type Inspection, type ReleasedFactoryRun } from "../operations.ts";
 import { publicInspect } from "./inspect.ts";
 import { liveSnapshot } from "./live.ts";
-import { nodeOutputSnapshot } from "./output.ts";
+import { loadRetainedRunForOutput, nodeOutputSnapshot, type NodeOutputSnapshotOptions } from "./output.ts";
 import { absentProposalsSnapshot, proposalsSnapshot, unavailableProposalsSnapshot } from "./proposals.ts";
 import { queueSnapshot, receiptSnapshot, unavailableQueueSnapshot } from "./queue.ts";
 import { absentRequestsSnapshot, collectRequestBlockedPaths, createViewerDirectionReader, projectViewerDeletion, requestsSnapshot, sanitizeOperatorText, unavailableRequestsSnapshot } from "./requests.ts";
@@ -296,7 +296,25 @@ export async function startViewer(
               json(res, 400, { error: "Invalid node identifier" }); return;
             }
             const { inspection, releases } = inspectLive(id);
-            const outcome = nodeOutputSnapshot(id, nodeId, inspection, releases, blockedPaths);
+            const outputOpts: NodeOutputSnapshotOptions = {};
+            if (releases.length === 0) {
+              const retained = loadRetainedRunForOutput(
+                id,
+                nodeId,
+                inspection,
+                indexRoot,
+                version => op({ action: "inspect", factory_id: id, version }),
+              );
+              if (retained.kind === "not_found") {
+                json(res, 404, { error: "Node not found in displayed run" }); return;
+              }
+              if (retained.kind === "ready") {
+                outputOpts.retainedRelease = retained.release;
+              } else if (retained.kind === "unavailable") {
+                outputOpts.retainedError = retained.explanation;
+              }
+            }
+            const outcome = nodeOutputSnapshot(id, nodeId, inspection, releases, blockedPaths, outputOpts);
             if (outcome.kind === "not_found") {
               json(res, 404, { error: outcome.error }); return;
             }
