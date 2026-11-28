@@ -15,17 +15,8 @@ function splitTrailingSentencePunctuation(token: string): { core: string; traili
 	return { core: match[1], trailing: match[2] };
 }
 
-/**
- * Normalize, path-scrub, and code-point length-bound operator-facing text so store/checkout/home paths
- * and unsafe control/bidi characters never leak. Note: genuinely path-like question text (tokens
- * starting with `/`, `~`, `file://`, or a drive letter) is conservatively redacted to `[redacted-path]`.
- */
-export function sanitizeOperatorText(value: string, maxChars: number, blockedPaths: readonly string[] = []): string {
-	let cleaned = value
-		.replace(/[\r\n\t]+/g, " ")
-		.replace(CONTROL_AND_FORMAT_RE, " [ctrl] ")
-		.replace(/\s+/g, " ")
-		.trim();
+function scrubBlockedAndGenericPaths(text: string, blockedPaths: readonly string[]): string {
+	let cleaned = text;
 	const uniquePaths = [...new Set(
 		blockedPaths
 			.filter(p => typeof p === "string" && p.length > 1)
@@ -40,16 +31,73 @@ export function sanitizeOperatorText(value: string, maxChars: number, blockedPat
 			return `[redacted-path]${trailing}`;
 		});
 	}
-	cleaned = cleaned.replace(GENERIC_PATH_RE, (_full, lead: string, token: string) => {
+	return cleaned.replace(GENERIC_PATH_RE, (_full, lead: string, token: string) => {
 		const { trailing } = splitTrailingSentencePunctuation(token);
 		return `${lead}[redacted-path]${trailing}`;
 	});
+}
+
+function truncateWithOmissionMarker(codePoints: string[], maxChars: number): string {
+	if (maxChars <= 0) return "";
+	const total = codePoints.length;
+	if (total <= maxChars) return codePoints.join("");
+	let kept = Math.max(0, maxChars - 40);
+	for (let i = 0; i < 4; i++) {
+		const omitted = total - kept;
+		const marker = `… [truncated, ${omitted} character${omitted === 1 ? "" : "s"} omitted]`;
+		const markerLen = Array.from(marker).length;
+		if (markerLen >= maxChars) {
+			return maxChars === 1 ? "…" : `${codePoints.slice(0, maxChars - 1).join("")}…`;
+		}
+		const nextKept = maxChars - markerLen;
+		if (nextKept === kept) {
+			return `${codePoints.slice(0, kept).join("")}${marker}`;
+		}
+		kept = nextKept;
+	}
+	const omitted = total - kept;
+	const marker = `… [truncated, ${omitted} character${omitted === 1 ? "" : "s"} omitted]`;
+	return `${codePoints.slice(0, kept).join("")}${marker}`;
+}
+
+/**
+ * Normalize, path-scrub, and code-point length-bound operator-facing text so store/checkout/home paths
+ * and unsafe control/bidi characters never leak. Note: genuinely path-like question text (tokens
+ * starting with `/`, `~`, `file://`, or a drive letter) is conservatively redacted to `[redacted-path]`.
+ */
+export function sanitizeOperatorText(value: string, maxChars: number, blockedPaths: readonly string[] = []): string {
+	const normalized = value
+		.toWellFormed()
+		.replace(/[\r\n\t]+/g, " ")
+		.replace(CONTROL_AND_FORMAT_RE, " [ctrl] ")
+		.replace(/\s+/g, " ")
+		.trim();
+	const cleaned = scrubBlockedAndGenericPaths(normalized, blockedPaths);
 	const codePoints = Array.from(cleaned);
 	if (maxChars <= 0) return "";
 	if (codePoints.length > maxChars) {
 		return maxChars === 1 ? "…" : `${codePoints.slice(0, maxChars - 1).join("")}…`;
 	}
 	return cleaned;
+}
+
+/**
+ * Scrub control/bidi/zero-width characters and blocked or generic absolute paths while preserving line breaks,
+ * then bound by Unicode code points with an explicit omission-count marker without splitting surrogate pairs.
+ */
+export function sanitizeOutputText(value: string, maxChars: number, blockedPaths: readonly string[] = []): string {
+	const normalized = value
+		.toWellFormed()
+		.replace(/\r\n?/g, "\n")
+		.replace(CONTROL_AND_FORMAT_RE, (match, offset: number, whole: string) => {
+			const before = offset > 0 ? whole[offset - 1]! : "";
+			const after = offset + match.length < whole.length ? whole[offset + match.length]! : "";
+			const padLeft = before !== "" && !/\s/.test(before) ? " " : "";
+			const padRight = after !== "" && !/\s/.test(after) ? " " : "";
+			return `${padLeft}[ctrl]${padRight}`;
+		});
+	const cleaned = scrubBlockedAndGenericPaths(normalized, blockedPaths);
+	return truncateWithOmissionMarker(Array.from(cleaned), maxChars);
 }
 
 export interface ViewerDeletionSummary {

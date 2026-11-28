@@ -361,6 +361,22 @@
     );
   }
 
+  function outputApiUrl(factoryId, nodeId) {
+    if (typeof factoryId !== "string" || !VALID_ID.test(factoryId)) return null;
+    if (typeof nodeId !== "string" || !VALID_ID.test(nodeId)) return null;
+    return `/api/factories/${encodeURIComponent(factoryId)}/output?node=${encodeURIComponent(nodeId)}`;
+  }
+
+  function matchesSelectedOutputTarget(data, selectedFactoryId, selectedNodeId) {
+    return Boolean(
+      matchesSelectedFactory(data, selectedFactoryId)
+      && typeof selectedNodeId === "string"
+      && selectedNodeId.length > 0
+      && typeof data.node_id === "string"
+      && data.node_id === selectedNodeId
+    );
+  }
+
   function resolveStopStateValue(stop) {
     if (isAbsenceObject(stop)) {
       return { kind: "absence", value: stop };
@@ -833,6 +849,8 @@
     resolveLiveBoundVersionAbsence,
     safeNodeDomId,
     matchesSelectedFactory,
+    outputApiUrl,
+    matchesSelectedOutputTarget,
     resolveStopStateValue,
     resolveInspectOverallEvidence,
     resolveBooleanVerification,
