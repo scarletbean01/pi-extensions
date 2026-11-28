@@ -5,7 +5,9 @@ import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import type test from "node:test";
+import { outcomeClaimPath } from "../cancellation.ts";
 import { createRequest, inTransaction, openRequestDatabase } from "../factory-requests.ts";
+import { handoffClaimPath, inputDigest } from "../handoff.ts";
 import { buildProposalRow, insertProposalRow } from "../constraint-proposals.ts";
 import { atomicJson, completionRecord, readJson, readyPath, resultPath, type WorkerConfig } from "../session-store.ts";
 import { BootstrapService, type ExecResult, type GenerateRequest } from "../lifecycle.ts";
@@ -22,6 +24,7 @@ export interface ManualAcceptanceFixture {
 	env: NodeJS.ProcessEnv;
 	factories: {
 		alphaLiveV2: string;
+		attemptOutput: string;
 		betaUnreleased: string;
 		gammaUncertain: string;
 		deltaUnmanaged: string;
@@ -44,6 +47,14 @@ export interface ManualAcceptanceFixture {
 		rightAttemptId: string;
 		reviewInstanceId: string;
 		mergeInstanceId: string;
+		attemptOutput: {
+			taskId: string;
+			attemptHistoryInstanceId: string;
+			commandExitInstanceId: string;
+			commandSignalInstanceId: string;
+			missingResultInstanceId: string;
+			stillRunningInstanceId: string;
+		};
 	};
 	sentinels: string[];
 	cleanup: () => void;
@@ -314,6 +325,222 @@ export async function createManualAcceptanceFixture(
 		reqDb.close();
 	}
 
+	// Dedicated manual Attempt output run. Keep the existing five-scenario fixture unchanged;
+	// this separate checkout has three finished attempts in an unfinalized review loop, so both members stay parked.
+	const outputCwd = join(root, "project-attempt-output");
+	mkdirSync(join(outputCwd, ".pi", "agents"), { recursive: true });
+	mkdirSync(join(outputCwd, "extensions"), { recursive: true });
+	writeFileSync(join(outputCwd, ".pi", "agents", "builder.md"), "---\nname: builder\ntools: read,bash\n---\nFixture persona builder\n");
+	writeFileSync(join(outputCwd, ".pi", "agents", "reviewer.md"), "---\nname: reviewer\ntools: read,bash\n---\nFixture persona reviewer\n");
+	writeFileSync(join(outputCwd, "extensions", "coms.ts"), "export default function () {}\n");
+	const outputDraft: GenerateRequest = {
+		project_cwd: outputCwd,
+		topology: "graph",
+		task: "SENTINEL_MANUAL_OUTPUT_PROMPT",
+		agents: [
+			{ node_id: "attempt_history", persona: "builder", sub_task: "SENTINEL_MANUAL_OUTPUT_SUB_HISTORY" },
+			{
+				node_id: "attempt_review",
+				persona: "reviewer",
+				depends_on: ["attempt_history"],
+				sub_task: "SENTINEL_MANUAL_OUTPUT_SUB_REVIEW",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "changes_requested"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "changes_requested", on_reject: "attempt_history", max_revisions: 2, on_exhausted: "needs_attention" },
+			},
+			{ node_id: "command_exit", kind: "command", command: "fixture-fake-command", args: ["--recorded-exit"], working_directory: outputCwd, sub_task: "SENTINEL_MANUAL_OUTPUT_SUB_COMMAND_EXIT" },
+			{ node_id: "command_signal", kind: "command", command: "fixture-fake-signal-command", args: ["--recorded-signal"], working_directory: outputCwd, sub_task: "SENTINEL_MANUAL_OUTPUT_SUB_COMMAND_SIGNAL" },
+			{ node_id: "missing_result", persona: "builder", sub_task: "SENTINEL_MANUAL_OUTPUT_SUB_MISSING" },
+			{ node_id: "still_running", persona: "builder", sub_task: "SENTINEL_MANUAL_OUTPUT_SUB_RUNNING" },
+		],
+	};
+	const outputFactory = ops({ action: "publish", name: "attempt-output-manual", draft: outputDraft, sessionModel });
+	const authOutput = createManagerAuthority({ pi_session_id: "manual-attempt-output" });
+	ops({ action: "resume", factory_id: outputFactory.factory_id, authority: authOutput });
+	ops({ action: "submit", factory_id: outputFactory.factory_id, authority: authOutput, reference: "ref-attempt-output", brief: "SENTINEL_MANUAL_OUTPUT_BRIEF" });
+	const outputRun = await ops({ action: "launch", factory_id: outputFactory.factory_id, authority: authOutput });
+	checkAborted();
+	revokeManagerAuthority(authOutput);
+	const outputDir = outputRun.manifest.session_dir;
+	const outputEntry = (nodeId: string) => outputRun.manifest.pane_manifest.find(entry => entry.node_id === nodeId)!;
+	const historyEntry = outputEntry("attempt_history");
+	const reviewEntryOutput = outputEntry("attempt_review");
+	const historyCfg = readJson<WorkerConfig>(join(outputDir, `${historyEntry.instance_id}.config.json`));
+	const reviewCfgOutput = readJson<WorkerConfig>(join(outputDir, `${reviewEntryOutput.instance_id}.config.json`));
+	const attemptTimes = ["2026-11-28T10:00:01.000Z", "2026-11-28T10:00:02.000Z", "2026-11-28T10:00:03.000Z"];
+	const historyInputDigests = new Map<number, string>();
+	const structuredPathSample = "/fixture-only/structured/review.json";
+	const structuredWrapSample = `STRUCTUREDCHECK${"s".repeat(640)}`;
+	const historyResults = [
+		{ status: "failure" as const, summary: "Attempt 1 found two synthetic checks to fix." },
+		{ status: "partial" as const, summary: "Attempt 2 fixed one check; one synthetic warning remains." },
+		{ status: "success" as const, summary: "Attempt 3 completed the fixture review successfully." },
+	];
+	for (let index = 0; index < historyResults.length; index++) {
+		const attemptNumber = index + 1;
+		const attemptId = `${historyEntry.instance_id}.${attemptNumber}`;
+		const resultMeta = historyResults[index]!;
+		const detail = [
+			`Attempt ${attemptNumber} detail line one: synthetic review fixture only.`,
+			`Attempt ${attemptNumber} detail line two: fake absolute path /fixture-only/review/attempt-${attemptNumber}.json.`,
+			...(attemptNumber === 3 ? [`Bidirectional scrub sample: left\u202Eright.`] : [`Attempt ${attemptNumber} detail line three: readable on a narrow panel.`]),
+			`Unbroken wrap sample ${attemptNumber}: WRAPCHECK${attemptNumber}${"x".repeat(640)}`,
+		].join("\n");
+		const config = { ...historyCfg, attempt_id: attemptId };
+		const completedAt = attemptTimes[index]!;
+		const historyCompletion = completionRecord(config, {
+			agent_name: historyEntry.persona_name,
+			node_id: "attempt_history",
+			status: resultMeta.status,
+			summary: resultMeta.summary,
+			detail,
+			verification: [{
+				check_id: `fixture-check-${attemptNumber}`,
+				result: attemptNumber === 1 ? "fail" : "pass",
+				attempt_id: attemptId,
+				completed_at: completedAt,
+				scope_kind: "declared",
+				applicability: "current",
+				reason: `Synthetic verification for attempt ${attemptNumber}.`,
+			}],
+			warnings: [attemptNumber === 3
+				? `Synthetic warning path ${structuredPathSample}; WRAPWARNING${"w".repeat(640)}`
+				: `Synthetic warning recorded for attempt ${attemptNumber}.`],
+			next_steps: [attemptNumber === 3
+				? `Review the fixture path ${structuredPathSample}; WRAPNEXTSTEP${"n".repeat(640)}`
+				: `Review the fixture's attempt ${attemptNumber} notes.`],
+			outputs: {
+				review_iteration: attemptNumber,
+				outcome: resultMeta.status,
+				fixture_only: true,
+				...(attemptNumber === 3 ? { sample_path: structuredPathSample, wrap_sample: structuredWrapSample } : {}),
+			},
+		}, "sent", completedAt);
+		atomicJson(resultPath(outputDir, attemptId), historyCompletion);
+		historyInputDigests.set(attemptNumber, inputDigest(historyCompletion.result));
+
+		const reviewAttemptId = `${reviewEntryOutput.instance_id}.${attemptNumber}`;
+		const reviewConfig = { ...reviewCfgOutput, attempt_id: reviewAttemptId };
+		atomicJson(resultPath(outputDir, reviewAttemptId), completionRecord(reviewConfig, {
+			agent_name: reviewEntryOutput.persona_name,
+			node_id: "attempt_review",
+			status: "success",
+			summary: attemptNumber < 3 ? `Synthetic review ${attemptNumber} requested a revision.` : "Synthetic review 3 approved the completed fixture.",
+			detail: `Review-loop fixture iteration ${attemptNumber}.`,
+			outputs: { verdict: attemptNumber < 3 ? "changes_requested" : "approve" },
+		}, "sent", completedAt));
+	}
+
+	const writeReviewHandoffClaim = (
+		destination: typeof historyEntry | typeof reviewEntryOutput,
+		destinationAttempt: number,
+		source: typeof historyEntry | typeof reviewEntryOutput,
+		sourceAttempt: number,
+		handoffId: string,
+		digest = "0".repeat(64),
+	) => atomicJson(handoffClaimPath(outputDir, `${destination.instance_id}.${destinationAttempt}`, source.instance_id), {
+		version: 1,
+		handoff_id: handoffId,
+		state: "accepted",
+		run_id: outputRun.task_id,
+		source: { node_id: source.node_id, attempt_id: `${source.instance_id}.${sourceAttempt}`, instance_id: source.instance_id, session_id: `session-${source.instance_id}` },
+		destination: { node_id: destination.node_id, attempt_id: `${destination.instance_id}.${destinationAttempt}`, instance_id: destination.instance_id },
+		input_digest: digest,
+		offer: "matched",
+		accepted_at: attemptTimes[destinationAttempt - 1]!,
+	});
+	for (const attemptNumber of [2, 3]) {
+		atomicJson(join(outputDir, `${reviewEntryOutput.instance_id}.${attemptNumber}.revision.json`), {
+			version: 1,
+			run_id: outputRun.task_id,
+			reviewer: reviewEntryOutput.instance_id,
+			attempt: attemptNumber,
+		});
+		writeReviewHandoffClaim(historyEntry, attemptNumber, reviewEntryOutput, attemptNumber - 1, `manual-feedback-${attemptNumber}`);
+		writeReviewHandoffClaim(
+			reviewEntryOutput,
+			attemptNumber,
+			historyEntry,
+			attemptNumber,
+			`manual-review-${attemptNumber}`,
+			historyInputDigests.get(attemptNumber)!,
+		);
+	}
+	writeReviewHandoffClaim(reviewEntryOutput, 1, historyEntry, 1, "manual-review-1", historyInputDigests.get(1)!);
+
+	const commandExitEntry = outputEntry("command_exit");
+	const commandExitCfg = readJson<WorkerConfig>(join(outputDir, `${commandExitEntry.instance_id}.config.json`));
+	const commandExitEvidence = {
+		version: 1 as const,
+		command: commandExitEntry.command!,
+		args: commandExitEntry.args ?? [],
+		working_directory: commandExitEntry.working_directory!,
+		exit_code: 17,
+		signal: null,
+		started_at: "2026-11-28T10:01:00.000Z",
+		finished_at: "2026-11-28T10:01:01.000Z",
+		duration_ms: 1000,
+		stdout_bytes: Buffer.byteLength(`fixture stdout: three synthetic checks\nFake path ${structuredPathSample}\nWRAPCOMMAND${"c".repeat(640)}\n`),
+		stderr_bytes: Buffer.byteLength("fixture stderr: expected sample failure\n"),
+		stdout_excerpt: `fixture stdout: three synthetic checks\nFake path ${structuredPathSample}\nWRAPCOMMAND${"c".repeat(640)}\n`,
+		stderr_excerpt: "fixture stderr: expected sample failure\n",
+	};
+	atomicJson(resultPath(outputDir, commandExitEntry.attempt_id!), completionRecord(commandExitCfg, {
+		agent_name: commandExitEntry.persona_name,
+		node_id: "command_exit",
+		status: "failure",
+		summary: "Synthetic command evidence records exit code 17.",
+		detail: "Fixture-only command output; no command was run.",
+		command_evidence: commandExitEvidence,
+	}, "not_required", "2026-11-28T10:01:01.000Z"));
+
+	const commandSignalEntry = outputEntry("command_signal");
+	const commandSignalCfg = readJson<WorkerConfig>(join(outputDir, `${commandSignalEntry.instance_id}.config.json`));
+	atomicJson(resultPath(outputDir, commandSignalEntry.attempt_id!), completionRecord(commandSignalCfg, {
+		agent_name: commandSignalEntry.persona_name,
+		node_id: "command_signal",
+		status: "failure",
+		summary: "Synthetic command evidence records SIGTERM.",
+		detail: "Fixture-only signal sample; no command was run.",
+		command_evidence: {
+			version: 1,
+			command: commandSignalEntry.command!,
+			args: commandSignalEntry.args ?? [],
+			working_directory: commandSignalEntry.working_directory!,
+			exit_code: null,
+			signal: "SIGTERM",
+			started_at: "2026-11-28T10:02:00.000Z",
+			finished_at: "2026-11-28T10:02:01.000Z",
+			duration_ms: 1000,
+			stdout_bytes: Buffer.byteLength("fixture stdout before signal\n"),
+			stderr_bytes: Buffer.byteLength("fixture stderr before signal\n"),
+			stdout_excerpt: "fixture stdout before signal\n",
+			stderr_excerpt: "fixture stderr before signal\n",
+		},
+	}, "not_required", "2026-11-28T10:02:01.000Z"));
+
+	const missingResultEntry = outputEntry("missing_result");
+	atomicJson(outcomeClaimPath(outputDir, `${missingResultEntry.instance_id}.1`), {
+		version: 1,
+		identity: {
+			run_id: outputRun.task_id,
+			node_id: "missing_result",
+			persona_name: missingResultEntry.persona_name,
+			attempt_id: missingResultEntry.attempt_id!,
+			instance_id: missingResultEntry.instance_id,
+		},
+		outcome: "completed",
+		claimed_at: "2026-11-28T10:03:00.000Z",
+	});
+	const stillRunningEntry = outputEntry("still_running");
+	const runningNow = Date.now();
+	atomicJson(join(outputDir, `${stillRunningEntry.instance_id}.progress.json`), {
+		attempt_id: stillRunningEntry.attempt_id,
+		token: outputRun.manifest.token,
+		started_at: runningNow - 2_000,
+		updated_at: runningNow,
+		state: "working",
+	});
+
 	// 2. beta-unreleased: reserved (unreleased) launch attempt on a second checkout (Scenario 2 blocked, never running).
 	const betaCwd = join(root, "project-beta");
 	mkdirSync(join(betaCwd, ".pi", "agents"), { recursive: true });
@@ -448,6 +675,16 @@ export async function createManualAcceptanceFixture(
 		"SENTINEL_MANUAL_SUB_REVIEW",
 		"SENTINEL_MANUAL_SUB_MERGE",
 		"SENTINEL_MANUAL_SUB_V3",
+		"SENTINEL_MANUAL_OUTPUT_PROMPT",
+		"SENTINEL_MANUAL_OUTPUT_SUB_HISTORY",
+		"SENTINEL_MANUAL_OUTPUT_SUB_REVIEW",
+		"SENTINEL_MANUAL_OUTPUT_SUB_COMMAND_EXIT",
+		"SENTINEL_MANUAL_OUTPUT_SUB_COMMAND_SIGNAL",
+		"SENTINEL_MANUAL_OUTPUT_SUB_MISSING",
+		"SENTINEL_MANUAL_OUTPUT_SUB_RUNNING",
+		"SENTINEL_MANUAL_OUTPUT_BRIEF",
+		"fixture-fake-command",
+		"fixture-fake-signal-command",
 		"SENTINEL_MANUAL_BRIEF_V1",
 		"SENTINEL_MANUAL_BRIEF_V2",
 		"SENTINEL_MANUAL_BETA_PROMPT",
@@ -465,6 +702,7 @@ export async function createManualAcceptanceFixture(
 		"SENTINEL_MANUAL_EPS_BRIEF_V2",
 		root,
 		cwd,
+		outputCwd,
 		betaCwd,
 		gammaCwd,
 		epsCwd,
@@ -480,6 +718,7 @@ export async function createManualAcceptanceFixture(
 		env,
 		factories: {
 			alphaLiveV2: alpha.factory_id,
+			attemptOutput: outputFactory.factory_id,
 			betaUnreleased: beta.factory_id,
 			gammaUncertain: gamma.factory_id,
 			deltaUnmanaged: delta.factory_id,
@@ -502,6 +741,14 @@ export async function createManualAcceptanceFixture(
 			rightAttemptId,
 			reviewInstanceId: reviewCfg.instance_id,
 			mergeInstanceId: mergeCfg.instance_id,
+			attemptOutput: {
+				taskId: outputRun.task_id,
+				attemptHistoryInstanceId: historyEntry.instance_id,
+				commandExitInstanceId: commandExitEntry.instance_id,
+				commandSignalInstanceId: commandSignalEntry.instance_id,
+				missingResultInstanceId: missingResultEntry.instance_id,
+				stillRunningInstanceId: stillRunningEntry.instance_id,
+			},
 		},
 		sentinels,
 		cleanup,
@@ -678,6 +925,7 @@ async function runCli() {
 		console.log(`PID: ${process.pid}`);
 		console.log(`Temp root (deleted on exit): ${fixture.root}`);
 		console.log(`  Scenario 1/4/5 (alpha, v2 running / v3 current): ${viewer.url}/?factory=${fixture.factories.alphaLiveV2}&view=live`);
+		console.log(`  Attempt output (review history and commands):    ${viewer.url}/?factory=${fixture.factories.attemptOutput}&view=live`);
 		console.log(`  Scenario 2a    (beta, reserved/blocked):         ${viewer.url}/?factory=${fixture.factories.betaUnreleased}&view=live`);
 		console.log(`  Scenario 2b/3  (gamma, contradictory/uncertain): ${viewer.url}/?factory=${fixture.factories.gammaUncertain}&view=live`);
 		console.log(`  Scenario 3/4   (delta, unmanaged/blocked):       ${viewer.url}/?factory=${fixture.factories.deltaUnmanaged}&view=live`);
