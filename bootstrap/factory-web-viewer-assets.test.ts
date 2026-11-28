@@ -2740,6 +2740,212 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				assert.match(appN1Abort.content.textContent, /Re-fetched after abort/);
 				appN1Abort.assertSafeDom();
 			}
+
+			// K. Ticket 02 Attempt output UI: verification/warnings/next_steps + omitted markers, command exit/signal/stdout/stderr side by side, collapsed structured outputs & artifacts without paths, disposition reason & recorded error, real headings & native disclosures
+			{
+				const snap = {
+					factory_id: "fac_t02",
+					current_version: "v1",
+					checked_at: "2026-11-28T12:00:00Z",
+					state: "running",
+					reason: "Running",
+					run: { run_id: "run-t02", attempt_id: "att-t02", bound_version: "v1" },
+					outcome: "incomplete",
+					settlement: "unsettled",
+					capacity_release: "held",
+					graph: {
+						evidence: "available",
+						bound_version: "v1",
+						topology: "graph",
+						nodes: [
+							{ id: "rich", kind: "agent", status: "succeeded", status_text: "Succeeded", current_attempt: { attempt_id: "r.1", attempt_number: 1, max_attempts: 1, instance_id: "i-r", process_state: "exited", resource_state: "closed" } },
+							{ id: "cmd", kind: "command", status: "failed", status_text: "Failed", current_attempt: { attempt_id: "c.1", attempt_number: 1, max_attempts: 1, instance_id: "i-c", process_state: "exited", resource_state: "closed" } },
+							{ id: "blk", kind: "agent", status: "blocked", status_text: "Blocked", current_attempt: { attempt_id: "b.1", attempt_number: 1, max_attempts: 1, instance_id: "i-b", process_state: "not_started", resource_state: "open" } },
+							{ id: "err", kind: "agent", status: "needs_attention", status_text: "Uncertain", current_attempt: { attempt_id: "e.1", attempt_number: 1, max_attempts: 1, instance_id: "i-e", process_state: "exited", resource_state: "closed" } },
+						],
+						edges: [],
+					},
+				};
+
+				const appT02 = bootApp("?factory=fac_t02&view=live", async (url) => {
+					if (url === "/api/factories") return jsonResp(200, [{ factory_id: "fac_t02", name: "FacT02", current_version: "v1", management: "managed" }]);
+					if (url === "/api/factories/fac_t02/live") return jsonResp(200, snap);
+					if (url === "/api/factories/fac_t02/output?node=rich") {
+						return jsonResp(200, {
+							factory_id: "fac_t02",
+							node_id: "rich",
+							evidence: "available",
+							latest_attempt: {
+								attempt_id: "r.1",
+								attempt_number: 1,
+								max_attempts: 1,
+								status: "succeeded",
+								status_text: "Succeeded",
+								evidence: "available",
+								summary: "Rich summary",
+								detail: "Rich detail",
+								verification: {
+									items: [
+										{ check_id: "unit-tests", result: "pass", applicability: "current", scope_kind: "declared", reason: "All green" },
+										{ check_id: "lint", result: "fail", applicability: "stale", scope_kind: "declared", reason: "Lint <script>xss</script>" },
+										{ check_id: "audit", result: "error", applicability: "unknown", scope_kind: "conservative" },
+									],
+									total_count: 22,
+									omitted_count: 19,
+									omitted_marker: "… [truncated, 19 items omitted]",
+								},
+								warnings: {
+									items: ["Warn <img src=x>", "Warn 2"],
+									total_count: 21,
+									omitted_count: 19,
+									omitted_marker: "… [truncated, 19 items omitted]",
+								},
+								next_steps: {
+									items: ["Step 1\nindented"],
+									total_count: 21,
+									omitted_count: 20,
+									omitted_marker: "… [truncated, 20 items omitted]",
+								},
+								outputs_text: "{\n  \"verdict\": \"ok\",\n  \"raw\": \"<b>not html</b>\"\n}",
+								artifacts: {
+									items: [
+										{ type: "file", action: "created", description: "Bundle description without path" },
+										{ type: "file", action: "modified", description: "Missing file", missing: true },
+									],
+									total_count: 2,
+									omitted_count: 0,
+								},
+							},
+						});
+					}
+					if (url === "/api/factories/fac_t02/output?node=cmd") {
+						return jsonResp(200, {
+							factory_id: "fac_t02",
+							node_id: "cmd",
+							evidence: "available",
+							latest_attempt: {
+								attempt_id: "c.1",
+								attempt_number: 1,
+								max_attempts: 1,
+								status: "failed",
+								status_text: "Failed",
+								evidence: "available",
+								summary: "Cmd failed",
+								detail: "Exit 2",
+								command: {
+									exit_code: 2,
+									signal: "SIGTERM",
+									duration_ms: 420,
+									stdout_bytes: 10,
+									stderr_bytes: 20,
+									stdout_excerpt: "stdout line 1\nstdout line 2",
+									stderr_excerpt: "stderr line 1\n<script>bad()</script>",
+								},
+							},
+						});
+					}
+					if (url === "/api/factories/fac_t02/output?node=blk") {
+						return jsonResp(200, {
+							factory_id: "fac_t02",
+							node_id: "blk",
+							evidence: "not applicable",
+							latest_attempt: {
+								attempt_id: "b.1",
+								attempt_number: 1,
+								max_attempts: 1,
+								status: "blocked",
+								status_text: "Blocked",
+								evidence: "not applicable",
+								absence: "not applicable",
+								explanation: "No attempt result was recorded (blocked).",
+								disposition_reason: "Upstream node cmd failed",
+								causes: {
+									items: [{ node_id: "cmd", state: "failed", reason: "Exit code 2" }],
+									total_count: 1,
+									omitted_count: 0,
+								},
+							},
+						});
+					}
+					if (url === "/api/factories/fac_t02/output?node=err") {
+						return jsonResp(200, {
+							factory_id: "fac_t02",
+							node_id: "err",
+							evidence: "unavailable",
+							latest_attempt: {
+								attempt_id: "e.1",
+								attempt_number: 1,
+								max_attempts: 1,
+								status: "needs_attention",
+								status_text: "Uncertain",
+								evidence: "unavailable",
+								absence: "evidence unavailable",
+								explanation: "The attempt recorded an execution error without a verified result.",
+								error_message: "Worker crashed <err>",
+							},
+						});
+					}
+					throw new Error(`Unexpected URL ${url}`);
+				});
+				await flushMicrotasks();
+
+				const clickNode = async (id: string) => {
+					const g = collectAllElements(appT02.content).find(e => e.getAttribute("data-node-id") === id)!;
+					for (const fn of g.listeners.get("click") ?? []) fn({});
+					await flushMicrotasks();
+				};
+
+				// 1. Rich node: verification, warnings, next_steps, collapsed structured outputs & artifacts with real headings
+				const getOutputSection = () => {
+					const h = collectAllElements(appT02.content).find(e => e.tagName === "h4" && e.textContent === "Attempt output")!;
+					return collectAllElements(appT02.content).find(e => e.tagName === "section" && e.children.some(c => c.children.includes(h)))!;
+				};
+
+				await clickNode("rich");
+				const outSection = getOutputSection();
+				const detailsEls = collectAllElements(outSection).filter(e => e.tagName === "details");
+				assert.equal(detailsEls.length, 3, "Expected attempt, structured outputs, and artifacts disclosures");
+				assert.equal(detailsEls[0]!.hasAttribute("open"), true, "Latest attempt disclosure must be open");
+				assert.equal(detailsEls[1]!.hasAttribute("open"), false, "Structured outputs disclosure must start collapsed");
+				assert.equal(detailsEls[2]!.hasAttribute("open"), false, "Artifacts disclosure must start collapsed");
+				assert.ok(collectAllElements(detailsEls[0]!.children[0] as FakeElement).some(e => e.tagName === "h5"), "Attempt summary must contain real h5 heading");
+				assert.ok(collectAllElements(detailsEls[1]!.children[0] as FakeElement).some(e => e.tagName === "h6"), "Structured outputs summary must contain real h6 heading");
+				assert.ok(collectAllElements(detailsEls[2]!.children[0] as FakeElement).some(e => e.tagName === "h6"), "Artifacts summary must contain real h6 heading");
+				assert.match(outSection.textContent, /… \[truncated, 19 items omitted\]/);
+				assert.match(outSection.textContent, /… \[truncated, 20 items omitted\]/);
+				assert.match(outSection.textContent, /"verdict": "ok"/);
+				assert.match(outSection.textContent, /Bundle description without path/);
+				assert.ok(collectTextNodes(outSection).some(t => t.includes("Lint <script>xss</script>")));
+				assert.ok(collectTextNodes(outSection).some(t => t.includes("Warn <img src=x>")));
+				appT02.assertSafeDom();
+
+				// 2. Command node: exit code, signal, stdout & stderr side by side
+				await clickNode("cmd");
+				const cmdOutSection = getOutputSection();
+				assert.match(cmdOutSection.textContent, /Command output/);
+				assert.match(cmdOutSection.textContent, /Exit code2/);
+				assert.match(cmdOutSection.textContent, /SignalSIGTERM/);
+				assert.match(cmdOutSection.textContent, /stdout line 1\nstdout line 2/);
+				assert.ok(collectTextNodes(cmdOutSection).some(t => t.includes("stderr line 1\n<script>bad()</script>")));
+				appT02.assertSafeDom();
+
+				// 3. Blocked disposition node: disposition_reason and causes
+				await clickNode("blk");
+				const blkOutSection = getOutputSection();
+				assert.match(blkOutSection.textContent, /— Not applicable/);
+				assert.match(blkOutSection.textContent, /Disposition reason/);
+				assert.match(blkOutSection.textContent, /Upstream node cmd failed/);
+				assert.match(blkOutSection.textContent, /Exit code 2/);
+				appT02.assertSafeDom();
+
+				// 4. Error node: recorded error message
+				await clickNode("err");
+				const errOutSection = getOutputSection();
+				assert.match(errOutSection.textContent, /! Evidence unavailable/);
+				assert.match(errOutSection.textContent, /Recorded error/);
+				assert.ok(collectTextNodes(errOutSection).some(t => t.includes("Worker crashed <err>")));
+				appT02.assertSafeDom();
+			}
 		},
 	);
 });

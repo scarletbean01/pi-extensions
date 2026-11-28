@@ -1014,6 +1014,20 @@ test("Materialize guard: every served shell and emitted class exists in material
 						evidence: "available",
 						summary: "Left summary",
 						detail: "Line 1\nLine 2",
+						verification: {
+							items: [
+								{ check_id: "tests", result: "pass", applicability: "current", scope_kind: "declared" },
+								{ check_id: "lint", result: "fail", applicability: "stale", scope_kind: "declared", reason: "Lint failed" },
+								{ check_id: "sec", result: "error", applicability: "unknown", scope_kind: "conservative" },
+							],
+							total_count: 3,
+							omitted_count: 0,
+						},
+						warnings: { items: ["Warn 1"], total_count: 1, omitted_count: 0 },
+						next_steps: { items: ["Step 1"], total_count: 1, omitted_count: 0 },
+						command: { exit_code: 0, signal: null, duration_ms: 100, stdout_bytes: 5, stderr_bytes: 0, stdout_excerpt: "ok", stderr_excerpt: "" },
+						outputs_text: "{\n  \"ok\": true\n}",
+						artifacts: { items: [{ type: "file", action: "created", description: "Bundle", missing: true }], total_count: 1, omitted_count: 0 },
 					},
 				},
 			};
@@ -1477,6 +1491,20 @@ test("Materialize Slice 2 components: chips, card-panel banners, cards, dl.row f
 						evidence: "available",
 						summary: "Left summary",
 						detail: "Line 1\nLine 2",
+						verification: {
+							items: [
+								{ check_id: "tests", result: "pass", applicability: "current", scope_kind: "declared" },
+								{ check_id: "lint", result: "fail", applicability: "stale", scope_kind: "declared", reason: "Lint failed" },
+								{ check_id: "sec", result: "error", applicability: "unknown", scope_kind: "conservative" },
+							],
+							total_count: 3,
+							omitted_count: 0,
+						},
+						warnings: { items: ["Warn 1"], total_count: 1, omitted_count: 0 },
+						next_steps: { items: ["Step 1"], total_count: 1, omitted_count: 0 },
+						command: { exit_code: 0, signal: null, duration_ms: 100, stdout_bytes: 5, stderr_bytes: 0, stdout_excerpt: "ok", stderr_excerpt: "" },
+						outputs_text: "{\n  \"ok\": true\n}",
+						artifacts: { items: [{ type: "file", action: "created", description: "Bundle", missing: true }], total_count: 1, omitted_count: 0 },
 					},
 				},
 			};
@@ -1774,6 +1802,20 @@ test("Slice 3: every .chip and .card-panel across all seven views carries a tone
 						evidence: "available",
 						summary: "Left summary",
 						detail: "Line 1\nLine 2",
+						verification: {
+							items: [
+								{ check_id: "tests", result: "pass", applicability: "current", scope_kind: "declared" },
+								{ check_id: "lint", result: "fail", applicability: "stale", scope_kind: "declared", reason: "Lint failed" },
+								{ check_id: "sec", result: "error", applicability: "unknown", scope_kind: "conservative" },
+							],
+							total_count: 3,
+							omitted_count: 0,
+						},
+						warnings: { items: ["Warn 1"], total_count: 1, omitted_count: 0 },
+						next_steps: { items: ["Step 1"], total_count: 1, omitted_count: 0 },
+						command: { exit_code: 0, signal: null, duration_ms: 100, stdout_bytes: 5, stderr_bytes: 0, stdout_excerpt: "ok", stderr_excerpt: "" },
+						outputs_text: "{\n  \"ok\": true\n}",
+						artifacts: { items: [{ type: "file", action: "created", description: "Bundle", missing: true }], total_count: 1, omitted_count: 0 },
 					},
 				},
 			};

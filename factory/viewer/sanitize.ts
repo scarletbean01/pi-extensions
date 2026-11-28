@@ -4,10 +4,18 @@ import type { FactoryDeletionInfo } from "../operations.ts";
 
 const CONTROL_AND_FORMAT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u034F\u115F\u1160\u180B-\u180D\u2800\u3164\uFE00-\uFE0D\uFFA0\u2028\u2029\u{E0100}-\u{E01EF}\p{Cf}]+/gu;
 const VARIATION_SELECTORS_RE = /[\uFE0E\uFE0F]+/g;
-const GENERIC_PATH_RE = /(^|[^A-Za-z0-9._~/-])((?:file:\/\/[^\s"'<>()\[\]{}`*,;|]+|\/(?:[^\s"'<>()\[\]{}`*,;|/]+\/)+[^\s"'<>()\[\]{}`*,;|]*|~[A-Za-z0-9._-]*[\\/][^\s"'<>()\[\]{}`*,;|]+|[A-Za-z]:[\\/][^\s"'<>()\[\]{}`*,;|]+))/g;
+const PATH_DELIM_LOOKAHEAD = String.raw`(?!$|[\s"'<>()\[\]{}\`*,;|\/~]|[A-Za-z]:[\\/]|file:\/\/)`;
+const PATH_BODY_CHAR = `(?:[^\\s"'<>()\\[\\]{}\`*,;|]|[,;|]${PATH_DELIM_LOOKAHEAD})`;
+const PATH_BODY_NO_SLASH_CHAR = `(?:[^\\s"'<>()\\[\\]{}\`*,;|/]|[,;|]${PATH_DELIM_LOOKAHEAD})`;
+const GENERIC_PATH_RE = new RegExp(
+	`(^|[^A-Za-z0-9._~/-])((?:file:\\/\\/${PATH_BODY_CHAR}+|\\/(?:${PATH_BODY_NO_SLASH_CHAR}+\\/)+${PATH_BODY_CHAR}*|~[A-Za-z0-9._-]*[\\\\/]${PATH_BODY_CHAR}+|[A-Za-z]:[\\\\/]${PATH_BODY_CHAR}+))`,
+	"g",
+);
 const SPOOFED_TRUNCATION_MARKER_RE = /(?:…\s*)?\[truncated,\s*[0-9\uFF10-\uFF19]+(?:,[0-9\uFF10-\uFF19]+)*\s+characters?\s+omitted\]/gi;
 const TRAILING_SENTENCE_PUNCTUATION = new Set([".", ",", ";", ":", "!", "?"]);
 const PRE_BOUND_MULTIPLIER = 4;
+const PRE_BOUND_TRIM_LOOKBACK = 4096;
+const PRE_BOUND_DELIM_RE = /[\s"'<>()\[\]{}`*,;|]/;
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -22,6 +30,16 @@ function splitTrailingSentencePunctuation(token: string): { core: string; traili
 		return { core: token, trailing: "" };
 	}
 	return { core: token.slice(0, splitAt), trailing: token.slice(splitAt) };
+}
+
+function countCodePoints(text: string): number {
+	let count = 0;
+	for (let j = 0, len = text.length; j < len; ) {
+		const code = text.charCodeAt(j);
+		j += code >= 0xd800 && code <= 0xdbff && j + 1 < len ? 2 : 1;
+		count += 1;
+	}
+	return count;
 }
 
 function preBoundCodePoints(wellFormed: string, maxCodePoints: number): { bounded: string; droppedCodePoints: number } {
@@ -39,13 +57,18 @@ function preBoundCodePoints(wellFormed: string, maxCodePoints: number): { bounde
 	if (i >= len) {
 		return { bounded: wellFormed, droppedCodePoints: 0 };
 	}
-	let droppedCodePoints = 0;
-	for (let j = i; j < len; ) {
-		const code = wellFormed.charCodeAt(j);
-		j += code >= 0xd800 && code <= 0xdbff && j + 1 < len ? 2 : 1;
-		droppedCodePoints += 1;
+	let cut = i;
+	if (!PRE_BOUND_DELIM_RE.test(wellFormed[i]!)) {
+		const floor = Math.max(0, i - PRE_BOUND_TRIM_LOOKBACK);
+		for (let k = i - 1; k >= floor; k--) {
+			if (PRE_BOUND_DELIM_RE.test(wellFormed[k]!)) {
+				cut = k + 1;
+				break;
+			}
+		}
 	}
-	return { bounded: wellFormed.slice(0, i), droppedCodePoints };
+	const droppedCodePoints = countCodePoints(wellFormed.slice(cut));
+	return { bounded: wellFormed.slice(0, cut), droppedCodePoints };
 }
 
 function scrubBlockedAndGenericPaths(text: string, blockedPaths: readonly string[]): string {
@@ -58,7 +81,7 @@ function scrubBlockedAndGenericPaths(text: string, blockedPaths: readonly string
 	)].sort((a, b) => b.length - a.length);
 	for (const blocked of uniquePaths) {
 		if (!cleaned.includes(blocked)) continue;
-		const re = new RegExp(`${escapeRegExp(blocked)}[^\\s"'<>()\\[\\]{}\`*,;|]*`, "g");
+		const re = new RegExp(`${escapeRegExp(blocked)}${PATH_BODY_CHAR}*`, "g");
 		cleaned = cleaned.replace(re, match => {
 			const { trailing } = splitTrailingSentencePunctuation(match);
 			return `[redacted-path]${trailing}`;
@@ -91,6 +114,23 @@ function truncateWithOmissionMarker(codePoints: string[], maxChars: number, extr
 	const omitted = total - kept;
 	const marker = `… [truncated, ${omitted} character${omitted === 1 ? "" : "s"} omitted]`;
 	return `${codePoints.slice(0, kept).join("")}${marker}`;
+}
+
+const TRAILING_TRUNCATION_MARKER_RE = /… \[truncated, (\d+) characters? omitted\]$/;
+
+/** Re-bound already-scrubbed text to `maxChars` Unicode code points, accumulating any existing omission count. */
+export function reboundOutputText(scrubbed: string, maxChars: number): string {
+	if (maxChars <= 0) return "";
+	let base = scrubbed;
+	let priorOmitted = 0;
+	const match = TRAILING_TRUNCATION_MARKER_RE.exec(scrubbed);
+	if (match) {
+		priorOmitted = Number(match[1]);
+		base = scrubbed.slice(0, match.index);
+	}
+	const codePoints = Array.from(base);
+	if (priorOmitted === 0 && codePoints.length <= maxChars) return scrubbed;
+	return truncateWithOmissionMarker(codePoints, maxChars, priorOmitted);
 }
 
 /**

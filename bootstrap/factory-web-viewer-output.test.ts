@@ -7,6 +7,7 @@ import { nodeOutputSnapshot } from "../factory/viewer/output.ts";
 import { sanitizeOperatorText, sanitizeOutputText } from "../factory/viewer/sanitize.ts";
 import { createViewerReader } from "../factory/viewer/server.ts";
 import { atomicJson, completionRecord, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
+import { handoffOfferPath } from "./handoff.ts";
 import type { GenerateRequest } from "./lifecycle.ts";
 import { serviceFixture, workerFromConfig, notification } from "./test-support/chain-fixture.ts";
 import { verifyReadOnlyViewer, verifyReadOnlyViewerInChild } from "./test-support/factory-viewer-fixture.ts";
@@ -97,6 +98,18 @@ test("sanitizeOutputText preserves line breaks, scrubs blocked/generic paths and
 	assert.equal(sanitizeOperatorText(adjRaw, 1000, blocked), adjExpected);
 	assert.equal(sanitizeOutputText("x|/var/a/b| `/a/b`/c/d`", 8000, blocked), "x|[redacted-path]| `[redacted-path]`[redacted-path]`");
 
+	// N3-a: paths containing ',', ';', '|' inside segment names must redact whole path without leaking tail
+	for (const segPath of [
+		"/a,b/c/d",
+		"/opt/a,b/secret/k",
+		"/home/alice/My,Docs/secret.txt",
+		"/srv/x|y/z",
+		"/opt/semi;dir/file",
+	]) {
+		assert.equal(sanitizeOutputText(segPath, 8000, blocked), "[redacted-path]", `failed on ${segPath}`);
+		assert.equal(sanitizeOperatorText(segPath, 1000, blocked), "[redacted-path]", `operator failed on ${segPath}`);
+	}
+
 	// N-c: pin conservative lead-character behaviour and untouched non-path forms
 	const ncRedacted = "#/definitions/foo $/x/y +/x/y";
 	assert.equal(sanitizeOutputText(ncRedacted, 8000, blocked), "#[redacted-path] $[redacted-path] +[redacted-path]");
@@ -139,6 +152,8 @@ test("sanitizeOutputText and sanitizeOperatorText handle 200k hostile inputs in 
 		commaSlash: repeatTo(",/a", 200_000),
 		tildeRun: `,~${"a".repeat(200_000)}`,
 		deepPath: `/${"a/".repeat(100_000)}`,
+		commaInSeg: `/${"a,b/".repeat(50_000)}`,
+		pipeInSeg: `/${"a|b/".repeat(50_000)}`,
 	};
 	for (const [name, input] of Object.entries(hostileInputs)) {
 		const t0 = performance.now();
@@ -182,6 +197,29 @@ test("sanitizeOutputText and sanitizeOperatorText handle 200k hostile inputs in 
 	const giantOut = sanitizeOutputText(giantPath, 1000, []);
 	assert.ok(Array.from(giantOut).length <= 1000);
 	assert.match(giantOut, /^\[redacted-path\]… \[truncated, \d+ characters? omitted\]$/);
+
+	// N3-b: pre-bound cut inside a ~user or /first-segment prefix trims back to whitespace/delimiter without leaking ~alice or /secretdir
+	for (const cap of [50, 200]) {
+		const vsPrefix = "w\uFE0F ".repeat(cap); // 3 code points per "w\uFE0F ", shrinks to 2 ("w ")
+		const vsLen = Array.from(vsPrefix).length;
+		const padNeeded = 4 * cap - 7 - vsLen;
+		if (padNeeded >= 0) {
+			const input = `${vsPrefix}${"a".repeat(padNeeded)} ~alice/.ssh/id_rsa`;
+			const totalCp = Array.from(input.replace(/\uFE0F/g, "")).length;
+			const out = sanitizeOutputText(input, cap, []);
+			assert.equal(out.includes("~alice"), false, `cap=${cap} leaked ~alice: ${out}`);
+			assert.equal(out.includes("~al"), false, `cap=${cap} leaked ~al: ${out}`);
+			const m = /… \[truncated, (\d+) characters? omitted\]$/.exec(out);
+			assert.ok(m, `cap=${cap} missing marker`);
+			const kept = Array.from(out).length - Array.from(m[0]).length;
+			assert.equal(kept + Number(m[1]), totalCp, `cap=${cap} N3-b marker arithmetic mismatch`);
+		}
+		const vsPad = "\uFE0F".repeat(4 * cap - 10);
+		const segInput = `${vsPad} /secretdir/inner/file`;
+		const segOut = sanitizeOutputText(segInput, cap, []);
+		assert.equal(segOut.includes("/secret"), false, `cap=${cap} leaked /secret: ${segOut}`);
+		assert.equal(segOut.includes("secretdir"), false, `cap=${cap} leaked secretdir: ${segOut}`);
+	}
 });
 
 test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summary/detail/live-summary, caps fields, and handles absence and hostile files", async t => {
@@ -347,7 +385,7 @@ test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summa
 		claimed_at: "2026-01-01T00:00:03.000Z",
 	});
 
-	// 8. cmd_node: command result with command_evidence excerpts that must NOT leak in Ticket 01
+	// 8. cmd_node: command result with command_evidence excerpts (now allowed, scrubbed and bounded; command/args/cwd stay private)
 	const cmdEntry = entryOf("cmd_node");
 	const cmdCfg = readJson<WorkerConfig>(join(dir, `${cmdEntry.instance_id}.config.json`));
 	atomicJson(
@@ -372,8 +410,8 @@ test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summa
 					duration_ms: 1000,
 					stdout_bytes: 12,
 					stderr_bytes: 0,
-					stdout_excerpt: "PRIVATE_CMD_STDOUT_EXCERPT",
-					stderr_excerpt: "PRIVATE_CMD_STDERR_EXCERPT",
+					stdout_excerpt: `PUBLIC_CMD_STDOUT_EXCERPT\nfrom ${f.cwd}/out.txt\u200b`,
+					stderr_excerpt: "PUBLIC_CMD_STDERR_EXCERPT\nwarn /etc/probe_gen/cmd.err",
 				},
 			},
 			"not_required",
@@ -501,10 +539,19 @@ test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summa
 				assert.equal(out.latest_attempt.absence, "evidence unavailable", badNode);
 			}
 
-			// /output for cmd_node must not leak command excerpts
+			// /output for cmd_node returns scrubbed stdout/stderr excerpts without leaking command/args/cwd/metrics
 			const cmdRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_node`);
 			assert.equal(cmdRes.status, 200);
-			scanSentinels(await cmdRes.text(), sentinels, "output cmd_node");
+			const cmdText = await cmdRes.text();
+			scanSentinels(cmdText, [...sentinels, "/etc/probe_gen/cmd.err"], "output cmd_node");
+			const cmdOut = JSON.parse(cmdText);
+			assert.equal(cmdOut.latest_attempt.command.exit_code, 0);
+			assert.equal(cmdOut.latest_attempt.command.signal, null);
+			assert.equal(cmdOut.latest_attempt.command.stdout_excerpt, "PUBLIC_CMD_STDOUT_EXCERPT\nfrom [redacted-path] [ctrl]");
+			assert.equal(cmdOut.latest_attempt.command.stderr_excerpt, "PUBLIC_CMD_STDERR_EXCERPT\nwarn [redacted-path]");
+			assert.equal("command" in cmdOut.latest_attempt.command, false);
+			assert.equal("args" in cmdOut.latest_attempt.command, false);
+			assert.equal("working_directory" in cmdOut.latest_attempt.command, false);
 		},
 	);
 });
@@ -769,7 +816,7 @@ test("GET /api/factories/:id/output keeps Live execution status alongside eviden
 	const entryOf = (nodeId: string) => launched.manifest.pane_manifest.find(e => e.node_id === nodeId)!;
 
 	const errEntry = entryOf("err_node");
-	atomicJson(join(dir, `${errEntry.instance_id}.error.json`), { error: "PRIVATE_ERR_JSON_MSG" });
+	atomicJson(join(dir, `${errEntry.instance_id}.error.json`), { error: `PUBLIC_ERR_JSON_MSG in ${f.cwd}/bad\u200b` });
 
 	const exitedEntry = entryOf("exited_node");
 	atomicJson(readyPath(dir, exitedEntry.instance_id), {
@@ -804,7 +851,8 @@ test("GET /api/factories/:id/output keeps Live execution status alongside eviden
 		async viewer => {
 			const liveRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
 			assert.equal(liveRes.status, 200);
-			const live = await liveRes.json() as any;
+			const liveText = await liveRes.text();
+			const live = JSON.parse(liveText) as any;
 			const liveById = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
 
 			for (const nodeId of ["err_node", "exited_node", "claim_only_node"]) {
@@ -812,6 +860,7 @@ test("GET /api/factories/:id/output keeps Live execution status alongside eviden
 				assert.equal(outRes.status, 200);
 				const outText = await outRes.text();
 				assert.equal(outText.includes("PRIVATE_"), false, `output for ${nodeId} leaked private sentinel`);
+				assert.equal(outText.includes(f.cwd), false, `output for ${nodeId} leaked project_cwd`);
 				const out = JSON.parse(outText);
 				const liveNode = liveById.get(nodeId);
 				assert.ok(liveNode, `missing ${nodeId} in live snapshot`);
@@ -819,6 +868,10 @@ test("GET /api/factories/:id/output keeps Live execution status alongside eviden
 				assert.equal(out.latest_attempt.absence, "evidence unavailable", nodeId);
 				assert.equal(out.latest_attempt.status, liveNode.status, `${nodeId} status must match Live`);
 				assert.equal(out.latest_attempt.status_text, liveNode.status_text, `${nodeId} status_text must match Live`);
+				if (nodeId === "err_node") {
+					assert.equal(out.latest_attempt.error_message, "PUBLIC_ERR_JSON_MSG in [redacted-path] [ctrl]");
+					assert.equal(liveText.includes("PUBLIC_ERR_JSON_MSG"), false, "/live must still not expose raw .error.json message");
+				}
 			}
 		},
 	);
@@ -882,6 +935,412 @@ test("GET /api/factories/:id/output and /live respond quickly on 60k hostile pun
 			const liveText = await liveRes.text();
 			assert.equal(liveText.includes("/b/secret"), false);
 			assert.ok(liveMs < 1000, `/live with 60k hostile payload took ${liveMs.toFixed(0)}ms`);
+		},
+	);
+});
+
+
+test("GET /api/factories/:id/output projects verification, warnings, next_steps, command excerpts, structured outputs, artifact descriptions, dispositions, 64KB cap, and N-e alignment without leaking private sentinels", async t => {
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_T02_PROMPT",
+		agents: [
+			{ node_id: "rich_node", persona: "builder", sub_task: "PRIVATE_T02_RICH_SUB" },
+			{
+				node_id: "cmd_fail",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "process.exit(2)", "--sentinel-cmd-fail-arg"],
+				working_directory: f.cwd,
+				sub_task: "PRIVATE_T02_CMD_SUB",
+			},
+			{ node_id: "blk_node", persona: "builder", sub_task: "PRIVATE_T02_BLK_SUB" },
+			{ node_id: "skip_node", persona: "builder", sub_task: "PRIVATE_T02_SKIP_SUB" },
+			{ node_id: "cancel_node", persona: "builder", sub_task: "PRIVATE_T02_CAN_SUB" },
+			{ node_id: "huge_node", persona: "builder", sub_task: "PRIVATE_T02_HUGE_SUB" },
+			{ node_id: "handoff_src", persona: "builder", sub_task: "PRIVATE_T02_HSRC_SUB" },
+			{ node_id: "handoff_bad", persona: "builder", sub_task: "PRIVATE_T02_HBAD_SUB", depends_on: ["handoff_src"] },
+		],
+	};
+
+	const fac = ops({ action: "publish", name: "t02-output-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-t02-out", pi_session_file: join(f.root, "PRIVATE_MGR_SESSION.jsonl") });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "t02-ref-1", brief: "PRIVATE_T02_RAW_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const entryOf = (nodeId: string) => launched.manifest.pane_manifest.find(e => e.node_id === nodeId)!;
+
+	// 1. rich_node: >20 verification/warnings/next_steps with >500-char items, >8000-char outputs, artifacts with paths, metrics
+	const richEntry = entryOf("rich_node");
+	const richCfg = readJson<WorkerConfig>(join(dir, `${richEntry.instance_id}.config.json`));
+	const verList = Array.from({ length: 24 }, (_, idx) => ({
+		check_id: idx === 0 ? `chk-long-${"V".repeat(520)}` : `chk-${idx}`,
+		result: (idx === 0 ? "pass" : idx === 1 ? "fail" : idx === 2 ? "error" : "pass") as "pass" | "fail" | "error",
+		attempt_id: richEntry.attempt_id!,
+		completed_at: "2026-01-01T00:00:01.000Z",
+		scope_kind: "declared" as const,
+		applicability: idx === 1 ? ("stale" as const) : ("current" as const),
+		...(idx === 0 ? { reason: `Reason in ${f.cwd}/src/a.ts ${"R".repeat(520)}` } : {}),
+	}));
+	const warnList = Array.from({ length: 23 }, (_, idx) =>
+		idx === 0 ? `Warn at ${dir}/x \u202e ${"W".repeat(520)}` : `Warning ${idx}`,
+	);
+	const nextList = Array.from({ length: 22 }, (_, idx) =>
+		idx === 0 ? `Next step /opt/probe_gen/next ${"N".repeat(520)}` : `Next step ${idx}`,
+	);
+	const bigOutputs = {
+		verdict: "ok",
+		secretPathInJson: `${f.home}/.ssh/id_rsa`,
+		items: Array.from({ length: 250 }, (_, idx) => `item-${idx}-${"O".repeat(35)}`),
+	};
+	atomicJson(
+		resultPath(dir, richEntry.instance_id),
+		completionRecord(
+			richCfg,
+			{
+				agent_name: richEntry.persona_name,
+				node_id: "rich_node",
+				status: "success",
+				summary: "Rich summary",
+				detail: "Rich detail\nline 2",
+				verification: verList,
+				warnings: warnList,
+				next_steps: nextList,
+				outputs: bigOutputs,
+				metrics: { PRIVATE_METRIC_KEY: 12345 },
+				artifacts: [
+					{ type: "file", path: join(f.cwd, "PRIVATE_ARTIFACT_FILE_1.txt"), action: "created", description: `Built bundle at ${f.cwd}/dist/app.js` },
+					{ type: "file", path: join(f.cwd, "PRIVATE_ARTIFACT_FILE_2.txt"), action: "modified", description: `Long desc ${"A".repeat(530)}`, missing: true },
+				],
+			},
+			"sent",
+			"2026-01-01T00:00:01.000Z",
+		),
+	);
+
+	// 2. cmd_fail: failed command node with exit_code 2, signal SIGTERM, >4000 stdout & stderr excerpts
+	const cmdFailEntry = entryOf("cmd_fail");
+	const cmdFailCfg = readJson<WorkerConfig>(join(dir, `${cmdFailEntry.instance_id}.config.json`));
+	atomicJson(
+		resultPath(dir, cmdFailEntry.instance_id),
+		completionRecord(
+			cmdFailCfg,
+			{
+				agent_name: cmdFailEntry.persona_name,
+				node_id: "cmd_fail",
+				status: "failure",
+				summary: "Command failed",
+				detail: "Exited with 2",
+				command_evidence: {
+					version: 1,
+					command: process.execPath,
+					args: ["-e", "process.exit(2)", "--sentinel-cmd-fail-arg"],
+					working_directory: f.cwd,
+					exit_code: 2,
+					signal: "SIGTERM",
+					started_at: "2026-01-01T00:00:00.000Z",
+					finished_at: "2026-01-01T00:00:02.000Z",
+					duration_ms: 2000,
+					stdout_bytes: 5000,
+					stderr_bytes: 5000,
+					stdout_excerpt: `STDOUT_HEAD ${f.cwd}/a.log\n${"S".repeat(4200)}`,
+					stderr_excerpt: `STDERR_HEAD /etc/probe_gen/fail.err\u200b\n${"E".repeat(4200)}`,
+				},
+			},
+			"not_required",
+			"2026-01-01T00:00:02.000Z",
+		),
+	);
+
+	// 3. Dispositions: blocked, skipped, cancelled
+	const blkEntry = entryOf("blk_node");
+	atomicJson(
+		dispositionPath(dir, blkEntry.instance_id),
+		dispositionRecord(
+			{ ...blkEntry, task_id: launched.task_id },
+			"blocked",
+			`Blocked due to upstream failure in ${f.cwd}/upstream`,
+			[{ node_id: "cmd_fail", state: "failed", reason: `Failed at /opt/probe_gen/cause` }],
+			"2026-01-01T00:00:03.000Z",
+		),
+	);
+
+	const skipEntry = entryOf("skip_node");
+	atomicJson(
+		dispositionPath(dir, skipEntry.instance_id),
+		dispositionRecord(
+			{ ...skipEntry, task_id: launched.task_id },
+			"skipped",
+			`Skipped optional step under ${dir}/skip`,
+			[],
+			"2026-01-01T00:00:03.000Z",
+		),
+	);
+
+	const canEntry = entryOf("cancel_node");
+	atomicJson(
+		dispositionPath(dir, canEntry.instance_id),
+		dispositionRecord(
+			{ ...canEntry, task_id: launched.task_id },
+			"cancelled",
+			`Cancelled by operator in ${f.home}/.pi`,
+			[],
+			"2026-01-01T00:00:03.000Z",
+		),
+	);
+
+	// 4. huge_node: every field maxed out to exercise the 64 KB response budget
+	const hugeEntry = entryOf("huge_node");
+	const hugeCfg = readJson<WorkerConfig>(join(dir, `${hugeEntry.instance_id}.config.json`));
+	atomicJson(
+		resultPath(dir, hugeEntry.instance_id),
+		completionRecord(
+			hugeCfg,
+			{
+				agent_name: hugeEntry.persona_name,
+				node_id: "huge_node",
+				status: "partial",
+				summary: "H".repeat(950),
+				detail: "D".repeat(7950),
+				verification: Array.from({ length: 20 }, (_, idx) => ({
+					check_id: `huge-chk-${idx}-${"C".repeat(450)}`,
+					result: "pass" as const,
+					attempt_id: hugeEntry.attempt_id!,
+					completed_at: "2026-01-01T00:00:01.000Z",
+					scope_kind: "declared" as const,
+					applicability: "current" as const,
+					reason: "R".repeat(480),
+				})),
+				warnings: Array.from({ length: 20 }, (_, idx) => `W${idx}-${"W".repeat(480)}`),
+				next_steps: Array.from({ length: 20 }, (_, idx) => `N${idx}-${"N".repeat(480)}`),
+				outputs: { blob: "J".repeat(7900) },
+				artifacts: Array.from({ length: 20 }, (_, idx) => ({
+					type: "file",
+					path: join(f.cwd, `PRIVATE_HUGE_${idx}.txt`),
+					description: `Art${idx}-${"A".repeat(480)}`,
+				})),
+			},
+			"sent",
+			"2026-01-01T00:00:04.000Z",
+		),
+	);
+
+	// 5. N-e: handoff_bad has damaged handoff offer from handoff_src -> Live shows Uncertain, /output must also show Uncertain
+	const hBadEntry = entryOf("handoff_bad");
+	const { writeFileSync } = await import("node:fs");
+	writeFileSync(handoffOfferPath(dir, hBadEntry.instance_id, entryOf("handoff_src").instance_id), "{corrupt");
+
+	const sentinels = [
+		"PRIVATE_",
+		f.root,
+		f.cwd,
+		f.home,
+		dir,
+		statePath,
+		coordinationPath,
+		launched.manifest.token,
+		"/opt/probe_gen/next",
+		"/etc/probe_gen/fail.err",
+		"/opt/probe_gen/cause",
+	];
+	const runtimeCommandSentinels = [...sentinels, process.execPath, "--sentinel-cmd-fail-arg"];
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			// Whole-body sentinel scans on every endpoint
+			for (const ep of [
+				"/api/factories",
+				`/api/factories/${fac.factory_id}/live`,
+				`/api/factories/${fac.factory_id}/inspect`,
+				`/api/factories/${fac.factory_id}/queue?filter=all`,
+				`/api/factories/${fac.factory_id}/receipts?reference=t02-ref-1`,
+				`/api/factories/${fac.factory_id}/requests`,
+				`/api/factories/${fac.factory_id}/proposals`,
+			]) {
+				const res = await fetch(`${viewer.url}${ep}`);
+				assert.equal(res.status, 200, ep);
+				const bodyText = await res.text();
+				scanSentinels(bodyText, ep.endsWith("/live") ? runtimeCommandSentinels : sentinels, ep);
+			}
+
+			// rich_node: verification/warnings/next_steps capped at 20 items & 500 chars, outputs_text <= 8000, artifacts without paths
+			const richRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=rich_node`);
+			assert.equal(richRes.status, 200);
+			const richText = await richRes.text();
+			scanSentinels(richText, runtimeCommandSentinels, "output rich_node");
+			const richOut = JSON.parse(richText);
+			const richAtt = richOut.latest_attempt;
+			assert.equal(richAtt.verification.items.length, 20);
+			assert.equal(richAtt.verification.total_count, 24);
+			assert.equal(richAtt.verification.omitted_count, 4);
+			assert.match(richAtt.verification.omitted_marker, /\[truncated, 4 items omitted\]/);
+			assert.ok(Array.from(richAtt.verification.items[0].check_id).length <= 500);
+			assert.match(richAtt.verification.items[0].check_id, /\[truncated, \d+ characters? omitted\]$/);
+			assert.ok(Array.from(richAtt.verification.items[0].reason).length <= 500);
+			assert.match(richAtt.verification.items[0].reason, /\[redacted-path\]/);
+			assert.match(richAtt.verification.items[0].reason, /\[truncated, \d+ characters? omitted\]$/);
+
+			assert.equal(richAtt.warnings.items.length, 20);
+			assert.equal(richAtt.warnings.omitted_count, 3);
+			assert.match(richAtt.warnings.omitted_marker, /\[truncated, 3 items omitted\]/);
+			assert.ok(Array.from(richAtt.warnings.items[0]).length <= 500);
+			assert.match(richAtt.warnings.items[0], /\[redacted-path\]/);
+			assert.match(richAtt.warnings.items[0], /\[ctrl\]/);
+
+			assert.equal(richAtt.next_steps.items.length, 20);
+			assert.equal(richAtt.next_steps.omitted_count, 2);
+			assert.match(richAtt.next_steps.omitted_marker, /\[truncated, 2 items omitted\]/);
+			assert.ok(Array.from(richAtt.next_steps.items[0]).length <= 500);
+			assert.match(richAtt.next_steps.items[0], /\[redacted-path\]/);
+
+			assert.ok(Array.from(richAtt.outputs_text).length <= 8000);
+			assert.match(richAtt.outputs_text, /"verdict": "ok"/);
+			assert.match(richAtt.outputs_text, /"secretPathInJson": "\[redacted-path\]"/);
+			assert.match(richAtt.outputs_text, /\[truncated, \d+ characters? omitted\]$/);
+
+			assert.equal(richAtt.artifacts.items.length, 2);
+			assert.equal("path" in richAtt.artifacts.items[0], false);
+			assert.equal(richAtt.artifacts.items[0].description, "Built bundle at [redacted-path]");
+			assert.ok(Array.from(richAtt.artifacts.items[1].description).length <= 500);
+			assert.equal(richAtt.artifacts.items[1].missing, true);
+
+			// cmd_fail: exit_code, signal, 4000-char capped excerpts
+			const cmdRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_fail`);
+			assert.equal(cmdRes.status, 200);
+			const cmdText = await cmdRes.text();
+			scanSentinels(cmdText, runtimeCommandSentinels, "output cmd_fail");
+			const cmdOut = JSON.parse(cmdText);
+			assert.equal(cmdOut.latest_attempt.status, "failed");
+			assert.equal(cmdOut.latest_attempt.command.exit_code, 2);
+			assert.equal(cmdOut.latest_attempt.command.signal, "SIGTERM");
+			assert.ok(Array.from(cmdOut.latest_attempt.command.stdout_excerpt).length <= 4000);
+			assert.match(cmdOut.latest_attempt.command.stdout_excerpt, /^STDOUT_HEAD \[redacted-path\]\n/);
+			assert.match(cmdOut.latest_attempt.command.stdout_excerpt, /\[truncated, \d+ characters? omitted\]$/);
+			assert.ok(Array.from(cmdOut.latest_attempt.command.stderr_excerpt).length <= 4000);
+			assert.match(cmdOut.latest_attempt.command.stderr_excerpt, /^STDERR_HEAD \[redacted-path\] \[ctrl\]\n/);
+			assert.match(cmdOut.latest_attempt.command.stderr_excerpt, /\[truncated, \d+ characters? omitted\]$/);
+
+			// Dispositions: blocked, skipped, cancelled
+			const blkRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=blk_node`);
+			assert.equal(blkRes.status, 200);
+			const blkText = await blkRes.text();
+			scanSentinels(blkText, sentinels, "output blk_node");
+			const blkOut = JSON.parse(blkText);
+			assert.equal(blkOut.latest_attempt.evidence, "not applicable");
+			assert.equal(blkOut.latest_attempt.status, "blocked");
+			assert.equal(blkOut.latest_attempt.disposition_reason, "Blocked due to upstream failure in [redacted-path]");
+			assert.equal(blkOut.latest_attempt.causes.items[0].reason, "Failed at [redacted-path]");
+
+			const skipOut = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=skip_node`)).json() as any;
+			assert.equal(skipOut.latest_attempt.status, "skipped");
+			assert.equal(skipOut.latest_attempt.disposition_reason, "Skipped optional step under [redacted-path]");
+
+			const canOut = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cancel_node`)).json() as any;
+			assert.equal(canOut.latest_attempt.status, "cancelled");
+			assert.equal(canOut.latest_attempt.disposition_reason, "Cancelled by operator in [redacted-path]");
+
+			// huge_node: 64 KB response budget
+			const hugeRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=huge_node`);
+			assert.equal(hugeRes.status, 200);
+			const hugeText = await hugeRes.text();
+			scanSentinels(hugeText, sentinels, "output huge_node");
+			assert.ok(Buffer.byteLength(hugeText, "utf8") <= 64 * 1024, `expected <= 65536 bytes, got ${Buffer.byteLength(hugeText, "utf8")}`);
+			const hugeOut = JSON.parse(hugeText);
+			assert.ok(hugeOut.latest_attempt.outputs_text.includes("truncated") || hugeOut.latest_attempt.artifacts.omitted_count > 0);
+
+			// N-e: handoff_bad matches Live Graph status ("needs_attention" / "Uncertain")
+			const liveData = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).json() as any;
+			const liveHBad = liveData.graph.nodes.find((n: any) => n.id === "handoff_bad");
+			const outHBad = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=handoff_bad`)).json() as any;
+			assert.equal(liveHBad.status, "needs_attention");
+			assert.equal(outHBad.latest_attempt.status, "needs_attention");
+			assert.equal(outHBad.latest_attempt.status_text, "Uncertain");
+			assert.equal(outHBad.latest_attempt.evidence, "unavailable");
+		},
+	);
+});
+
+test("GET /api/factories/:id/output matches Live Graph upstream review-closure Blocked override (N-e)", async t => {
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_CLOSURE_PROMPT",
+		agents: [
+			{ node_id: "build", persona: "builder", sub_task: "PRIVATE_CLOSURE_BUILD" },
+			{
+				node_id: "review",
+				persona: "reviewer",
+				depends_on: ["build"],
+				sub_task: "PRIVATE_CLOSURE_REV",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 1, on_exhausted: "failed" },
+			},
+			{ node_id: "deploy", persona: "builder", depends_on: ["review"], sub_task: "PRIVATE_CLOSURE_DEP" },
+		],
+	};
+	const fac = ops({ action: "publish", name: "ne-closure-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-ne-close" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "ne-close-ref", brief: "PRIVATE_CLOSURE_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const buildEntry = launched.manifest.pane_manifest.find(e => e.node_id === "build")!;
+	const reviewEntry = launched.manifest.pane_manifest.find(e => e.node_id === "review")!;
+	const workerModel = { provider: "test-provider", id: "test-model" };
+	const build = workerFromConfig(t, join(dir, `${buildEntry.instance_id}.config.json`), { model: workerModel });
+	const review = workerFromConfig(t, join(dir, `${reviewEntry.instance_id}.config.json`), { model: workerModel });
+	await build.start();
+	await review.start();
+	await build.beforeStart();
+	await review.beforeStart();
+
+	await build.complete({ status: "success", summary: "Build 1", detail: "Detail 1" });
+	await review.beforeStart(notification(build, review));
+	await review.deliverFollowUps();
+	await review.complete({ status: "success", summary: "Revise 1", detail: "Needs fix", outputs: { verdict: "revise" } });
+	await build.beforeStart(notification(review, build));
+	await build.deliverFollowUps();
+	await build.complete({ status: "success", summary: "Build 2", detail: "Detail 2" });
+	await review.beforeStart(notification(build, review));
+	await review.deliverFollowUps();
+	await review.complete({ status: "success", summary: "Still bad", detail: "Exhausted", outputs: { verdict: "revise" } });
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const live = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).json() as any;
+			const liveDeploy = live.graph.nodes.find((n: any) => n.id === "deploy");
+			assert.equal(liveDeploy.status, "blocked");
+
+			const outRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=deploy`);
+			assert.equal(outRes.status, 200);
+			const outText = await outRes.text();
+			assert.equal(outText.includes("PRIVATE_"), false);
+			const out = JSON.parse(outText);
+			assert.equal(out.latest_attempt.status, "blocked");
+			assert.equal(out.latest_attempt.status_text, "Blocked");
+			assert.equal(out.latest_attempt.evidence, "not applicable");
+			assert.equal(out.latest_attempt.absence, "not applicable");
+			assert.ok(typeof out.latest_attempt.disposition_reason === "string" && out.latest_attempt.disposition_reason.length > 0);
 		},
 	);
 });

@@ -98,6 +98,9 @@
     continuing: { symbol: "●", label: "Continuing", tone: "tone-info" },
     incomplete: { symbol: "◔", label: "Incomplete", tone: "tone-info" },
     passed: { symbol: "✓", label: "Passed", tone: "tone-ok" },
+    pass: { symbol: "✓", label: "Pass", tone: "tone-ok" },
+    fail: { symbol: "✕", label: "Fail", tone: "tone-error" },
+    error: { symbol: "!", label: "Error", tone: "tone-error" },
     deleted: { symbol: "⊗", label: "Deleted", tone: "tone-muted" },
     damaged: { symbol: "!", label: "Damaged", tone: "tone-error" },
   });

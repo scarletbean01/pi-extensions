@@ -168,7 +168,7 @@ test("Live Graph projects bound-version topology, joins, feedback edges, current
       node_id: "prep",
       status: "success",
       summary: "Prep command exited 0",
-      detail: "PRIVATE_LOG_DETAIL",
+      detail: "PUBLIC_LOG_DETAIL",
       command_evidence: {
         version: 1,
         command: process.execPath,
@@ -181,8 +181,8 @@ test("Live Graph projects bound-version topology, joins, feedback edges, current
         duration_ms: 1000,
         stdout_bytes: 12,
         stderr_bytes: 0,
-        stdout_excerpt: "PRIVATE_STDOUT_LOG",
-        stderr_excerpt: "PRIVATE_STDERR_LOG",
+        stdout_excerpt: "PUBLIC_STDOUT_LOG",
+        stderr_excerpt: "PUBLIC_STDERR_LOG",
       },
     },
     delivery: "sent",
@@ -256,6 +256,9 @@ test("Live Graph projects bound-version topology, joins, feedback edges, current
       assert.equal(liveRes.status, 200);
       const liveText = await liveRes.text();
       assertNoLeaks(liveText, "live snapshot");
+      assert.equal(liveText.includes("PUBLIC_LOG_DETAIL"), false, "live snapshot must not expose detail");
+      assert.equal(liveText.includes("PUBLIC_STDOUT_LOG"), false, "live snapshot must not expose stdout_excerpt");
+      assert.equal(liveText.includes("PUBLIC_STDERR_LOG"), false, "live snapshot must not expose stderr_excerpt");
       assert.equal(liveText.includes(otherLaunched.task_id), false);
       assert.equal(liveText.includes(otherLaunched.attempt_id), false);
       assert.equal(liveText.includes("other_alpha"), false);
@@ -336,6 +339,16 @@ test("Live Graph projects bound-version topology, joins, feedback edges, current
       assert.equal(cfgSnap.current_version, "v4");
       assert.equal(cfgSnap.target_node.verified, true);
       assert.equal(cfgSnap.target_node.node.limits.task_timeout_ms.value, 15_000);
+
+      // /output for prep exposes scrubbed detail & command excerpts while keeping PRIVATE_ and command/args/cwd/endpoint sentinels out.
+      const prepOutRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=prep`);
+      assert.equal(prepOutRes.status, 200);
+      const prepOutText = await prepOutRes.text();
+      assertNoLeaks(prepOutText, "output prep");
+      const prepOut = JSON.parse(prepOutText);
+      assert.equal(prepOut.latest_attempt.detail, "PUBLIC_LOG_DETAIL");
+      assert.equal(prepOut.latest_attempt.command.stdout_excerpt, "PUBLIC_STDOUT_LOG");
+      assert.equal(prepOut.latest_attempt.command.stderr_excerpt, "PUBLIC_STDERR_LOG");
 
       // Factory isolation: other factory returns only its own launched graph and never leaks fac's ids/nodes.
       const otherText = await (await fetch(`${viewer.url}/api/factories/${otherFac.factory_id}/live`)).text();

@@ -1,460 +1,374 @@
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
 import type { Inspection, ReleasedFactoryRun } from "../operations.ts";
+import type { ExecutionState } from "../../bootstrap/outcomes.ts";
+import type { CommandEvidence } from "../../bootstrap/session-store.ts";
 import {
-	cancelPath,
-	outcomeClaimPath,
-	readCancelRecordSafe,
-	readOutcomeClaimSafe,
-	readRunCancelRecordSafe,
-	runCancelPath,
-	type ProgressSnapshot,
-} from "../../bootstrap/cancellation.ts";
-import { verifyBoundReviewPlan } from "../../bootstrap/factory-requests.ts";
-import { currentAttempt, handoffClaimPath } from "../../bootstrap/handoff.ts";
-import { executionFromResult, type ExecutionState } from "../../bootstrap/outcomes.ts";
-import { failFastPath, readFailFast } from "../../bootstrap/ownership.ts";
-import {
-	attemptNumber,
-	finalizePath,
-	finalizedReviewRejection,
-	readFinalization,
-	reviewLoopFor,
-} from "../../bootstrap/review-loop.ts";
-import {
-	assertNoSymlinkPath,
-	dispositionPath,
-	expectationFor,
-	inboundEdgesOf,
-	parseCompletion,
-	parseDisposition,
-	parseWorkerReady,
-	pathEntryExists,
-	processAlive,
-	readyPath,
-	resultPath,
-	type AgentLaunch,
-	type BootstrapManifest,
-} from "../../bootstrap/session-store.ts";
+	assertRunEvidenceConsistent,
+	resolveRunObservations,
+	STATUS_TEXT,
+	type ProjectedCause,
+	type ResolvedNodeObservation,
+} from "./attempt-resolution.ts";
 import type { TypedAbsence } from "./inspect.ts";
-import { assertRegularFileIfExists } from "./live.ts";
-import { deletionMarkerFields, sanitizeOutputText } from "./sanitize.ts";
+import { deletionMarkerFields, reboundOutputText, sanitizeOutputText } from "./sanitize.ts";
 
 export const OUTPUT_SUMMARY_MAX_CHARS = 1000;
 export const OUTPUT_DETAIL_MAX_CHARS = 8000;
-const MAX_OUTPUT_FILE_BYTES = 1024 * 1024;
+export const OUTPUT_STRUCTURED_MAX_CHARS = 8000;
+export const OUTPUT_COMMAND_EXCERPT_MAX_CHARS = 4000;
+export const OUTPUT_LIST_ITEM_MAX_CHARS = 500;
+export const OUTPUT_LIST_MAX_ITEMS = 20;
+export const OUTPUT_DISPOSITION_REASON_MAX_CHARS = 4000;
+export const OUTPUT_ERROR_MAX_CHARS = 4000;
+export const OUTPUT_MAX_RESPONSE_BYTES = 64 * 1024;
 
-const OUTPUT_STATUS_TEXT: Record<ExecutionState, string> = {
-	pending: "Pending",
-	waiting: "Waiting",
-	running: "Running",
-	succeeded: "Succeeded",
-	partial: "Partial",
-	failed: "Failed",
-	blocked: "Blocked",
-	skipped: "Skipped",
-	cancelled: "Cancelled",
-	needs_attention: "Uncertain",
-};
+export interface BoundedList<T> {
+	items: T[];
+	total_count: number;
+	omitted_count: number;
+	omitted_marker?: string;
+}
 
-function assertPathInsideDir(dir: string, targetPath: string, label: string): void {
-	const rel = relative(resolve(dir), resolve(targetPath));
-	if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
-		throw new Error(`Refusing ${label} outside session directory`);
+function itemsOmittedMarker(omitted: number): string {
+	return `… [truncated, ${omitted} item${omitted === 1 ? "" : "s"} omitted]`;
+}
+
+function buildBoundedList<T, U>(raw: readonly T[] | undefined, maxItems: number, mapItem: (item: T) => U): BoundedList<U> | undefined {
+	if (!Array.isArray(raw) || raw.length === 0) return undefined;
+	const items = raw.slice(0, maxItems).map(mapItem);
+	const omitted = Math.max(0, raw.length - items.length);
+	return {
+		items,
+		total_count: raw.length,
+		omitted_count: omitted,
+		...(omitted > 0 ? { omitted_marker: itemsOmittedMarker(omitted) } : {}),
+	};
+}
+
+function projectAttemptCommand(ev: CommandEvidence | undefined, blockedPaths: readonly string[]) {
+	if (!ev) return undefined;
+	const spawnError = typeof ev.spawn_error === "string" && ev.spawn_error
+		? sanitizeOutputText(ev.spawn_error, OUTPUT_SUMMARY_MAX_CHARS, blockedPaths)
+		: undefined;
+	const terminationError = typeof ev.termination_error === "string" && ev.termination_error
+		? sanitizeOutputText(ev.termination_error, OUTPUT_SUMMARY_MAX_CHARS, blockedPaths)
+		: undefined;
+	return {
+		exit_code: ev.exit_code,
+		signal: ev.signal,
+		duration_ms: ev.duration_ms,
+		stdout_bytes: ev.stdout_bytes,
+		stderr_bytes: ev.stderr_bytes,
+		...(typeof ev.stdout_excerpt === "string"
+			? { stdout_excerpt: sanitizeOutputText(ev.stdout_excerpt, OUTPUT_COMMAND_EXCERPT_MAX_CHARS, blockedPaths) }
+			: {}),
+		...(typeof ev.stderr_excerpt === "string"
+			? { stderr_excerpt: sanitizeOutputText(ev.stderr_excerpt, OUTPUT_COMMAND_EXCERPT_MAX_CHARS, blockedPaths) }
+			: {}),
+		...(spawnError ? { spawn_error: spawnError } : {}),
+		...(terminationError ? { termination_error: terminationError } : {}),
+	};
+}
+
+function projectScrubbedCauses(causes: readonly ProjectedCause[] | undefined, blockedPaths: readonly string[]): BoundedList<ProjectedCause> | undefined {
+	return buildBoundedList(causes, OUTPUT_LIST_MAX_ITEMS, c => ({
+		node_id: sanitizeOutputText(String(c.node_id), OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths),
+		state: c.state,
+		reason: sanitizeOutputText(String(c.reason ?? ""), OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths),
+		...(c.check
+			? {
+				check: {
+					name: sanitizeOutputText(String(c.check.name ?? ""), OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths),
+					evidence: c.check.evidence,
+				},
+			}
+			: {}),
+	}));
+}
+
+function trimBoundedListForBudget<T>(list: BoundedList<T>, targetBytes: number, measure: () => number): void {
+	while (list.items.length > 0 && measure() > targetBytes) {
+		list.items.pop();
+		list.omitted_count += 1;
+		list.omitted_marker = itemsOmittedMarker(list.omitted_count);
 	}
 }
 
-function assertRegularDirNoSymlink(dir: string, label: string): void {
-	assertNoSymlinkPath(dir);
-	if (!pathEntryExists(dir)) {
-		throw new Error(`Missing ${label}`);
+function trimStringFieldForBudget(
+	holder: Record<string, unknown>,
+	key: string,
+	targetBytes: number,
+	measure: () => number,
+): void {
+	const cur = holder[key];
+	if (typeof cur !== "string" || !cur || measure() <= targetBytes) return;
+	const minChars = Math.min(Array.from(cur).length, 64);
+	let low = minChars;
+	let high = Array.from(cur).length;
+	// Binary search the largest code-point cap that fits within targetBytes.
+	while (low < high) {
+		const mid = Math.ceil((low + high) / 2);
+		holder[key] = reboundOutputText(cur, mid);
+		if (measure() <= targetBytes) {
+			low = mid;
+		} else {
+			high = mid - 1;
+		}
 	}
-	const st = lstatSync(dir);
-	if (st.isSymbolicLink() || !st.isDirectory()) {
-		throw new Error(`Refusing non-directory ${label}`);
+	holder[key] = reboundOutputText(cur, low);
+	if (measure() > targetBytes) {
+		holder[key] = reboundOutputText(cur, 1);
 	}
 }
 
-function readBoundedRegularJsonIfExists<T>(
-	dir: string,
-	filePath: string,
-	label: string,
-	maxBytes = MAX_OUTPUT_FILE_BYTES,
-): { exists: false } | { exists: true; value: T } {
-	assertPathInsideDir(dir, filePath, label);
-	if (!pathEntryExists(filePath)) return { exists: false };
-	assertNoSymlinkPath(filePath);
-	const st = lstatSync(filePath);
-	if (st.isSymbolicLink() || !st.isFile()) {
-		throw new Error(`Refusing non-regular ${label}`);
-	}
-	if (st.size > maxBytes) {
-		throw new Error(`Refusing oversized ${label}`);
-	}
-	const fd = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
-	try {
-		const fst = fstatSync(fd);
-		if (!fst.isFile()) {
-			throw new Error(`Refusing non-regular ${label}`);
+function enforceOutputResponseBudget(body: Record<string, unknown>, maxBytes = OUTPUT_MAX_RESPONSE_BYTES): Record<string, unknown> {
+	const measure = () => Buffer.byteLength(JSON.stringify(body), "utf8");
+	if (measure() <= maxBytes) return body;
+	const att = body.latest_attempt as Record<string, unknown> | undefined;
+	if (!att || typeof att !== "object") return body;
+
+	trimStringFieldForBudget(att, "outputs_text", maxBytes, measure);
+	if (measure() <= maxBytes) return body;
+
+	for (const listKey of ["artifacts", "next_steps", "warnings", "verification", "causes"] as const) {
+		const list = att[listKey] as BoundedList<unknown> | undefined;
+		if (list && Array.isArray(list.items)) {
+			trimBoundedListForBudget(list, maxBytes, measure);
+			if (measure() <= maxBytes) return body;
 		}
-		if (fst.size > maxBytes) {
-			throw new Error(`Refusing oversized ${label}`);
-		}
-		return { exists: true, value: JSON.parse(readFileSync(fd, "utf8")) as T };
-	} finally {
-		closeSync(fd);
 	}
+
+	const cmd = att.command as Record<string, unknown> | undefined;
+	if (cmd && typeof cmd === "object") {
+		trimStringFieldForBudget(cmd, "stderr_excerpt", maxBytes, measure);
+		if (measure() <= maxBytes) return body;
+		trimStringFieldForBudget(cmd, "stdout_excerpt", maxBytes, measure);
+		if (measure() <= maxBytes) return body;
+	}
+
+	for (const strKey of ["detail", "error_message", "disposition_reason", "summary"] as const) {
+		trimStringFieldForBudget(att, strKey, maxBytes, measure);
+		if (measure() <= maxBytes) return body;
+	}
+	return body;
 }
 
-function assertRunEvidenceConsistent(inspection: Inspection, releases: ReleasedFactoryRun[]) {
-	const { factory, attempts, capacity, head_status } = inspection;
-	const anyActiveAuthorized = attempts.filter(a => !a.historical && a.release_authorized);
-	const active = anyActiveAuthorized.filter(a => a.state === "released");
-	const badHistoricalReleased = attempts.some(
-		a => ((a.state === "settled" || a.state === "cleared") && (!a.release_authorized || !a.settlement || Boolean(a.uncertainty?.length)))
-			|| (a.state === "proven_not_released" && a.release_authorized),
-	);
-	const contradictoryHistoricalReleased = attempts.some(
-		a => a.historical && a.release_authorized && a.state === "released",
-	);
-	const hasCurrentAttempt = attempts.some(a => !a.historical);
-	const headExplainsFactoryHold = head_status.blocking_kind === "factory_held" || head_status.without_control_fence?.blocking_kind === "factory_held";
-	const contradictoryFactoryHold = capacity.factory_slot === "held" && !hasCurrentAttempt && !headExplainsFactoryHold;
-	const hasUncertainty = Boolean(
-		inspection.uncertainty.length ||
-		inspection.current_error ||
-		inspection.control_error ||
-		head_status.blocking_kind === "uncertain" ||
-		capacity.factory_slot === "uncertain" ||
-		capacity.checkout_slot === "uncertain" ||
-		badHistoricalReleased ||
-		contradictoryHistoricalReleased ||
-		contradictoryFactoryHold,
-	);
-
-	if (inspection.deleted) {
-		if (anyActiveAuthorized.length || releases.length || hasUncertainty || capacity.factory_slot === "held") {
-			return { state: "uncertain" as const };
-		}
-		return { state: "no_displayed_run" as const };
-	}
-	if (anyActiveAuthorized.length || releases.length) {
-		if (
-			anyActiveAuthorized.length !== 1 ||
-			active.length !== 1 ||
-			releases.length !== 1 ||
-			Boolean(active[0].uncertainty?.length) ||
-			active[0].attempt_id !== releases[0].attempt_id ||
-			active[0].bound_version !== releases[0].bound_version ||
-			active[0].task_id !== releases[0].manifest.task_id ||
-			releases[0].manifest.factory_managed?.factory_id !== factory.factory_id ||
-			releases[0].manifest.factory_managed?.attempt_id !== active[0].attempt_id ||
-			capacity.factory_slot !== "held" ||
-			capacity.checkout_slot !== "held"
-		) {
-			return { state: "uncertain" as const };
-		}
-		return { state: "released" as const, release: releases[0] };
-	}
-	if (hasUncertainty) {
-		return { state: "uncertain" as const };
-	}
-	return { state: "no_displayed_run" as const };
-}
-
-function verifyReleaseMatchesDefinition(factoryId: string, release: ReleasedFactoryRun): Map<string, AgentLaunch> {
-	const { definition, manifest, bound_version } = release;
-	if (manifest.factory_managed?.factory_id !== factoryId || manifest.factory_managed?.bound_version !== bound_version) {
-		throw new Error("Run factory binding does not match the selected factory release");
-	}
-	if (manifest.topology !== definition.topology || manifest.pane_manifest.length !== definition.agents.length) {
-		throw new Error("Run topology differs from the retained version");
-	}
-	const roster = new Map(manifest.pane_manifest.map(entry => [entry.node_id, entry]));
-	const byInstance = new Map(manifest.pane_manifest.map(entry => [entry.instance_id, entry.node_id]));
-	if (roster.size !== definition.agents.length || byInstance.size !== definition.agents.length) {
-		throw new Error("Run roster contains duplicate node or instance identifiers");
-	}
-	verifyBoundReviewPlan(definition, manifest.review_plan, manifest.pane_manifest);
-	for (const entry of definition.agents) {
-		const node = entry.node;
-		const launched = roster.get(node.node_id);
-		const inbound = inboundEdgesOf(node);
-		if (!launched || (launched.kind ?? "agent") !== (node.kind ?? "agent") ||
-			JSON.stringify(inboundEdgesOf(launched).map(id => byInstance.get(id))) !== JSON.stringify(inbound)) {
-			throw new Error("Run roster differs from the retained version");
-		}
-	}
-	return roster;
-}
-
-// Note: attempt/status derivation mirrors nodeObservation in ./live.ts; extracting a shared resolver is deferred to ticket 02.
-function latestAttemptOutputForNode(
-	manifest: BootstrapManifest,
-	entry: AgentLaunch,
-	blockedPaths: readonly string[],
-) {
-	const { session_dir: dir, task_id, review_plan } = manifest;
-	const loop = reviewLoopFor(review_plan, entry.instance_id);
-	const maxAttempts = loop ? loop.max_revisions + 1 : 1;
+function projectAttemptFromObservation(obs: ResolvedNodeObservation, blockedPaths: readonly string[]) {
+	const attemptIdVal = obs.attempt_id ?? {
+		absence: "evidence unavailable" as TypedAbsence,
+		explanation: "Attempt identity could not be verified.",
+	};
 
 	const unavailable = (
-		attemptId: string | undefined,
-		attemptNumberVal: number,
 		status: ExecutionState,
 		statusText: string,
 		explanation: string,
+		extras: Record<string, unknown> = {},
 	) => ({
-		attempt_id: attemptId ?? { absence: "evidence unavailable" as TypedAbsence, explanation: "Attempt identity could not be verified." },
-		attempt_number: attemptNumberVal,
-		max_attempts: maxAttempts,
+		attempt_id: attemptIdVal,
+		attempt_number: obs.attempt_number,
+		max_attempts: obs.max_attempts,
 		status,
 		status_text: statusText,
 		evidence: "unavailable" as const,
 		absence: "evidence unavailable" as TypedAbsence,
 		explanation,
+		...extras,
 	});
 
 	const notApplicable = (
-		attemptId: string | undefined,
-		attemptNumberVal: number,
 		status: ExecutionState,
 		statusText: string,
 		explanation: string,
+		extras: Record<string, unknown> = {},
 	) => ({
-		attempt_id: attemptId ?? { absence: "evidence unavailable" as TypedAbsence, explanation: "Attempt identity could not be verified." },
-		attempt_number: attemptNumberVal,
-		max_attempts: maxAttempts,
+		attempt_id: attemptIdVal,
+		attempt_number: obs.attempt_number,
+		max_attempts: obs.max_attempts,
 		status,
 		status_text: statusText,
 		evidence: "not applicable" as const,
 		absence: "not applicable" as TypedAbsence,
 		explanation,
+		...extras,
 	});
 
-	let resolvedAttemptNum = 1;
-	let resolvedAttemptId = entry.attempt_id;
-
-	try {
-		assertRegularDirNoSymlink(dir, "session directory");
-		if (loop) {
-			assertPathInsideDir(dir, finalizePath(dir, entry.instance_id), "finalization record");
-			assertRegularFileIfExists(finalizePath(dir, entry.instance_id), "finalization record", MAX_OUTPUT_FILE_BYTES);
-			assertPathInsideDir(dir, finalizePath(dir, loop.reviewer), "reviewer finalization record");
-			assertRegularFileIfExists(finalizePath(dir, loop.reviewer), "reviewer finalization record", MAX_OUTPUT_FILE_BYTES);
-			for (let n = 1; n <= maxAttempts; n++) {
-				const keyN = `${entry.instance_id}.${n}`;
-				for (const [p, lbl] of [
-					[resultPath(dir, keyN), "loop result"],
-					[dispositionPath(dir, keyN), "loop disposition"],
-					[join(dir, `${keyN}.error.json`), "loop error"],
-					[join(dir, `${keyN}.transition.json`), "loop transition"],
-					[join(dir, `${loop.reviewer}.${n}.revision.json`), "revision reservation"],
-				] as const) {
-					assertPathInsideDir(dir, p, lbl);
-					assertRegularFileIfExists(p, lbl, MAX_OUTPUT_FILE_BYTES);
-				}
-				for (const src of inboundEdgesOf(entry)) {
-					const claimP = handoffClaimPath(dir, keyN, src);
-					assertPathInsideDir(dir, claimP, "revision handoff claim");
-					assertRegularFileIfExists(claimP, "revision handoff claim", MAX_OUTPUT_FILE_BYTES);
-				}
-				if (loop.target === entry.instance_id) {
-					const fbClaimP = handoffClaimPath(dir, keyN, loop.reviewer);
-					assertPathInsideDir(dir, fbClaimP, "feedback handoff claim");
-					assertRegularFileIfExists(fbClaimP, "feedback handoff claim", MAX_OUTPUT_FILE_BYTES);
-				}
-			}
-		}
-
-		let attempt = currentAttempt(manifest, entry);
-		const finalization = loop && readFinalization(dir, task_id, loop, entry.instance_id, manifest.topology, manifest.version);
-		if (finalization && attempt && attemptNumber(finalization.attempt_id) < attempt.number) {
-			attempt = { ...attempt, number: attemptNumber(finalization.attempt_id) };
-		}
-		const attemptNum = attempt?.number ?? 1;
-		const attemptId = attempt ? `${entry.instance_id}.${attempt.number}` : entry.attempt_id;
-		resolvedAttemptNum = attemptNum;
-		resolvedAttemptId = attemptId;
-		if (finalization && attemptId && finalization.attempt_id !== attemptId) {
-			throw new Error("Finalization does not match the latest attempt");
-		}
-
-		const key = review_plan && (attempt || finalization) ? (attemptId ?? entry.instance_id) : entry.instance_id;
-		const expected = { ...expectationFor(manifest, entry), attempt_id: attemptId };
-		const resFile = resultPath(dir, key);
-		const dispFile = dispositionPath(dir, key);
-		assertPathInsideDir(dir, resFile, "node result");
-		assertPathInsideDir(dir, dispFile, "node disposition");
-		const hasResult = pathEntryExists(resFile);
-		const hasDisposition = pathEntryExists(dispFile);
-		if (hasResult && hasDisposition) {
-			throw new Error("Contradictory result and disposition records");
-		}
-
-		// Pre-check supporting status records with size limit before parsing.
-		const readyFile = readyPath(dir, entry.instance_id);
-		const progressFile = join(dir, `${entry.instance_id}.progress.json`);
-		const cancelFile = cancelPath(dir, entry.instance_id);
-		const runCancelFile = runCancelPath(dir);
-		const ffFile = failFastPath(dir);
-		const claimFile = outcomeClaimPath(dir, key);
-		assertPathInsideDir(dir, cancelFile, "cancel record");
-		assertPathInsideDir(dir, runCancelFile, "run cancel record");
-		assertPathInsideDir(dir, ffFile, "fail-fast record");
-		assertPathInsideDir(dir, claimFile, "outcome claim");
-		assertRegularFileIfExists(cancelFile, "cancel record", MAX_OUTPUT_FILE_BYTES);
-		assertRegularFileIfExists(runCancelFile, "run cancel record", MAX_OUTPUT_FILE_BYTES);
-		assertRegularFileIfExists(ffFile, "fail-fast record", MAX_OUTPUT_FILE_BYTES);
-		assertRegularFileIfExists(claimFile, "outcome claim", MAX_OUTPUT_FILE_BYTES);
-
-		const readyRead = readBoundedRegularJsonIfExists<unknown>(dir, readyFile, "worker readiness");
-		let readyAlive = false;
-		let processState: "alive" | "exited" | "not_started" = "not_started";
-		if (readyRead.exists) {
-			const ready = parseWorkerReady(readyRead.value);
-			if (ready.token !== manifest.token || ready.task_id !== task_id || ready.instance_id !== entry.instance_id) {
-				throw new Error("Foreign readiness");
-			}
-			readyAlive = processAlive(ready);
-			processState = readyAlive ? "alive" : "exited";
-		}
-
-		const cancelInfo = readCancelRecordSafe(dir, {
-			run_id: task_id,
-			node_id: entry.node_id,
-			persona_name: entry.persona_name,
-			instance_id: entry.instance_id,
-			...(attemptId ? { attempt_id: attemptId } : {}),
-		});
-		const runCancelInfo = readRunCancelRecordSafe(dir, task_id);
-		const failFastInfo = readFailFast(dir, task_id, manifest.token);
-		const claimInfo = readOutcomeClaimSafe(dir, {
-			run_id: task_id,
-			node_id: entry.node_id,
-			persona_name: entry.persona_name,
-			instance_id: entry.instance_id,
-			...(attemptId ? { attempt_id: attemptId } : {}),
-		}, key);
-		if (cancelInfo.error || runCancelInfo.error || failFastInfo.error || claimInfo.error) {
-			throw new Error(cancelInfo.error ?? runCancelInfo.error ?? failFastInfo.error ?? claimInfo.error);
-		}
-
-		const progressRead = readBoundedRegularJsonIfExists<ProgressSnapshot>(dir, progressFile, "node progress");
-		let matchingProgress: ProgressSnapshot | undefined;
-		if (progressRead.exists) {
-			const progress = progressRead.value;
-			if (progress.token !== manifest.token) throw new Error("Foreign progress");
-			if (progress.attempt_id !== undefined && progress.attempt_id !== attemptId) {
-				if (!(review_plan && progress.state === "completed" && progress.attempt_id.startsWith(`${entry.instance_id}.`))) {
-					throw new Error("Progress attempt mismatch");
-				}
-			} else if (review_plan && progress.attempt_id === undefined) {
-				throw new Error("Missing review progress attempt");
-			} else {
-				matchingProgress = progress;
-			}
-		}
-
-		if (hasDisposition) {
-			const dispRead = readBoundedRegularJsonIfExists<unknown>(dir, dispFile, "node disposition");
-			if (!dispRead.exists) {
-				return unavailable(attemptId, attemptNum, "needs_attention", OUTPUT_STATUS_TEXT.needs_attention, "Disposition record could not be read.");
-			}
-			const disp = parseDisposition(dispRead.value, expected);
-			if (disp.state === "needs_attention") {
-				return unavailable(attemptId, attemptNum, "needs_attention", OUTPUT_STATUS_TEXT.needs_attention, "Attempt ended with unresolved evidence and no recorded result.");
-			}
-			return notApplicable(
-				attemptId,
-				attemptNum,
-				disp.state,
-				OUTPUT_STATUS_TEXT[disp.state],
-				`No attempt result was recorded (${disp.state}).`,
-			);
-		}
-
-		if (hasResult) {
-			const resRead = readBoundedRegularJsonIfExists<unknown>(dir, resFile, "node result");
-			if (!resRead.exists) {
-				return unavailable(attemptId, attemptNum, "needs_attention", OUTPUT_STATUS_TEXT.needs_attention, "Result record could not be read.");
-			}
-			const record = parseCompletion(resRead.value, expected);
-			const baseState = executionFromResult(record.result.status).state;
-			const rejection = loop && finalization
-				? finalizedReviewRejection(loop, finalization, entry.node_id, record.result)
-				: undefined;
-			const status = rejection ? rejection.state : baseState;
-			const statusText = OUTPUT_STATUS_TEXT[status];
-			const summary = sanitizeOutputText(record.result.summary, OUTPUT_SUMMARY_MAX_CHARS, blockedPaths);
-			const rawDetail = typeof record.result.detail === "string" ? record.result.detail : "";
-			const detail = sanitizeOutputText(rawDetail, OUTPUT_DETAIL_MAX_CHARS, blockedPaths);
-			return {
-				attempt_id: attemptId ?? { absence: "evidence unavailable" as TypedAbsence, explanation: "Attempt identity could not be verified." },
-				attempt_number: attemptNum,
-				max_attempts: maxAttempts,
-				status,
-				status_text: statusText,
-				result_status: record.result.status,
-				evidence: "available" as const,
-				summary,
-				detail,
-				...(record.completed_at ? { completed_at: record.completed_at } : {}),
-			};
-		}
-
-		const scopedErrorFile = join(dir, `${key}.error.json`);
-		const fallbackErrorFile = join(dir, `${entry.instance_id}.error.json`);
-		const errorFile = review_plan && !pathEntryExists(scopedErrorFile) && attemptNum === 1
-			? fallbackErrorFile
-			: scopedErrorFile;
-		if (pathEntryExists(errorFile)) {
-			readBoundedRegularJsonIfExists<unknown>(dir, errorFile, "node error");
-			return unavailable(attemptId, attemptNum, "needs_attention", OUTPUT_STATUS_TEXT.needs_attention, "The attempt recorded an execution error without a verified result.");
-		}
-		if (entry.error) {
-			return unavailable(attemptId, attemptNum, "needs_attention", OUTPUT_STATUS_TEXT.needs_attention, "The attempt launch recorded an error without a verified result.");
-		}
-
-		const matchingNodeCancel = cancelInfo.record && (!review_plan || !cancelInfo.record.identity.attempt_id || cancelInfo.record.identity.attempt_id === attemptId)
-			? cancelInfo.record
-			: undefined;
-		const activeCancel = matchingNodeCancel ?? (claimInfo.claim?.outcome === "completed" ? undefined : runCancelInfo.record);
-		const deriveNonResultState = (): { status: ExecutionState; statusText: string; kind: "unavailable" | "not_applicable"; explanation: string } => {
-			if (activeCancel) {
-				if (matchingProgress?.state === "working" && readyAlive && entry.status !== "closed") {
-					return { status: "running", statusText: "Running (cancelling)", kind: "not_applicable", explanation: "Attempt output is recorded when the attempt finishes." };
-				}
-				return { status: "cancelled", statusText: OUTPUT_STATUS_TEXT.cancelled, kind: "not_applicable", explanation: "No attempt result was recorded because the attempt was cancelled." };
-			}
-			if (processState === "exited" || entry.status === "closed") {
-				return { status: "needs_attention", statusText: OUTPUT_STATUS_TEXT.needs_attention, kind: "unavailable", explanation: "The attempt ended before a verified result record was saved." };
-			}
-			if (readyAlive && matchingProgress) {
-				const status: ExecutionState = matchingProgress.state === "working" && matchingProgress.waiting_for_human_since === undefined
-					? "running"
-					: "waiting";
-				return { status, statusText: OUTPUT_STATUS_TEXT[status], kind: "not_applicable", explanation: "Attempt output is recorded when the attempt finishes." };
-			}
-			return { status: "pending", statusText: OUTPUT_STATUS_TEXT.pending, kind: "not_applicable", explanation: "Attempt output is recorded when the attempt finishes." };
-		};
-
-		const nonResult = deriveNonResultState();
-		if (claimInfo.claim?.outcome === "completed") {
-			return unavailable(attemptId, attemptNum, nonResult.status, nonResult.statusText, "The attempt recorded completion without a readable result record.");
-		}
-		return nonResult.kind === "unavailable"
-			? unavailable(attemptId, attemptNum, nonResult.status, nonResult.statusText, nonResult.explanation)
-			: notApplicable(attemptId, attemptNum, nonResult.status, nonResult.statusText, nonResult.explanation);
-	} catch {
+	if (obs.corrupt_or_unverified) {
 		return unavailable(
-			resolvedAttemptId,
-			resolvedAttemptNum,
-			"needs_attention",
-			OUTPUT_STATUS_TEXT.needs_attention,
-			"Attempt output evidence is unavailable because the result record is missing, damaged, unreadable, or fails verification.",
+			obs.attempt_status,
+			obs.attempt_status_text,
+			obs.evidence_problem ?? "Attempt output evidence is unavailable because the result record is missing, damaged, unreadable, or fails verification.",
 		);
 	}
+
+	if (obs.has_disposition && obs.disposition_record) {
+		const disp = obs.disposition_record;
+		const dispositionReason = sanitizeOutputText(
+			disp.reason || `Recorded disposition: ${disp.state}.`,
+			OUTPUT_DISPOSITION_REASON_MAX_CHARS,
+			blockedPaths,
+		);
+		const causes = projectScrubbedCauses(obs.raw_causes ?? obs.causes, blockedPaths);
+		const command = projectAttemptCommand(disp.command_evidence, blockedPaths);
+		const extras = {
+			disposition_state: disp.state,
+			disposition_reason: dispositionReason,
+			...(causes ? { causes } : {}),
+			...(disp.recorded_at ? { recorded_at: disp.recorded_at } : {}),
+			...(command ? { command } : {}),
+		};
+		if (obs.handoff_error || disp.state === "needs_attention") {
+			return unavailable(
+				obs.attempt_status,
+				obs.attempt_status_text,
+				obs.handoff_error
+					? "Node handoff evidence is missing, damaged or contradictory."
+					: "Attempt ended with unresolved evidence and no recorded result.",
+				extras,
+			);
+		}
+		return notApplicable(
+			obs.attempt_status,
+			obs.attempt_status_text,
+			`No attempt result was recorded (${disp.state}).`,
+			extras,
+		);
+	}
+
+	if (obs.has_result && obs.result_record) {
+		const record = obs.result_record;
+		const res = record.result;
+		const summary = sanitizeOutputText(res.summary, OUTPUT_SUMMARY_MAX_CHARS, blockedPaths);
+		const rawDetail = typeof res.detail === "string" ? res.detail : "";
+		const detail = sanitizeOutputText(rawDetail, OUTPUT_DETAIL_MAX_CHARS, blockedPaths);
+		const verification = buildBoundedList(res.verification, OUTPUT_LIST_MAX_ITEMS, v => ({
+			check_id: sanitizeOutputText(String(v?.check_id ?? ""), OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths),
+			result: v?.result === "pass" || v?.result === "fail" || v?.result === "error"
+				? v.result
+				: sanitizeOutputText(String(v?.result ?? "unknown"), OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths),
+			applicability: v?.applicability === "current" || v?.applicability === "stale" || v?.applicability === "unknown"
+				? v.applicability
+				: sanitizeOutputText(String(v?.applicability ?? "unknown"), OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths),
+			scope_kind: v?.scope_kind === "declared" || v?.scope_kind === "conservative" || v?.scope_kind === "unknown"
+				? v.scope_kind
+				: sanitizeOutputText(String(v?.scope_kind ?? "unknown"), OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths),
+			...(typeof v?.completed_at === "string" && v.completed_at
+				? { completed_at: sanitizeOutputText(v.completed_at, OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths) }
+				: {}),
+			...(typeof v?.reason === "string" && v.reason
+				? { reason: sanitizeOutputText(v.reason, OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths) }
+				: {}),
+		}));
+		const warnings = buildBoundedList(res.warnings, OUTPUT_LIST_MAX_ITEMS, w =>
+			sanitizeOutputText(String(w ?? ""), OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths),
+		);
+		const nextSteps = buildBoundedList(res.next_steps, OUTPUT_LIST_MAX_ITEMS, s =>
+			sanitizeOutputText(String(s ?? ""), OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths),
+		);
+		const command = projectAttemptCommand(res.command_evidence, blockedPaths);
+		const outputsText = res.outputs !== undefined
+			? sanitizeOutputText(JSON.stringify(res.outputs, null, 2), OUTPUT_STRUCTURED_MAX_CHARS, blockedPaths)
+			: undefined;
+		// Never project artifacts[].path or host provenance paths.
+		const artifacts = buildBoundedList(res.artifacts, OUTPUT_LIST_MAX_ITEMS, a => ({
+			type: sanitizeOutputText(typeof a?.type === "string" && a.type ? a.type : "artifact", 128, blockedPaths),
+			...(typeof a?.action === "string" && a.action
+				? { action: sanitizeOutputText(a.action, 128, blockedPaths) }
+				: {}),
+			...(typeof a?.description === "string" && a.description
+				? { description: sanitizeOutputText(a.description, OUTPUT_LIST_ITEM_MAX_CHARS, blockedPaths) }
+				: {}),
+			...(a?.missing !== undefined ? { missing: Boolean(a.missing) } : {}),
+		}));
+
+		return {
+			attempt_id: attemptIdVal,
+			attempt_number: obs.attempt_number,
+			max_attempts: obs.max_attempts,
+			status: obs.attempt_status,
+			status_text: obs.attempt_status_text,
+			result_status: res.status,
+			evidence: "available" as const,
+			summary,
+			detail,
+			...(verification ? { verification } : {}),
+			...(warnings ? { warnings } : {}),
+			...(nextSteps ? { next_steps: nextSteps } : {}),
+			...(command ? { command } : {}),
+			...(outputsText !== undefined ? { outputs_text: outputsText } : {}),
+			...(artifacts ? { artifacts } : {}),
+			...(record.completed_at ? { completed_at: record.completed_at } : {}),
+		};
+	}
+
+	if (obs.handoff_error) {
+		return unavailable(obs.attempt_status, obs.attempt_status_text, obs.reason ?? "Node handoff evidence is missing, damaged or contradictory.");
+	}
+
+	if (obs.upstream_closed) {
+		const dispositionReason = sanitizeOutputText(
+			obs.raw_reason || obs.reason || "Blocked by upstream review closure.",
+			OUTPUT_DISPOSITION_REASON_MAX_CHARS,
+			blockedPaths,
+		);
+		const causes = projectScrubbedCauses(obs.raw_causes ?? obs.causes, blockedPaths);
+		return notApplicable(
+			obs.attempt_status,
+			obs.attempt_status_text,
+			"No attempt result was recorded (blocked).",
+			{
+				disposition_state: "blocked",
+				disposition_reason: dispositionReason,
+				...(causes ? { causes } : {}),
+			},
+		);
+	}
+
+	if (obs.error_source) {
+		const errorMessage = obs.error_message
+			? sanitizeOutputText(obs.error_message, OUTPUT_ERROR_MAX_CHARS, blockedPaths)
+			: undefined;
+		return unavailable(
+			obs.attempt_status,
+			obs.attempt_status_text,
+			obs.evidence_problem ?? "The attempt recorded an execution error without a verified result.",
+			errorMessage ? { error_message: errorMessage } : {},
+		);
+	}
+
+	if (obs.claim_outcome === "completed") {
+		return unavailable(
+			obs.attempt_status,
+			obs.attempt_status_text,
+			"The attempt recorded completion without a readable result record.",
+		);
+	}
+
+	if (obs.attempt_status === "cancelled") {
+		const dispositionReason = sanitizeOutputText(
+			obs.cancel_reason || "Cancelled.",
+			OUTPUT_DISPOSITION_REASON_MAX_CHARS,
+			blockedPaths,
+		);
+		return notApplicable(
+			"cancelled",
+			STATUS_TEXT.cancelled,
+			"No attempt result was recorded because the attempt was cancelled.",
+			{
+				disposition_state: "cancelled",
+				disposition_reason: dispositionReason,
+			},
+		);
+	}
+
+	if (obs.evidence_problem) {
+		return unavailable(obs.attempt_status, obs.attempt_status_text, obs.evidence_problem);
+	}
+
+	return notApplicable(
+		obs.attempt_status,
+		obs.attempt_status_text,
+		"Attempt output is recorded when the attempt finishes.",
+	);
 }
 
 export type OutputSnapshotOutcome =
@@ -495,9 +409,10 @@ export function nodeOutputSnapshot(
 	if (!release.definition.agents.some(entry => entry.node.node_id === nodeId)) {
 		return { kind: "not_found", error: "Node not found in displayed run" };
 	}
-	let roster: Map<string, AgentLaunch>;
+
+	let resolved: ReturnType<typeof resolveRunObservations>;
 	try {
-		roster = verifyReleaseMatchesDefinition(factoryId, release);
+		resolved = resolveRunObservations(factoryId, release, blockedPaths, { enforceNodeRecordSizeLimit: true });
 	} catch {
 		return {
 			kind: "ok",
@@ -512,30 +427,23 @@ export function nodeOutputSnapshot(
 		};
 	}
 
-	const entry = roster.get(nodeId);
-	if (!entry) {
+	const obs = resolved.observations.get(nodeId);
+	if (!obs) {
 		return { kind: "not_found", error: "Node not found in displayed run" };
 	}
 
-	const { manifest, bound_version } = release;
-	const runBlockedPaths = [
-		...blockedPaths,
-		manifest.session_dir,
-		manifest.project_cwd,
-		...(manifest.factory_managed?.canonical_checkout ? [manifest.factory_managed.canonical_checkout] : []),
-	];
-	const latestAttempt = latestAttemptOutputForNode(manifest, entry, runBlockedPaths);
-
+	const latestAttempt = projectAttemptFromObservation(obs, resolved.runBlockedPaths);
+	const body: Record<string, unknown> = {
+		factory_id: factoryId,
+		node_id: nodeId,
+		run_id: resolved.manifest.task_id,
+		bound_version: resolved.bound_version,
+		...deletionFields,
+		evidence: latestAttempt.evidence,
+		latest_attempt: latestAttempt,
+	};
 	return {
 		kind: "ok",
-		body: {
-			factory_id: factoryId,
-			node_id: nodeId,
-			run_id: manifest.task_id,
-			bound_version,
-			...deletionFields,
-			evidence: latestAttempt.evidence,
-			latest_attempt: latestAttempt,
-		},
+		body: enforceOutputResponseBudget(body),
 	};
 }
