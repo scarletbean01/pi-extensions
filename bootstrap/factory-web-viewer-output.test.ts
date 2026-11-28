@@ -3,8 +3,9 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
+import { resolveNodeAttempts, resolveNodeObservation } from "../factory/viewer/attempt-resolution.ts";
 import { enforceOutputResponseBudget, nodeOutputSnapshot } from "../factory/viewer/output.ts";
-import { collectArtifactPathTokens, compileArtifactRedactionMatcher, sanitizeOperatorText, sanitizeOutputText } from "../factory/viewer/sanitize.ts";
+import { collectArtifactPathTokens, compileArtifactRedactionMatcher, reboundOutputText, sanitizeOperatorText, sanitizeOutputText } from "../factory/viewer/sanitize.ts";
 import { createViewerReader } from "../factory/viewer/server.ts";
 import { atomicJson, completionRecord, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
 import { handoffOfferPath } from "./handoff.ts";
@@ -527,15 +528,18 @@ test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summa
 			const doneOut = JSON.parse(doneText);
 			assert.equal(doneOut.factory_id, fac.factory_id);
 			assert.equal(doneOut.node_id, "done_node");
-			assert.equal(doneOut.latest_attempt.evidence, "available");
-			assert.equal(doneOut.latest_attempt.status, "succeeded");
-			assert.match(doneOut.latest_attempt.summary, /\n/);
-			assert.match(doneOut.latest_attempt.summary, /\[redacted-path\]/);
-			assert.ok(doneOut.latest_attempt.summary.includes("`[redacted-path]`"));
-			assert.ok(doneOut.latest_attempt.summary.includes("**[redacted-path]**"));
-			assert.match(doneOut.latest_attempt.summary, /\[ctrl\]/);
+			assert.equal(doneOut.attempts.length, 1);
+			assert.equal(doneOut.total_attempts, 1);
+			assert.equal(doneOut.omitted_attempts, 0);
+			assert.equal(doneOut.attempts[0].evidence, "available");
+			assert.equal(doneOut.attempts[0].status, "succeeded");
+			assert.match(doneOut.attempts[0].summary, /\n/);
+			assert.match(doneOut.attempts[0].summary, /\[redacted-path\]/);
+			assert.ok(doneOut.attempts[0].summary.includes("`[redacted-path]`"));
+			assert.ok(doneOut.attempts[0].summary.includes("**[redacted-path]**"));
+			assert.match(doneOut.attempts[0].summary, /\[ctrl\]/);
 			assert.equal(
-				doneOut.latest_attempt.detail,
+				doneOut.attempts[0].detail,
 				"Line 1 in [redacted-path]\nLine 2 in [redacted-path]\nLine 3 [redacted-path] [ctrl] alert <script>alert(1)</script>\nChanged `[redacted-path]` and **[redacted-path]**, <p>[redacted-path]</p>, a,[redacted-path]\nSpoof [truncated-marker]",
 			);
 
@@ -543,23 +547,23 @@ test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summa
 			const longRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=long_node`);
 			assert.equal(longRes.status, 200);
 			const longOut = await longRes.json() as any;
-			assert.equal(longOut.latest_attempt.evidence, "available");
-			assert.equal(longOut.latest_attempt.status, "partial");
-			assert.equal(longOut.latest_attempt.summary.isWellFormed(), true);
-			assert.ok(Array.from(longOut.latest_attempt.summary).length <= 1000);
-			assert.match(longOut.latest_attempt.summary, /\[truncated, \d+ characters? omitted\]$/);
-			assert.equal(longOut.latest_attempt.detail.isWellFormed(), true);
-			assert.ok(Array.from(longOut.latest_attempt.detail).length <= 8000);
-			assert.match(longOut.latest_attempt.detail, /\[truncated, \d+ characters? omitted\]$/);
+			assert.equal(longOut.attempts[0].evidence, "available");
+			assert.equal(longOut.attempts[0].status, "partial");
+			assert.equal(longOut.attempts[0].summary.isWellFormed(), true);
+			assert.ok(Array.from(longOut.attempts[0].summary).length <= 1000);
+			assert.match(longOut.attempts[0].summary, /\[truncated, \d+ characters? omitted\]$/);
+			assert.equal(longOut.attempts[0].detail.isWellFormed(), true);
+			assert.ok(Array.from(longOut.attempts[0].detail).length <= 8000);
+			assert.match(longOut.attempts[0].detail, /\[truncated, \d+ characters? omitted\]$/);
 
 			// /output for running and pending nodes -> Not applicable
 			for (const activeNode of ["run_node", "pend_node"]) {
 				const res = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=${activeNode}`);
 				assert.equal(res.status, 200);
 				const out = await res.json() as any;
-				assert.equal(out.latest_attempt.evidence, "not applicable", activeNode);
-				assert.equal(out.latest_attempt.absence, "not applicable", activeNode);
-				assert.match(out.latest_attempt.explanation, /when the attempt finishes/i, activeNode);
+				assert.equal(out.attempts[0].evidence, "not applicable", activeNode);
+				assert.equal(out.attempts[0].absence, "not applicable", activeNode);
+				assert.match(out.attempts[0].explanation, /when the attempt finishes/i, activeNode);
 			}
 
 			// /output for corrupt, wrong-identity, oversize, missing result -> Evidence unavailable & zero leaks
@@ -569,8 +573,8 @@ test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summa
 				const text = await res.text();
 				scanSentinels(text, sentinels, `output ${badNode}`);
 				const out = JSON.parse(text);
-				assert.equal(out.latest_attempt.evidence, "unavailable", badNode);
-				assert.equal(out.latest_attempt.absence, "evidence unavailable", badNode);
+				assert.equal(out.attempts[0].evidence, "unavailable", badNode);
+				assert.equal(out.attempts[0].absence, "evidence unavailable", badNode);
 			}
 
 			// /output for cmd_node returns scrubbed stdout/stderr excerpts without leaking command/args/cwd/metrics
@@ -579,13 +583,13 @@ test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summa
 			const cmdText = await cmdRes.text();
 			scanSentinels(cmdText, [...sentinels, "/etc/probe_gen/cmd.err"], "output cmd_node");
 			const cmdOut = JSON.parse(cmdText);
-			assert.equal(cmdOut.latest_attempt.command.exit_code, 0);
-			assert.equal(cmdOut.latest_attempt.command.signal, null);
-			assert.equal(cmdOut.latest_attempt.command.stdout_excerpt, "PUBLIC_CMD_STDOUT_EXCERPT\nfrom [redacted-path] [ctrl]");
-			assert.equal(cmdOut.latest_attempt.command.stderr_excerpt, "PUBLIC_CMD_STDERR_EXCERPT\nwarn [redacted-path]");
-			assert.equal("command" in cmdOut.latest_attempt.command, false);
-			assert.equal("args" in cmdOut.latest_attempt.command, false);
-			assert.equal("working_directory" in cmdOut.latest_attempt.command, false);
+			assert.equal(cmdOut.attempts[0].command.exit_code, 0);
+			assert.equal(cmdOut.attempts[0].command.signal, null);
+			assert.equal(cmdOut.attempts[0].command.stdout_excerpt, "PUBLIC_CMD_STDOUT_EXCERPT\nfrom [redacted-path] [ctrl]");
+			assert.equal(cmdOut.attempts[0].command.stderr_excerpt, "PUBLIC_CMD_STDERR_EXCERPT\nwarn [redacted-path]");
+			assert.equal("command" in cmdOut.attempts[0].command, false);
+			assert.equal("args" in cmdOut.attempts[0].command, false);
+			assert.equal("working_directory" in cmdOut.attempts[0].command, false);
 		},
 	);
 });
@@ -636,8 +640,8 @@ test("GET /api/factories/:id/output refuses symlinked and FIFO result files with
 		assert.equal(resp.status, 200);
 		assert.equal(resp.text.includes("PRIVATE_"), false, `leaked private sentinel in ${resp.path}`);
 		const body = JSON.parse(resp.text);
-		assert.equal(body.latest_attempt.evidence, "unavailable");
-		assert.equal(body.latest_attempt.absence, "evidence unavailable");
+		assert.equal(body.attempts[0].evidence, "unavailable");
+		assert.equal(body.attempts[0].absence, "evidence unavailable");
 	}
 });
 
@@ -697,14 +701,18 @@ test("GET /api/factories/:id/output tracks latest attempt in review loops and fa
 			const res = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`);
 			assert.equal(res.status, 200);
 			const out = await res.json() as any;
-			assert.equal(out.latest_attempt.attempt_number, 2);
-			assert.equal(out.latest_attempt.evidence, "not applicable");
-			assert.equal(out.latest_attempt.absence, "not applicable");
-			assert.match(out.latest_attempt.explanation, /when the attempt finishes/i);
+			assert.equal(out.attempts.length, 2);
+			assert.equal(out.attempts[0].attempt_number, 2);
+			assert.equal(out.attempts[0].evidence, "not applicable");
+			assert.equal(out.attempts[0].absence, "not applicable");
+			assert.match(out.attempts[0].explanation, /when the attempt finishes/i);
+			assert.equal(out.attempts[1].attempt_number, 1);
+			assert.equal(out.attempts[1].evidence, "available");
+			assert.equal(out.attempts[1].summary, "Attempt 1 summary");
 		},
 	);
 
-	// Now attempt 2 finishes -> latest attempt 2 output is returned.
+	// Now attempt 2 finishes -> attempts [2, 1] newest first are returned.
 	await build.complete({ status: "success", summary: "Attempt 2 summary", detail: "Attempt 2 line 1\nAttempt 2 line 2" });
 
 	await verifyReadOnlyViewer(
@@ -713,11 +721,15 @@ test("GET /api/factories/:id/output tracks latest attempt in review loops and fa
 			const res = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`);
 			assert.equal(res.status, 200);
 			const out = await res.json() as any;
-			assert.equal(out.latest_attempt.attempt_number, 2);
-			assert.equal(out.latest_attempt.evidence, "available");
-			assert.equal(out.latest_attempt.status, "succeeded");
-			assert.equal(out.latest_attempt.summary, "Attempt 2 summary");
-			assert.equal(out.latest_attempt.detail, "Attempt 2 line 1\nAttempt 2 line 2");
+			assert.equal(out.attempts.length, 2);
+			assert.equal(out.attempts[0].attempt_number, 2);
+			assert.equal(out.attempts[0].evidence, "available");
+			assert.equal(out.attempts[0].status, "succeeded");
+			assert.equal(out.attempts[0].summary, "Attempt 2 summary");
+			assert.equal(out.attempts[0].detail, "Attempt 2 line 1\nAttempt 2 line 2");
+			assert.equal(out.attempts[1].attempt_number, 1);
+			assert.equal(out.attempts[1].evidence, "available");
+			assert.equal(out.attempts[1].summary, "Attempt 1 summary");
 		},
 	);
 
@@ -898,12 +910,12 @@ test("GET /api/factories/:id/output keeps Live execution status alongside eviden
 				const out = JSON.parse(outText);
 				const liveNode = liveById.get(nodeId);
 				assert.ok(liveNode, `missing ${nodeId} in live snapshot`);
-				assert.equal(out.latest_attempt.evidence, "unavailable", nodeId);
-				assert.equal(out.latest_attempt.absence, "evidence unavailable", nodeId);
-				assert.equal(out.latest_attempt.status, liveNode.status, `${nodeId} status must match Live`);
-				assert.equal(out.latest_attempt.status_text, liveNode.status_text, `${nodeId} status_text must match Live`);
+				assert.equal(out.attempts[0].evidence, "unavailable", nodeId);
+				assert.equal(out.attempts[0].absence, "evidence unavailable", nodeId);
+				assert.equal(out.attempts[0].status, liveNode.status, `${nodeId} status must match Live`);
+				assert.equal(out.attempts[0].status_text, liveNode.status_text, `${nodeId} status_text must match Live`);
 				if (nodeId === "err_node") {
-					assert.equal(out.latest_attempt.error_message, "PUBLIC_ERR_JSON_MSG in [redacted-path] [ctrl]");
+					assert.equal(out.attempts[0].error_message, "PUBLIC_ERR_JSON_MSG in [redacted-path] [ctrl]");
 					assert.equal(liveText.includes("PUBLIC_ERR_JSON_MSG"), false, "/live must still not expose raw .error.json message");
 				}
 			}
@@ -1214,7 +1226,7 @@ test("GET /api/factories/:id/output projects verification, warnings, next_steps,
 			const richText = await richRes.text();
 			scanSentinels(richText, runtimeCommandSentinels, "output rich_node");
 			const richOut = JSON.parse(richText);
-			const richAtt = richOut.latest_attempt;
+			const richAtt = richOut.attempts[0];
 			assert.equal(richAtt.verification.items.length, 20);
 			assert.equal(richAtt.verification.total_count, 24);
 			assert.equal(richAtt.verification.omitted_count, 4);
@@ -1255,15 +1267,15 @@ test("GET /api/factories/:id/output projects verification, warnings, next_steps,
 			const cmdText = await cmdRes.text();
 			scanSentinels(cmdText, runtimeCommandSentinels, "output cmd_fail");
 			const cmdOut = JSON.parse(cmdText);
-			assert.equal(cmdOut.latest_attempt.status, "failed");
-			assert.equal(cmdOut.latest_attempt.command.exit_code, 2);
-			assert.equal(cmdOut.latest_attempt.command.signal, "SIGTERM");
-			assert.ok(Array.from(cmdOut.latest_attempt.command.stdout_excerpt).length <= 4000);
-			assert.match(cmdOut.latest_attempt.command.stdout_excerpt, /^STDOUT_HEAD \[redacted-path\]\n/);
-			assert.match(cmdOut.latest_attempt.command.stdout_excerpt, /\[truncated, \d+ characters? omitted\]$/);
-			assert.ok(Array.from(cmdOut.latest_attempt.command.stderr_excerpt).length <= 4000);
-			assert.match(cmdOut.latest_attempt.command.stderr_excerpt, /^STDERR_HEAD \[redacted-path\] \[ctrl\]\n/);
-			assert.match(cmdOut.latest_attempt.command.stderr_excerpt, /\[truncated, \d+ characters? omitted\]$/);
+			assert.equal(cmdOut.attempts[0].status, "failed");
+			assert.equal(cmdOut.attempts[0].command.exit_code, 2);
+			assert.equal(cmdOut.attempts[0].command.signal, "SIGTERM");
+			assert.ok(Array.from(cmdOut.attempts[0].command.stdout_excerpt).length <= 4000);
+			assert.match(cmdOut.attempts[0].command.stdout_excerpt, /^STDOUT_HEAD \[redacted-path\]\n/);
+			assert.match(cmdOut.attempts[0].command.stdout_excerpt, /\[truncated, \d+ characters? omitted\]$/);
+			assert.ok(Array.from(cmdOut.attempts[0].command.stderr_excerpt).length <= 4000);
+			assert.match(cmdOut.attempts[0].command.stderr_excerpt, /^STDERR_HEAD \[redacted-path\] \[ctrl\]\n/);
+			assert.match(cmdOut.attempts[0].command.stderr_excerpt, /\[truncated, \d+ characters? omitted\]$/);
 
 			// Dispositions: blocked, skipped, cancelled
 			const blkRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=blk_node`);
@@ -1271,18 +1283,18 @@ test("GET /api/factories/:id/output projects verification, warnings, next_steps,
 			const blkText = await blkRes.text();
 			scanSentinels(blkText, sentinels, "output blk_node");
 			const blkOut = JSON.parse(blkText);
-			assert.equal(blkOut.latest_attempt.evidence, "not applicable");
-			assert.equal(blkOut.latest_attempt.status, "blocked");
-			assert.equal(blkOut.latest_attempt.disposition_reason, "Blocked due to upstream failure in [redacted-path]");
-			assert.equal(blkOut.latest_attempt.causes.items[0].reason, "Failed at [redacted-path]");
+			assert.equal(blkOut.attempts[0].evidence, "not applicable");
+			assert.equal(blkOut.attempts[0].status, "blocked");
+			assert.equal(blkOut.attempts[0].disposition_reason, "Blocked due to upstream failure in [redacted-path]");
+			assert.equal(blkOut.attempts[0].causes.items[0].reason, "Failed at [redacted-path]");
 
 			const skipOut = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=skip_node`)).json() as any;
-			assert.equal(skipOut.latest_attempt.status, "skipped");
-			assert.equal(skipOut.latest_attempt.disposition_reason, "Skipped optional step under [redacted-path]");
+			assert.equal(skipOut.attempts[0].status, "skipped");
+			assert.equal(skipOut.attempts[0].disposition_reason, "Skipped optional step under [redacted-path]");
 
 			const canOut = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cancel_node`)).json() as any;
-			assert.equal(canOut.latest_attempt.status, "cancelled");
-			assert.equal(canOut.latest_attempt.disposition_reason, "Cancelled by operator in [redacted-path]");
+			assert.equal(canOut.attempts[0].status, "cancelled");
+			assert.equal(canOut.attempts[0].disposition_reason, "Cancelled by operator in [redacted-path]");
 
 			// huge_node: 64 KB response budget
 			const hugeRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=huge_node`);
@@ -1291,16 +1303,16 @@ test("GET /api/factories/:id/output projects verification, warnings, next_steps,
 			scanSentinels(hugeText, sentinels, "output huge_node");
 			assert.ok(Buffer.byteLength(hugeText, "utf8") <= 64 * 1024, `expected <= 65536 bytes, got ${Buffer.byteLength(hugeText, "utf8")}`);
 			const hugeOut = JSON.parse(hugeText);
-			assert.ok(hugeOut.latest_attempt.outputs_text.includes("truncated") || hugeOut.latest_attempt.artifacts.omitted_count > 0);
+			assert.ok(hugeOut.attempts[0].outputs_text.includes("truncated") || hugeOut.attempts[0].artifacts.omitted_count > 0);
 
 			// N-e: handoff_bad matches Live Graph status ("needs_attention" / "Uncertain")
 			const liveData = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).json() as any;
 			const liveHBad = liveData.graph.nodes.find((n: any) => n.id === "handoff_bad");
 			const outHBad = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=handoff_bad`)).json() as any;
 			assert.equal(liveHBad.status, "needs_attention");
-			assert.equal(outHBad.latest_attempt.status, "needs_attention");
-			assert.equal(outHBad.latest_attempt.status_text, "Uncertain");
-			assert.equal(outHBad.latest_attempt.evidence, "unavailable");
+			assert.equal(outHBad.attempts[0].status, "needs_attention");
+			assert.equal(outHBad.attempts[0].status_text, "Uncertain");
+			assert.equal(outHBad.attempts[0].evidence, "unavailable");
 		},
 	);
 });
@@ -1370,11 +1382,11 @@ test("GET /api/factories/:id/output matches Live Graph upstream review-closure B
 			const outText = await outRes.text();
 			assert.equal(outText.includes("PRIVATE_"), false);
 			const out = JSON.parse(outText);
-			assert.equal(out.latest_attempt.status, "blocked");
-			assert.equal(out.latest_attempt.status_text, "Blocked");
-			assert.equal(out.latest_attempt.evidence, "not applicable");
-			assert.equal(out.latest_attempt.absence, "not applicable");
-			assert.ok(typeof out.latest_attempt.disposition_reason === "string" && out.latest_attempt.disposition_reason.length > 0);
+			assert.equal(out.attempts[0].status, "blocked");
+			assert.equal(out.attempts[0].status_text, "Blocked");
+			assert.equal(out.attempts[0].evidence, "not applicable");
+			assert.equal(out.attempts[0].absence, "not applicable");
+			assert.ok(typeof out.attempts[0].disposition_reason === "string" && out.attempts[0].disposition_reason.length > 0);
 		},
 	);
 });
@@ -1605,21 +1617,21 @@ test("GET /api/factories/:id/output and /live validate/scrub hostile timestamps,
 			const artText = await artRes.text();
 			scanSentinels(artText, sentinels, "r1 art_node");
 			const artOut = JSON.parse(artText);
-			assert.equal("completed_at" in artOut.latest_attempt, false, "invalid completed_at must be omitted");
-			assert.match(artOut.latest_attempt.summary, /\[redacted-path\]/);
-			assert.match(artOut.latest_attempt.detail, /\[redacted-path\]/);
-			assert.match(artOut.latest_attempt.artifacts.items[0].description, /\[redacted-path\]/);
-			assert.match(artOut.latest_attempt.outputs_text, /"public_rel": "src\/PUBLIC_REL_OUT\.ts"/);
+			assert.equal("completed_at" in artOut.attempts[0], false, "invalid completed_at must be omitted");
+			assert.match(artOut.attempts[0].summary, /\[redacted-path\]/);
+			assert.match(artOut.attempts[0].detail, /\[redacted-path\]/);
+			assert.match(artOut.attempts[0].artifacts.items[0].description, /\[redacted-path\]/);
+			assert.match(artOut.attempts[0].outputs_text, /"public_rel": "src\/PUBLIC_REL_OUT\.ts"/);
 
 			// deep_node: 200 OK with summary, detail, verification, outputs_text
 			const deepRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=deep_node`);
 			assert.equal(deepRes.status, 200);
 			const deepOut = await deepRes.json() as any;
-			assert.equal(deepOut.latest_attempt.evidence, "available");
-			assert.equal(deepOut.latest_attempt.summary, "Deep summary ok");
-			assert.equal(deepOut.latest_attempt.detail, "Deep detail ok");
-			assert.equal(deepOut.latest_attempt.verification.items.length, 1);
-			assert.equal(typeof deepOut.latest_attempt.outputs_text, "string");
+			assert.equal(deepOut.attempts[0].evidence, "available");
+			assert.equal(deepOut.attempts[0].summary, "Deep summary ok");
+			assert.equal(deepOut.attempts[0].detail, "Deep detail ok");
+			assert.equal(deepOut.attempts[0].verification.items.length, 1);
+			assert.equal(typeof deepOut.attempts[0].outputs_text, "string");
 
 			// disp_hostile: causes validated/scrubbed, invalid recorded_at omitted
 			const dispRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=disp_hostile`);
@@ -1627,9 +1639,9 @@ test("GET /api/factories/:id/output and /live validate/scrub hostile timestamps,
 			const dispText = await dispRes.text();
 			scanSentinels(dispText, sentinels, "r1 disp_hostile");
 			const dispOut = JSON.parse(dispText);
-			assert.equal("recorded_at" in dispOut.latest_attempt, false, "invalid recorded_at must be omitted");
-			assert.equal(dispOut.latest_attempt.causes.items[0].state, "needs_attention");
-			assert.equal(dispOut.latest_attempt.causes.items[0].check.evidence, "unverified");
+			assert.equal("recorded_at" in dispOut.attempts[0], false, "invalid recorded_at must be omitted");
+			assert.equal(dispOut.attempts[0].causes.items[0].state, "needs_attention");
+			assert.equal(dispOut.attempts[0].causes.items[0].check.evidence, "unverified");
 
 			// big_ts_node: <= 64 KB
 			const bigRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=big_ts_node`);
@@ -1647,12 +1659,12 @@ test("GET /api/factories/:id/output and /live validate/scrub hostile timestamps,
 			const itemRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=item_cap_node`);
 			assert.equal(itemRes.status, 200);
 			const itemOut = await itemRes.json() as any;
-			const vItem = itemOut.latest_attempt.verification.items[0];
+			const vItem = itemOut.attempts[0].verification.items[0];
 			const vTotalCp = Array.from(
 				`${vItem.check_id}${vItem.result}${vItem.applicability}${vItem.scope_kind}${vItem.completed_at ?? ""}${vItem.reason ?? ""}`,
 			).length;
 			assert.ok(vTotalCp <= 500, `verification item total code points ${vTotalCp} exceeded 500`);
-			const aItem = itemOut.latest_attempt.artifacts.items[0];
+			const aItem = itemOut.attempts[0].artifacts.items[0];
 			const aTotalCp = Array.from(`${aItem.type}${aItem.action ?? ""}${aItem.description ?? ""}`).length;
 			assert.ok(aTotalCp <= 500, `artifact item total code points ${aTotalCp} exceeded 500`);
 		},
@@ -1720,7 +1732,7 @@ test("GET /api/factories/:id/output and /live validate/scrub hostile timestamps,
 	});
 	writeFileSync(revProgPath, `${revProgText}${" ".repeat(1_200_000)}`);
 
-	// N3: Corrupt build attempt 2 result and verify /output masks attempt_id and attempt_number to 1 like /live
+	// N3 (ticket 02) + B1 (ticket 03): Corrupt build attempt 2 result keeps verified positional attempt_number=2 on /output while /live masks to 1
 	writeFileSync(resultPath(dir2, `${be.instance_id}.2`), "{corrupt");
 
 	await verifyReadOnlyViewer(
@@ -1731,16 +1743,20 @@ test("GET /api/factories/:id/output and /live validate/scrub hostile timestamps,
 			const liveDeploy = live.graph.nodes.find((n: any) => n.id === "deploy");
 
 			const outBuild = await (await fetch(`${viewer.url}/api/factories/${fac2.factory_id}/output?node=build`)).json() as any;
-			assert.equal(outBuild.latest_attempt.evidence, "unavailable");
-			assert.equal(outBuild.latest_attempt.attempt_number, liveBuild.current_attempt.attempt_number);
-			assert.equal(outBuild.latest_attempt.attempt_number, 1);
-			assert.equal(typeof outBuild.latest_attempt.attempt_id, "object");
-			assert.equal(outBuild.latest_attempt.attempt_id.absence, "evidence unavailable");
+			assert.equal(outBuild.attempts.length, 2);
+			assert.equal(outBuild.attempts[0].evidence, "unavailable");
+			assert.equal(liveBuild.current_attempt.attempt_number, 1);
+			assert.equal(outBuild.attempts[0].attempt_number, 2);
+			assert.equal(typeof outBuild.attempts[0].attempt_id, "object");
+			assert.equal(outBuild.attempts[0].attempt_id.absence, "evidence unavailable");
+			assert.equal(outBuild.attempts[1].evidence, "available");
+			assert.equal(outBuild.attempts[1].attempt_number, 1);
+			assert.equal(outBuild.attempts[1].summary, "B1");
 
 			const outDeploy = await (await fetch(`${viewer.url}/api/factories/${fac2.factory_id}/output?node=deploy`)).json() as any;
 			assert.equal(liveDeploy.status, "blocked");
-			assert.equal(outDeploy.latest_attempt.status, liveDeploy.status);
-			assert.equal(outDeploy.latest_attempt.status_text, liveDeploy.status_text);
+			assert.equal(outDeploy.attempts[0].status, liveDeploy.status);
+			assert.equal(outDeploy.attempts[0].status_text, liveDeploy.status_text);
 		},
 	);
 
@@ -1774,9 +1790,9 @@ test("GET /api/factories/:id/output and /live validate/scrub hostile timestamps,
 				},
 			},
 		},
-		450,
+		380,
 	);
-	assert.ok(Buffer.byteLength(JSON.stringify(overBudget), "utf8") <= 450);
+	assert.ok(Buffer.byteLength(JSON.stringify(overBudget), "utf8") <= 380);
 	assert.equal(overBudget.evidence, "unavailable");
 	assert.equal((overBudget.latest_attempt as any).absence, "evidence unavailable");
 });
@@ -2012,7 +2028,7 @@ test("GET /api/factories/:id/output and /live fix B1 mid-segment leaks, B2 19k-a
 			const midText = await midRes.text();
 			assert.equal(midText.includes("PRIV_"), false, `output mid leaked PRIV_: ${midText}`);
 			assert.equal(midText.includes("~bob"), false, `output mid leaked ~bob: ${midText}`);
-			assert.equal("path" in JSON.parse(midText).latest_attempt.artifacts.items[0], false);
+			assert.equal("path" in JSON.parse(midText).attempts[0].artifacts.items[0], false);
 
 			// B2 on /output?node=many
 			const tMany0 = performance.now();
@@ -2029,7 +2045,7 @@ test("GET /api/factories/:id/output and /live fix B1 mid-segment leaks, B2 19k-a
 				["d63", d63Val],
 			] as const) {
 				const out = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=${nodeId}`)).json() as any;
-				const txtOut: string = out.latest_attempt.outputs_text;
+				const txtOut: string = out.attempts[0].outputs_text;
 				const fullLen = Array.from(JSON.stringify(rawVal, null, 2)).length;
 				const m = /… \[truncated, (\d+) characters? omitted\]$/.exec(txtOut);
 				assert.ok(m, `${nodeId} missing truncation marker`);
@@ -2040,7 +2056,7 @@ test("GET /api/factories/:id/output and /live fix B1 mid-segment leaks, B2 19k-a
 				}
 			}
 			const d64Out = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=d64`)).json() as any;
-			const d64Txt: string = d64Out.latest_attempt.outputs_text;
+			const d64Txt: string = d64Out.attempts[0].outputs_text;
 			assert.ok(d64Txt.includes('"{...}"'), `d64 should contain depth-elided "{...}"`);
 			const d64m = /… \[truncated, (\d+) characters? omitted\]$/.exec(d64Txt);
 			assert.ok(d64m);
@@ -2285,7 +2301,7 @@ test("GET /api/factories/:id/output and /live redact R3-B1 path:line/#L/@/file: 
 			assert.equal(lineOutRes.status, 200);
 			const lineOutText = await lineOutRes.text();
 			const lineOut = JSON.parse(lineOutText);
-			const att = lineOut.latest_attempt;
+			const att = lineOut.attempts[0];
 			assert.equal(
 				att.summary,
 				"Fixed [redacted-path]:12 and [redacted-path]:12:3 and [redacted-path]#L5 and [redacted-path]@HEAD and file:[redacted-path]",
@@ -2319,7 +2335,7 @@ test("GET /api/factories/:id/output and /live redact R3-B1 path:line/#L/@/file: 
 			const spacedText = await spacedRes.text();
 			assert.ok(spacedMs < 1000, `/output with spaced artifacts took ${spacedMs.toFixed(0)}ms`);
 			const spacedBody = JSON.parse(spacedText);
-			assert.equal("path" in spacedBody.latest_attempt.artifacts.items[0], false);
+			assert.equal("path" in spacedBody.attempts[0].artifacts.items[0], false);
 			assert.equal(spacedText.includes("/z0"), false);
 		},
 	);
@@ -2405,7 +2421,7 @@ test("GET /api/factories/:id/output and /live redact R4-B1 non-ASCII punctuation
 			assert.equal(outRes.status, 200);
 			const outText = await outRes.text();
 			const out = JSON.parse(outText);
-			const att = out.latest_attempt;
+			const att = out.attempts[0];
 			assert.equal(att.summary, expectedRedacted);
 			assert.equal(att.detail, expectedRedacted);
 			assert.equal(att.verification.items[0].reason, expectedRedacted);
@@ -2433,4 +2449,1182 @@ test("GET /api/factories/:id/output and /live redact R4-B1 non-ASCII punctuation
 			}
 		},
 	);
+});
+
+test("Carried-forward scrubber items: \\p{No}/\\p{Nl}/\\p{Lm} delimiters, leading sigil runs, and fast 1 MiB artifact cap check", () => {
+	const cwd = "/home/alice/proj";
+	const blocked = ["/home/alice", cwd];
+	const tokens = collectArtifactPathTokens([{ path: "src/a.ts" }], cwd);
+
+	// (a) Non-ASCII numbers (\p{No}, \p{Nl}) and modifier letters (\p{Lm}) delimit in both scrubbers,
+	// and runs of leading sigils (@, #, &, %, +, $, ^) are stripped before matching.
+	const cases: Array<[string, string]> = [
+		["src/a.ts¹", "[redacted-path]¹"],
+		["②src/a.ts②", "②[redacted-path]②"],
+		["src/a.ts½", "[redacted-path]½"],
+		["src/a.tsʼs", "[redacted-path]ʼs"],
+		["src/a.tsⅠ", "[redacted-path]Ⅰ"],
+		["@@src/a.ts", "@@[redacted-path]"],
+		["+src/a.ts", "+[redacted-path]"],
+		["$src/a.ts", "$[redacted-path]"],
+		["^src/a.ts", "^[redacted-path]"],
+		["+@$^src/a.ts:12", "+@$^\[redacted-path]:12".replace("\\", "")],
+		["@@file:src/a.ts:3", "@@file:[redacted-path]:3"],
+	];
+	for (const [input, expected] of cases) {
+		assert.equal(sanitizeOutputText(input, 1000, blocked, tokens), expected, `output failed on ${input}`);
+		assert.equal(sanitizeOperatorText(input, 1000, blocked, tokens), expected, `operator failed on ${input}`);
+	}
+	assert.deepEqual(
+		collectArtifactPathTokens([
+			{ path: "src/a¹.ts" },
+			{ path: "src/a②.ts" },
+			{ path: "src/a½.ts" },
+			{ path: "src/aʼs.ts" },
+			{ path: "src/aⅠ.ts" },
+		], cwd),
+		[],
+	);
+
+	// (b) 1+ MiB of artifact paths is rejected/bounded fast without per-code-unit regex overhead
+	const hugeArtifacts = Array.from({ length: 20 }, (_, i) => ({
+		type: "file",
+		path: `dir_${i}/${"a".repeat(60_000)}.ts`,
+	}));
+	const t0 = performance.now();
+	const hugeTokens = collectArtifactPathTokens(hugeArtifacts, cwd);
+	const elapsed = performance.now() - t0;
+	assert.ok(elapsed < 100, `1.2 MiB artifact path collection took too long: ${elapsed.toFixed(1)}ms`);
+	assert.ok(hugeTokens.reduce((sum, tok) => sum + tok.length, 0) <= 256 * 1024);
+});
+
+test("Ticket 03: multi-attempt ordering, 20-attempt cap, 64KB response budget + trim order, independent per-attempt typing, and linear perf", async t => {
+	const { symlinkSync, writeFileSync } = await import("node:fs");
+	const { handoffClaimPath, inputDigest } = await import("./handoff.ts");
+	const { finalizePath } = await import("./review-loop.ts");
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	// 1. 11-attempt persisted review loop (max_revisions: 10 limit in parseReviewPlan) + 23-attempt cap verification via resolveNodeAttempts
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_T03_PROMPT",
+		agents: [
+			{ node_id: "build", persona: "builder", sub_task: "PRIVATE_T03_BUILD" },
+			{
+				node_id: "review",
+				persona: "reviewer",
+				depends_on: ["build"],
+				sub_task: "PRIVATE_T03_REV",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 10, on_exhausted: "needs_attention" },
+			},
+			{ node_id: "solo", persona: "builder", sub_task: "PRIVATE_T03_SOLO" },
+		],
+	};
+
+	const fac = ops({ action: "publish", name: "t03-loop-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-t03" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "t03-ref", brief: "PRIVATE_T03_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const entryOf = (nodeId: string) => launched.manifest.pane_manifest.find(e => e.node_id === nodeId)!;
+	const buildEntry = entryOf("build");
+	const reviewEntry = entryOf("review");
+	const soloEntry = entryOf("solo");
+	const buildCfg = readJson<WorkerConfig>(join(dir, `${buildEntry.instance_id}.config.json`));
+	const reviewCfg = readJson<WorkerConfig>(join(dir, `${reviewEntry.instance_id}.config.json`));
+	const soloCfg = readJson<WorkerConfig>(join(dir, `${soloEntry.instance_id}.config.json`));
+
+	// Solo node has 1 attempt
+	atomicJson(
+		resultPath(dir, soloEntry.attempt_id!),
+		completionRecord(soloCfg, { agent_name: soloEntry.persona_name, node_id: "solo", status: "success", summary: "Solo summary", detail: "Solo detail" }, "not_required", "2026-11-28T10:00:00.000Z"),
+	);
+
+	const seedLoopIteration = (
+		n: number,
+		buildResOpts: { status?: "success" | "partial" | "failure"; summary?: string; detail?: string; outputs?: Record<string, unknown>; warnings?: string[] },
+		verdict: "approve" | "revise",
+		writeBuildResult = true,
+	) => {
+		const bId = `${buildEntry.instance_id}.${n}`;
+		const rId = `${reviewEntry.instance_id}.${n}`;
+		const ts = `2026-11-28T10:00:${String(n).padStart(2, "0")}.000Z`;
+		let bDigest = "0".repeat(64);
+		if (writeBuildResult) {
+			const rec = completionRecord(
+				{ ...buildCfg, attempt_id: bId },
+				{
+					agent_name: buildEntry.persona_name,
+					node_id: "build",
+					status: buildResOpts.status ?? "success",
+					summary: buildResOpts.summary ?? `Build summary ${n}`,
+					detail: buildResOpts.detail ?? `Build detail ${n}\nline 2`,
+					...(buildResOpts.outputs ? { outputs: buildResOpts.outputs } : {}),
+					...(buildResOpts.warnings ? { warnings: buildResOpts.warnings } : {}),
+				},
+				"sent",
+				ts,
+			);
+			atomicJson(resultPath(dir, bId), rec);
+			bDigest = inputDigest(rec.result);
+		}
+		if (n >= 2) {
+			atomicJson(join(dir, `${reviewEntry.instance_id}.${n}.revision.json`), {
+				version: 1,
+				run_id: launched.task_id,
+				reviewer: reviewEntry.instance_id,
+				attempt: n,
+			});
+			atomicJson(handoffClaimPath(dir, bId, reviewEntry.instance_id), {
+				version: 1,
+				handoff_id: `h-fb-${n}`,
+				state: "accepted",
+				run_id: launched.task_id,
+				source: { node_id: "review", attempt_id: `${reviewEntry.instance_id}.${n - 1}`, instance_id: reviewEntry.instance_id, session_id: "s-rev" },
+				destination: { node_id: "build", attempt_id: bId, instance_id: buildEntry.instance_id },
+				input_digest: "0".repeat(64),
+				offer: "matched",
+				accepted_at: ts,
+			});
+		}
+		const rRec = completionRecord(
+			{ ...reviewCfg, attempt_id: rId },
+			{
+				agent_name: reviewEntry.persona_name,
+				node_id: "review",
+				status: "success",
+				summary: `Review summary ${n}`,
+				detail: `Review detail ${n}`,
+				outputs: { verdict },
+			},
+			"sent",
+			ts,
+		);
+		atomicJson(resultPath(dir, rId), rRec);
+		atomicJson(handoffClaimPath(dir, rId, buildEntry.instance_id), {
+			version: 1,
+			handoff_id: `h-rev-${n}`,
+			state: "accepted",
+			run_id: launched.task_id,
+			source: { node_id: "build", attempt_id: bId, instance_id: buildEntry.instance_id, session_id: "s-bld" },
+			destination: { node_id: "review", attempt_id: rId, instance_id: reviewEntry.instance_id },
+			input_digest: bDigest,
+			offer: "matched",
+			accepted_at: ts,
+		});
+		if (n >= 2) {
+			atomicJson(handoffClaimPath(dir, rId, buildEntry.instance_id), {
+				version: 1,
+				handoff_id: `h-rev-${n}`,
+				state: "accepted",
+				run_id: launched.task_id,
+				source: { node_id: "build", attempt_id: bId, instance_id: buildEntry.instance_id, session_id: "s-bld" },
+				destination: { node_id: "review", attempt_id: rId, instance_id: reviewEntry.instance_id },
+				input_digest: bDigest,
+				offer: "matched",
+				accepted_at: ts,
+			});
+		}
+	};
+
+	for (let n = 1; n <= 11; n++) {
+		// Make attempt 9 have wrong node identity and attempt 10 be corrupt JSON to verify independent typing across attempts
+		if (n === 9) {
+			seedLoopIteration(n, {}, "revise", false);
+			atomicJson(resultPath(dir, `${buildEntry.instance_id}.9`), {
+				version: 6,
+				identity: {
+					run_id: launched.task_id,
+					node_id: "other_wrong_node",
+					persona_name: buildEntry.persona_name,
+					attempt_id: `${buildEntry.instance_id}.9`,
+					instance_id: buildEntry.instance_id,
+				},
+				result: { agent_name: buildEntry.persona_name, node_id: "other_wrong_node", status: "success", summary: "PRIVATE_WRONG_NODE_SUM", detail: "PRIVATE_WRONG_NODE_DET" },
+				delivery: "not_required",
+				completed_at: "2026-11-28T10:00:09.000Z",
+			});
+		} else if (n === 10) {
+			seedLoopIteration(n, {}, "revise", false);
+			writeFileSync(resultPath(dir, `${buildEntry.instance_id}.10`), "{corrupt PRIVATE_BAD_10");
+		} else {
+			seedLoopIteration(n, {
+				status: n === 11 ? "success" : (n % 2 === 0 ? "partial" : "failure"),
+				summary: `Build summary ${n} in ${f.cwd}/file${n}.ts`,
+				detail: `Build detail ${n}\nline 2`,
+				outputs: { iter: n, note: `iter-${n}` },
+			}, n === 11 ? "approve" : "revise");
+		}
+	}
+	atomicJson(finalizePath(dir, reviewEntry.instance_id), {
+		version: 1,
+		run_id: launched.task_id,
+		instance_id: reviewEntry.instance_id,
+		attempt_id: `${reviewEntry.instance_id}.11`,
+		finalized_by: reviewEntry.instance_id,
+	});
+	atomicJson(finalizePath(dir, buildEntry.instance_id), {
+		version: 1,
+		run_id: launched.task_id,
+		instance_id: buildEntry.instance_id,
+		attempt_id: `${buildEntry.instance_id}.11`,
+		finalized_by: reviewEntry.instance_id,
+	});
+
+	const sentinels = ["PRIVATE_", f.root, f.cwd, f.home, dir, statePath, coordinationPath];
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			// Single-attempt node shows 1
+			const soloOut = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=solo`)).json() as any;
+			assert.equal(soloOut.attempts.length, 1);
+			assert.equal(soloOut.total_attempts, 1);
+			assert.equal(soloOut.omitted_attempts, 0);
+			assert.equal("omitted_marker" in soloOut, false);
+
+			// 11-attempt node over HTTP -> newest first [11..1], mixed damaged attempts 10 & 9 do not hide 11 or 8..1
+			const bRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`);
+			assert.equal(bRes.status, 200);
+			const bText = await bRes.text();
+			scanSentinels(bText, sentinels, "output build 11-attempt");
+			const bOut = JSON.parse(bText);
+			assert.equal(bOut.attempts.length, 11);
+			assert.equal(bOut.total_attempts, 11);
+			assert.equal(bOut.omitted_attempts, 0);
+			assert.equal("omitted_marker" in bOut, false);
+			assert.equal(bOut.attempts[0].attempt_number, 11);
+			assert.equal(bOut.attempts[0].max_attempts, 11);
+			assert.equal(bOut.attempts[0].status, "succeeded");
+			assert.equal(bOut.attempts[0].evidence, "available");
+			assert.equal(bOut.attempts[0].summary, "Build summary 11 in [redacted-path]");
+			// Attempt 10 (index 1) corrupt JSON -> evidence unavailable with verified attempt_number 10 without hiding 11 or 8..1
+			assert.equal(bOut.attempts[1].attempt_number, 10);
+			assert.equal(bOut.attempts[1].evidence, "unavailable");
+			assert.equal(bOut.attempts[1].absence, "evidence unavailable");
+			assert.equal(typeof bOut.attempts[1].attempt_id, "object");
+			assert.equal(bOut.attempts[1].attempt_id.absence, "evidence unavailable");
+			// Attempt 9 (index 2) wrong node_id -> evidence unavailable with verified attempt_number 9, zero leaked text
+			assert.equal(bOut.attempts[2].attempt_number, 9);
+			assert.equal(bOut.attempts[2].evidence, "unavailable");
+			assert.equal(bOut.attempts[2].absence, "evidence unavailable");
+			// Attempt 8 (index 3) and Attempt 1 (index 10) remain readable in order
+			assert.equal(bOut.attempts[3].attempt_number, 8);
+			assert.equal(bOut.attempts[3].evidence, "available");
+			assert.equal(bOut.attempts[10].attempt_number, 1);
+			assert.equal(bOut.attempts[10].evidence, "available");
+		},
+	);
+
+	// Extend disk loop fixture to 23 attempts and test OUTPUT_MAX_ATTEMPTS = 20 cap via resolveNodeAttempts + enforceOutputResponseBudget
+	for (let n = 12; n <= 23; n++) {
+		if (n === 21) {
+			seedLoopIteration(n, {}, "revise", false);
+			atomicJson(resultPath(dir, `${buildEntry.instance_id}.21`), {
+				version: 6,
+				identity: {
+					run_id: launched.task_id,
+					node_id: "other_wrong_node",
+					persona_name: buildEntry.persona_name,
+					attempt_id: `${buildEntry.instance_id}.21`,
+					instance_id: buildEntry.instance_id,
+				},
+				result: { agent_name: buildEntry.persona_name, node_id: "other_wrong_node", status: "success", summary: "PRIVATE_WRONG_NODE_SUM", detail: "PRIVATE_WRONG_NODE_DET" },
+				delivery: "not_required",
+				completed_at: "2026-11-28T10:00:21.000Z",
+			});
+		} else if (n === 22) {
+			seedLoopIteration(n, {}, "revise", false);
+			writeFileSync(resultPath(dir, `${buildEntry.instance_id}.22`), "{corrupt PRIVATE_BAD_22");
+		} else {
+			seedLoopIteration(n, {
+				status: n === 23 ? "success" : (n % 2 === 0 ? "partial" : "failure"),
+				summary: `Build summary ${n} in ${f.cwd}/file${n}.ts`,
+				detail: `Build detail ${n}\nline 2`,
+				outputs: { iter: n, note: `iter-${n}` },
+			}, n === 23 ? "approve" : "revise");
+		}
+	}
+	atomicJson(finalizePath(dir, reviewEntry.instance_id), {
+		version: 1,
+		run_id: launched.task_id,
+		instance_id: reviewEntry.instance_id,
+		attempt_id: `${reviewEntry.instance_id}.23`,
+		finalized_by: reviewEntry.instance_id,
+	});
+	atomicJson(finalizePath(dir, buildEntry.instance_id), {
+		version: 1,
+		run_id: launched.task_id,
+		instance_id: buildEntry.instance_id,
+		attempt_id: `${buildEntry.instance_id}.23`,
+		finalized_by: reviewEntry.instance_id,
+	});
+	const manifest25 = {
+		...launched.manifest,
+		review_plan: {
+			...launched.manifest.review_plan!,
+			max_total_attempts: 60,
+			loops: [{ ...launched.manifest.review_plan!.loops[0], max_revisions: 24 }],
+		},
+	};
+	const byInstance = new Map(manifest25.pane_manifest.map(e => [e.instance_id, e.node_id]));
+	const resolved23 = resolveNodeAttempts(
+		manifest25,
+		buildEntry,
+		byInstance,
+		sentinels.filter(s => s !== "PRIVATE_"),
+		{
+			attempt_id: `${buildEntry.instance_id}.23`,
+			attempt_number: 23,
+			max_attempts: 25,
+			instance_id: buildEntry.instance_id,
+			key: `${buildEntry.instance_id}.23`,
+			has_result: true,
+			has_disposition: false,
+			corrupt_or_unverified: false,
+			status: "succeeded",
+			status_text: "Succeeded",
+			attempt_status: "succeeded",
+			attempt_status_text: "Succeeded",
+			completed_at: "2026-11-28T10:00:23.000Z",
+			resource_state: "finished",
+			process_state: "exited",
+		} as any,
+		20,
+	);
+	assert.equal(resolved23.attempts.length, 20);
+	assert.equal(resolved23.totalAttempts, 23);
+	assert.equal(resolved23.omittedAttempts, 3);
+	assert.equal(resolved23.attempts[0].attempt_number, 23);
+	assert.equal(resolved23.attempts[0].status, "succeeded");
+	assert.equal(resolved23.attempts[1].attempt_number, 22);
+	assert.equal(resolved23.attempts[1].corrupt_or_unverified, true);
+	assert.equal(resolved23.attempts[1].status, "needs_attention");
+	assert.equal(resolved23.attempts[2].attempt_number, 21);
+	assert.equal(resolved23.attempts[2].corrupt_or_unverified, true);
+	assert.equal(resolved23.attempts[2].status, "needs_attention");
+	assert.equal(resolved23.attempts[3].attempt_number, 20);
+	assert.equal(Boolean(resolved23.attempts[3].corrupt_or_unverified), false);
+	assert.equal(resolved23.attempts[19].attempt_number, 4);
+	assert.equal(Boolean(resolved23.attempts[19].corrupt_or_unverified), false);
+
+	// 2. Maximal fields: 11 attempts over HTTP + 20 attempts in enforceOutputResponseBudget -> <= 64KB, < 1s, valid surrogate pairs
+	const fMax = serviceFixture(t, ["builder", "reviewer"]);
+	const stateMax = join(fMax.root, "factories.sqlite");
+	const coordMax = join(fMax.root, "factory-coordination.sqlite");
+	const envMax = { PATH: join(fMax.root, "bin"), PI_BOOTSTRAP_STATE_DIR: fMax.stateDir };
+	const opsMax = factoryOperations(stateMax, fMax.service, { coordinationPath: coordMax });
+	const draftMax: GenerateRequest = {
+		project_cwd: fMax.cwd,
+		topology: "graph",
+		task: "PRIVATE_MAX_PROMPT",
+		agents: [
+			{ node_id: "build", persona: "builder", sub_task: "PRIVATE_MAX_B" },
+			{
+				node_id: "review",
+				persona: "reviewer",
+				depends_on: ["build"],
+				sub_task: "PRIVATE_MAX_R",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 10, on_exhausted: "needs_attention" },
+			},
+		],
+	};
+	const facMax = opsMax({ action: "publish", name: "t03-max-fac", draft: draftMax, sessionModel });
+	const authMax = createManagerAuthority({ pi_session_id: "sess-t03-max" });
+	opsMax({ action: "resume", factory_id: facMax.factory_id, authority: authMax });
+	opsMax({ action: "submit", factory_id: facMax.factory_id, authority: authMax, reference: "t03-max-ref", brief: "PRIVATE_MAX_BRIEF" });
+	const launchedMax = await opsMax({ action: "launch", factory_id: facMax.factory_id, authority: authMax });
+	revokeManagerAuthority(authMax);
+
+	const dirMax = launchedMax.manifest.session_dir;
+	const maxBuild = launchedMax.manifest.pane_manifest.find(e => e.node_id === "build")!;
+	const maxRev = launchedMax.manifest.pane_manifest.find(e => e.node_id === "review")!;
+	const maxBuildCfg = readJson<WorkerConfig>(join(dirMax, `${maxBuild.instance_id}.config.json`));
+	const maxRevCfg = readJson<WorkerConfig>(join(dirMax, `${maxRev.instance_id}.config.json`));
+
+	for (let n = 1; n <= 11; n++) {
+		const bId = `${maxBuild.instance_id}.${n}`;
+		const rId = `${maxRev.instance_id}.${n}`;
+		const ts = `2026-11-28T11:00:${String(n).padStart(2, "0")}.000Z`;
+		const rec = completionRecord(
+			{ ...maxBuildCfg, attempt_id: bId },
+			{
+				agent_name: maxBuild.persona_name,
+				node_id: "build",
+				status: n === 11 ? "success" : "partial",
+				summary: `Newest-protected summary ${n} ${"S".repeat(900)}`,
+				detail: `${"D".repeat(7900)}🚀${"E".repeat(100)}`,
+				verification: Array.from({ length: 20 }, (_, i) => ({
+					check_id: `chk-${n}-${i}-${"C".repeat(440)}`,
+					result: "pass" as const,
+					scope_kind: "declared" as const,
+					applicability: "current" as const,
+				})),
+				warnings: Array.from({ length: 20 }, (_, i) => `W${n}-${i}-${"W".repeat(480)}`),
+				next_steps: Array.from({ length: 20 }, (_, i) => `N${n}-${i}-${"N".repeat(480)}`),
+				outputs: { blob: `${"J".repeat(7900)}🚀` },
+				artifacts: Array.from({ length: 20 }, (_, i) => ({
+					type: "file",
+					path: join(fMax.cwd, `PRIVATE_MAX_ART_${n}_${i}.ts`),
+					description: `Art-${n}-${i}-${"A".repeat(480)}`,
+				})),
+			},
+			"sent",
+			ts,
+		);
+		writeFileSync(resultPath(dirMax, bId), JSON.stringify(rec));
+		const bDigest = inputDigest(rec.result);
+		if (n >= 2) {
+			atomicJson(join(dirMax, `${maxRev.instance_id}.${n}.revision.json`), {
+				version: 1,
+				run_id: launchedMax.task_id,
+				reviewer: maxRev.instance_id,
+				attempt: n,
+			});
+			atomicJson(handoffClaimPath(dirMax, bId, maxRev.instance_id), {
+				version: 1,
+				handoff_id: `hm-fb-${n}`,
+				state: "accepted",
+				run_id: launchedMax.task_id,
+				source: { node_id: "review", attempt_id: `${maxRev.instance_id}.${n - 1}`, instance_id: maxRev.instance_id, session_id: "sr" },
+				destination: { node_id: "build", attempt_id: bId, instance_id: maxBuild.instance_id },
+				input_digest: "0".repeat(64),
+				offer: "matched",
+				accepted_at: ts,
+			});
+		}
+		atomicJson(resultPath(dirMax, rId), completionRecord(
+			{ ...maxRevCfg, attempt_id: rId },
+			{ agent_name: maxRev.persona_name, node_id: "review", status: "success", summary: `R${n}`, outputs: { verdict: n === 11 ? "approve" : "revise" } },
+			"sent",
+			ts,
+		));
+		atomicJson(handoffClaimPath(dirMax, rId, maxBuild.instance_id), {
+			version: 1,
+			handoff_id: `hm-r-${n}`,
+			state: "accepted",
+			run_id: launchedMax.task_id,
+			source: { node_id: "build", attempt_id: bId, instance_id: maxBuild.instance_id, session_id: "sb" },
+			destination: { node_id: "review", attempt_id: rId, instance_id: maxRev.instance_id },
+			input_digest: bDigest,
+			offer: "matched",
+			accepted_at: ts,
+		});
+	}
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: fMax.root, viewerOptions: { statePath: stateMax, coordinationPath: coordMax, env: envMax, home: fMax.home } },
+		async viewer => {
+			const tOut0 = performance.now();
+			const outRes = await fetch(`${viewer.url}/api/factories/${facMax.factory_id}/output?node=build`);
+			const outMs = performance.now() - tOut0;
+			assert.equal(outRes.status, 200);
+			const outText = await outRes.text();
+			assert.ok(outMs < 1000, `11 maximal attempts /output took ${outMs.toFixed(0)}ms`);
+			assert.ok(Buffer.byteLength(outText, "utf8") <= 64 * 1024, `expected <= 65536 bytes, got ${Buffer.byteLength(outText, "utf8")}`);
+			assert.equal(outText.includes("PRIVATE_"), false);
+			const parsed = JSON.parse(outText);
+			assert.equal(parsed.attempts[0].attempt_number, 11);
+			assert.equal(parsed.attempts[0].status, "succeeded");
+			assert.ok(parsed.attempts[0].summary.startsWith("Newest-protected summary 11 "));
+			assert.equal(parsed.attempts.length + parsed.omitted_attempts, 11);
+			assert.ok(parsed.attempts.length >= 1);
+			if (parsed.omitted_attempts > 0) {
+				assert.match(parsed.omitted_marker, /\[truncated, \d+ attempts? omitted\]/);
+			}
+			assert.ok(typeof parsed.attempts[0].detail === "string");
+			for (const a of parsed.attempts) {
+				if (typeof a.detail === "string") assert.equal(a.detail.isWellFormed(), true);
+				if (typeof a.outputs_text === "string") assert.equal(a.outputs_text.isWellFormed(), true);
+			}
+			// B3: Every trimmed older attempt field carries a counted truncation marker, never a bare "…"
+			for (const a of parsed.attempts.slice(1)) {
+				for (const field of ["summary", "detail", "outputs_text"] as const) {
+					const val = a[field];
+					if (typeof val === "string") {
+						assert.notEqual(val, "…", `Attempt ${a.attempt_number}.${field} must not be trimmed to bare "…"`);
+						assert.match(val, /… \[truncated, \d+ characters? omitted\]$/, `Attempt ${a.attempt_number}.${field} missing counted marker`);
+					}
+				}
+			}
+
+			const tLive0 = performance.now();
+			const liveRes = await fetch(`${viewer.url}/api/factories/${facMax.factory_id}/live`);
+			const liveMs = performance.now() - tLive0;
+			assert.equal(liveRes.status, 200);
+			assert.ok(liveMs < 1000, `11 maximal attempts /live took ${liveMs.toFixed(0)}ms`);
+		},
+	);
+
+	// 20 maximal attempts (with 4-byte UTF-8 emojis so even 20 summaries exceed 64KB) directly through enforceOutputResponseBudget
+	const max20Attempts = Array.from({ length: 20 }, (_, idx) => {
+		const n = 20 - idx;
+		return {
+			attempt_id: `b.${n}`,
+			attempt_number: n,
+			max_attempts: 20,
+			status: n === 20 ? "succeeded" : "partial",
+			status_text: n === 20 ? "Succeeded" : "Partial",
+			evidence: "available",
+			summary: `Newest-protected summary ${n} ${"🚀".repeat(900)}`,
+			detail: `${"D".repeat(7900)}🚀${"E".repeat(99)}`,
+			outputs_text: `${"J".repeat(7900)}🚀`,
+			verification: Array.from({ length: 20 }, (_, i) => ({ check_id: `chk-${n}-${i}-${"C".repeat(440)}`, result: "pass", applicability: "current" })),
+			warnings: Array.from({ length: 20 }, (_, i) => `W${n}-${i}-${"W".repeat(480)}`),
+			next_steps: Array.from({ length: 20 }, (_, i) => `N${n}-${i}-${"N".repeat(480)}`),
+			artifacts: Array.from({ length: 20 }, (_, i) => ({ type: "file", description: `Art-${n}-${i}-${"A".repeat(480)}` })),
+		};
+	});
+	const tBudget0 = performance.now();
+	const budgeted20 = enforceOutputResponseBudget({
+		factory_id: "fmax",
+		node_id: "build",
+		run_id: "r1",
+		bound_version: "v1",
+		evidence: "available",
+		attempts: max20Attempts,
+		total_attempts: 20,
+		omitted_attempts: 0,
+	});
+	const budgetMs = performance.now() - tBudget0;
+	const budgetedJson = JSON.stringify(budgeted20);
+	assert.ok(budgetMs < 1000, `20 maximal attempts budget enforcement took ${budgetMs.toFixed(0)}ms`);
+	assert.ok(Buffer.byteLength(budgetedJson, "utf8") <= 64 * 1024);
+	assert.equal((budgeted20.attempts as any[])[0].attempt_number, 20);
+	assert.equal((budgeted20.attempts as any[])[0].status, "succeeded");
+	assert.ok((budgeted20.attempts as any[])[0].summary.startsWith("Newest-protected summary 20 "));
+	assert.ok((budgeted20.omitted_attempts as number) > 0);
+	assert.match(String(budgeted20.omitted_marker), /\[truncated, \d+ attempts? omitted\]/);
+	for (const a of budgeted20.attempts as any[]) {
+		if (typeof a.detail === "string") assert.equal(a.detail.isWellFormed(), true);
+		if (typeof a.outputs_text === "string") assert.equal(a.outputs_text.isWellFormed(), true);
+	}
+
+	// 3. Controlled trim order unit test: older attempts' optional sections first, then older attempts' bodies, never newest summary/status
+	const trimBody = enforceOutputResponseBudget(
+		{
+			factory_id: "f1",
+			node_id: "n1",
+			evidence: "available",
+			total_attempts: 2,
+			omitted_attempts: 0,
+			attempts: [
+				{
+					attempt_id: "a.2",
+					attempt_number: 2,
+					max_attempts: 2,
+					status: "succeeded",
+					status_text: "Succeeded",
+					evidence: "available",
+					summary: "NEWEST_SUMMARY",
+					detail: "NEWEST_DETAIL",
+					outputs_text: "{\"newest\":true}",
+				},
+				{
+					attempt_id: "a.1",
+					attempt_number: 1,
+					max_attempts: 2,
+					status: "failure",
+					status_text: "Failed",
+					evidence: "available",
+					summary: "OLDER_SUMMARY",
+					detail: "D".repeat(400),
+					outputs_text: "O".repeat(600),
+				},
+			],
+		},
+		1050,
+	);
+	assert.ok(Buffer.byteLength(JSON.stringify(trimBody), "utf8") <= 1050);
+	const trimAtts = trimBody.attempts as any[];
+	assert.equal(trimAtts[0].summary, "NEWEST_SUMMARY");
+	assert.equal(trimAtts[0].detail, "NEWEST_DETAIL");
+	assert.equal(trimAtts[0].outputs_text, "{\"newest\":true}");
+	assert.equal(trimAtts[0].status, "succeeded");
+	// Optional section outputs_text is trimmed first before older attempt's detail
+	assert.ok(trimAtts[1].outputs_text.includes("truncated"));
+	assert.equal(trimAtts[1].detail, "D".repeat(400));
+
+	// Tighter budget drops oldest attempt while preserving newest attempt's summary and status
+	const dropOlderBody = enforceOutputResponseBudget(
+		{
+			factory_id: "f1",
+			node_id: "n1",
+			evidence: "available",
+			total_attempts: 2,
+			omitted_attempts: 0,
+			attempts: [
+				{
+					attempt_id: "a.2",
+					attempt_number: 2,
+					max_attempts: 2,
+					status: "succeeded",
+					status_text: "Succeeded",
+					evidence: "available",
+					summary: "NEWEST_SUMMARY",
+					detail: "NEWEST_DETAIL",
+					outputs_text: "{\"newest\":true}",
+				},
+				{
+					attempt_id: "a.1",
+					attempt_number: 1,
+					max_attempts: 2,
+					status: "failure",
+					status_text: "Failed",
+					evidence: "available",
+					summary: "OLDER_SUMMARY",
+					detail: "D".repeat(400),
+					outputs_text: "O".repeat(600),
+				},
+			],
+		},
+		420,
+	);
+	assert.ok(Buffer.byteLength(JSON.stringify(dropOlderBody), "utf8") <= 420);
+	assert.equal(dropOlderBody.omitted_attempts, 1);
+	assert.equal(dropOlderBody.omitted_marker, "… [truncated, 1 attempt omitted]");
+	assert.equal((dropOlderBody.attempts as any[]).length, 1);
+	assert.equal((dropOlderBody.attempts as any[])[0].summary, "NEWEST_SUMMARY");
+	assert.equal((dropOlderBody.attempts as any[])[0].status, "succeeded");
+
+	// 4. Child watchdog: FIFO in attempt 1 alongside valid attempt 2 never blocks or hides attempt 2
+	const fFifo = serviceFixture(t, ["builder", "reviewer"]);
+	const stateFifo = join(fFifo.root, "factories.sqlite");
+	const coordFifo = join(fFifo.root, "factory-coordination.sqlite");
+	const envFifo = { PATH: join(fFifo.root, "bin"), PI_BOOTSTRAP_STATE_DIR: fFifo.stateDir };
+	const opsFifo = factoryOperations(stateFifo, fFifo.service, { coordinationPath: coordFifo });
+	const facFifo = opsFifo({
+		action: "publish",
+		name: "t03-fifo-fac",
+		draft: {
+			project_cwd: fFifo.cwd,
+			topology: "graph",
+			task: "PRIVATE_FIFO_P",
+			agents: [
+				{ node_id: "build", persona: "builder", sub_task: "PRIVATE_FIFO_B" },
+				{
+					node_id: "review",
+					persona: "reviewer",
+					depends_on: ["build"],
+					sub_task: "PRIVATE_FIFO_R",
+					output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+					decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 2, on_exhausted: "failed" },
+				},
+			],
+		},
+		sessionModel,
+	});
+	const authFifo = createManagerAuthority({ pi_session_id: "sess-t03-fifo" });
+	opsFifo({ action: "resume", factory_id: facFifo.factory_id, authority: authFifo });
+	opsFifo({ action: "submit", factory_id: facFifo.factory_id, authority: authFifo, reference: "t03-fifo-ref", brief: "PRIVATE_FIFO_BRIEF" });
+	const launchedFifo = await opsFifo({ action: "launch", factory_id: facFifo.factory_id, authority: authFifo });
+	revokeManagerAuthority(authFifo);
+
+	const dirFifo = launchedFifo.manifest.session_dir;
+	const bFifo = launchedFifo.manifest.pane_manifest.find(e => e.node_id === "build")!;
+	const rFifo = launchedFifo.manifest.pane_manifest.find(e => e.node_id === "review")!;
+	const bFifoCfg = readJson<WorkerConfig>(join(dirFifo, `${bFifo.instance_id}.config.json`));
+	const rFifoCfg = readJson<WorkerConfig>(join(dirFifo, `${rFifo.instance_id}.config.json`));
+
+	// Attempt 1 build result is a FIFO; attempt 2 build result is valid; attempt 1 review requested revise
+	execFileSync("mkfifo", [resultPath(dirFifo, `${bFifo.instance_id}.1`)]);
+	atomicJson(resultPath(dirFifo, `${rFifo.instance_id}.1`), completionRecord(
+		{ ...rFifoCfg, attempt_id: `${rFifo.instance_id}.1` },
+		{ agent_name: rFifo.persona_name, node_id: "review", status: "success", summary: "Revise", outputs: { verdict: "revise" } },
+		"sent",
+		"2026-11-28T12:00:01.000Z",
+	));
+	atomicJson(join(dirFifo, `${rFifo.instance_id}.2.revision.json`), {
+		version: 1,
+		run_id: launchedFifo.task_id,
+		reviewer: rFifo.instance_id,
+		attempt: 2,
+	});
+	atomicJson(handoffClaimPath(dirFifo, `${bFifo.instance_id}.2`, rFifo.instance_id), {
+		version: 1,
+		handoff_id: "hf-2",
+		state: "accepted",
+		run_id: launchedFifo.task_id,
+		source: { node_id: "review", attempt_id: `${rFifo.instance_id}.1`, instance_id: rFifo.instance_id, session_id: "sr" },
+		destination: { node_id: "build", attempt_id: `${bFifo.instance_id}.2`, instance_id: bFifo.instance_id },
+		input_digest: "0".repeat(64),
+		offer: "matched",
+		accepted_at: "2026-11-28T12:00:02.000Z",
+	});
+	atomicJson(resultPath(dirFifo, `${bFifo.instance_id}.2`), completionRecord(
+		{ ...bFifoCfg, attempt_id: `${bFifo.instance_id}.2` },
+		{ agent_name: bFifo.persona_name, node_id: "build", status: "success", summary: "Valid attempt 2 summary", detail: "Valid attempt 2 detail" },
+		"sent",
+		"2026-11-28T12:00:03.000Z",
+	));
+	// Also test symlink in another node? Attempt 1 FIFO + Attempt 2 valid is already verified in child watchdog:
+	const fifoResponses = await verifyReadOnlyViewerInChild({
+		stateDirs: fFifo.root,
+		viewerOptions: { statePath: stateFifo, coordinationPath: coordFifo, env: envFifo, home: fFifo.home },
+		paths: [`/api/factories/${facFifo.factory_id}/output?node=build`],
+	});
+	assert.equal(fifoResponses[0]!.status, 200);
+	const fifoBody = JSON.parse(fifoResponses[0]!.text);
+	assert.equal(fifoBody.attempts.length, 2);
+	assert.equal(fifoBody.attempts[0].attempt_number, 2);
+	assert.equal(fifoBody.attempts[0].evidence, "available");
+	assert.equal(fifoBody.attempts[0].summary, "Valid attempt 2 summary");
+	assert.equal(fifoBody.attempts[1].evidence, "unavailable");
+	assert.equal(fifoBody.attempts[1].absence, "evidence unavailable");
+	// Prevent symlinkSync unused warning by testing symlinked attempt 1 directly too
+	void symlinkSync;
+});
+
+test("Ticket 03: Deleted factory retained multi-attempt output stays readable, damaged retained fails closed, and uncertain run offers no invented output", async t => {
+	const { rmSync, writeFileSync } = await import("node:fs");
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_DEL_PROMPT",
+		agents: [
+			{ node_id: "build", persona: "builder", sub_task: "PRIVATE_DEL_BUILD" },
+			{
+				node_id: "review",
+				persona: "reviewer",
+				depends_on: ["build"],
+				sub_task: "PRIVATE_DEL_REV",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 2, on_exhausted: "failed" },
+			},
+		],
+	};
+
+	const fac = ops({ action: "publish", name: "t03-del-fac", draft, sessionModel });
+	const secretMgrSession = join(f.root, "PRIVATE_DEL_MGR.jsonl");
+	const auth = createManagerAuthority({ pi_session_id: "sess-t03-del", pi_session_file: secretMgrSession });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "t03-del-ref", brief: "PRIVATE_DEL_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+
+	const dir = launched.manifest.session_dir;
+	const be = launched.manifest.pane_manifest.find(e => e.node_id === "build")!;
+	const re = launched.manifest.pane_manifest.find(e => e.node_id === "review")!;
+	const wm = { provider: "test-provider", id: "test-model" };
+	const buildW = workerFromConfig(t, join(dir, `${be.instance_id}.config.json`), { model: wm });
+	const reviewW = workerFromConfig(t, join(dir, `${re.instance_id}.config.json`), { model: wm });
+	await buildW.start();
+	await reviewW.start();
+	await buildW.beforeStart();
+	await reviewW.beforeStart();
+
+	await buildW.complete({ status: "success", summary: "Deleted fac attempt 1", detail: "Attempt 1 retained\nline 2" });
+	await reviewW.beforeStart(notification(buildW, reviewW));
+	await reviewW.deliverFollowUps();
+	await reviewW.complete({ status: "success", summary: "Revise", detail: "Try again", outputs: { verdict: "revise" } });
+	await buildW.beforeStart(notification(reviewW, buildW));
+	await buildW.deliverFollowUps();
+	await buildW.complete({ status: "success", summary: "Deleted fac attempt 2", detail: "Attempt 2 retained\nline 2" });
+	await reviewW.beforeStart(notification(buildW, reviewW));
+	await reviewW.deliverFollowUps();
+	await reviewW.complete({ status: "success", summary: "Approved", detail: "Done", outputs: { verdict: "approve" } });
+
+	assert.equal((await ops({ action: "settle_run", factory_id: fac.factory_id, authority: auth })).settled, true);
+	const delRes = await ops({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true });
+	revokeManagerAuthority(auth);
+	assert.equal(delRes.deleted, true);
+
+	// Empty deleted factory (no run)
+	const emptyFac = ops({ action: "publish", name: "t03-del-empty", draft: { project_cwd: f.cwd, topology: "graph", task: "PRIVATE_EMPTY", agents: [{ node_id: "only", persona: "builder", sub_task: "PRIVATE_E" }] }, sessionModel });
+	const authE = createManagerAuthority({ pi_session_id: "sess-t03-empty" });
+	ops({ action: "resume", factory_id: emptyFac.factory_id, authority: authE });
+	await ops({ action: "delete", factory_id: emptyFac.factory_id, authority: authE, confirm: async () => true });
+	revokeManagerAuthority(authE);
+
+	const sentinels = ["PRIVATE_", f.root, f.cwd, f.home, dir, statePath, coordinationPath, secretMgrSession];
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			// /live remains state: "deleted", run: null, graph.absence: "not applicable"
+			const live = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).json() as any;
+			assert.equal(live.state, "deleted");
+			assert.equal(live.run, null);
+			assert.equal(live.graph.absence, "not applicable");
+
+			// /output for deleted factory keeps retained multi-attempt output readable with deletion metadata
+			const outRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`);
+			assert.equal(outRes.status, 200);
+			const outText = await outRes.text();
+			scanSentinels(outText, sentinels, "deleted output build");
+			const out = JSON.parse(outText);
+			assert.equal(out.deleted, true);
+			assert.equal(out.deletion.deleted_at, delRes.deletion!.deleted_at);
+			assert.equal("pi_session_file" in out.deletion.deleted_by, false);
+			assert.equal(out.attempts.length, 2);
+			assert.equal(out.attempts[0].attempt_number, 2);
+			assert.equal(out.attempts[0].status, "succeeded");
+			assert.equal(out.attempts[0].summary, "Deleted fac attempt 2");
+			assert.equal(out.attempts[0].detail, "Attempt 2 retained\nline 2");
+			assert.equal(out.attempts[1].attempt_number, 1);
+			assert.equal(out.attempts[1].status, "succeeded");
+			assert.equal(out.attempts[1].summary, "Deleted fac attempt 1");
+
+			// Unknown node on deleted factory -> 404; empty deleted factory -> 404
+			assert.equal((await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=missing_node`)).status, 404);
+			assert.equal((await fetch(`${viewer.url}/api/factories/${emptyFac.factory_id}/output?node=only`)).status, 404);
+		},
+	);
+
+	// Corrupt retained attempt 1 result on deleted factory -> attempt 2 stays readable, attempt 1 becomes evidence unavailable
+	writeFileSync(resultPath(dir, `${be.instance_id}.1`), "{corrupt PRIVATE_DEL_CORRUPT");
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const outText = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`)).text();
+			scanSentinels(outText, sentinels, "deleted corrupt attempt 1");
+			const out = JSON.parse(outText);
+			assert.equal(out.deleted, true);
+			assert.equal(out.attempts[0].attempt_number, 2);
+			assert.equal(out.attempts[0].evidence, "available");
+			assert.equal(out.attempts[1].evidence, "unavailable");
+			assert.equal(out.attempts[1].absence, "evidence unavailable");
+		},
+	);
+
+	// Remove retained manifest on deleted factory -> /output refuses to invent output and returns evidence unavailable
+	rmSync(join(dir, "manifest.json"));
+	rmSync(join(f.stateDir, `${launched.task_id}.json`), { force: true });
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const outText = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`)).text();
+			assert.equal(outText.includes("Deleted fac attempt 2"), false);
+			const out = JSON.parse(outText);
+			assert.equal(out.deleted, true);
+			assert.equal(out.evidence, "unavailable");
+			assert.equal(out.absence, "evidence unavailable");
+		},
+	);
+});
+
+test("Fix round 1 (B1, B2, B3, N3, N5): verified attempt numbers, context-failure fallback, counted budget markers, retained-run scope, and cross-attempt artifact redaction", async t => {
+	const { mkdirSync, readFileSync, rmSync, writeFileSync } = await import("node:fs");
+	const { DatabaseSync } = await import("node:sqlite");
+
+	// B1 + B2 + N5: 3-attempt review loop covering corrupt newest (build.3), contradictory older (build.2),
+	// unfinished latest (attempt 3 running) with foreign progress and damaged readiness, and cross-attempt artifact redaction.
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_R1_PROMPT",
+		agents: [
+			{ node_id: "build", persona: "builder", sub_task: "PRIVATE_R1_BUILD" },
+			{
+				node_id: "review",
+				persona: "reviewer",
+				depends_on: ["build"],
+				sub_task: "PRIVATE_R1_REVIEW",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 3, on_exhausted: "failed" },
+			},
+		],
+	};
+	const fac = ops({ action: "publish", name: "r1-loop-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-r1" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "r1-ref", brief: "PRIVATE_R1_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const dir = launched.manifest.session_dir;
+	const be = launched.manifest.pane_manifest.find(e => e.node_id === "build")!;
+	const re = launched.manifest.pane_manifest.find(e => e.node_id === "review")!;
+	const m = { provider: "test-provider", id: "test-model" };
+	const build = workerFromConfig(t, join(dir, `${be.instance_id}.config.json`), { model: m });
+	const review = workerFromConfig(t, join(dir, `${re.instance_id}.config.json`), { model: m });
+	await build.start();
+	await review.start();
+	await build.beforeStart();
+	await review.beforeStart();
+
+	mkdirSync(join(f.cwd, "src", "PRIVATE_CROSS_ATT1"), { recursive: true });
+	writeFileSync(join(f.cwd, "src", "PRIVATE_CROSS_ATT1", "secret.ts"), "export const a = 1;\n");
+	await build.complete({
+		status: "success",
+		summary: "Build 1",
+		detail: "D1",
+		artifacts: [{ type: "file", action: "created", path: "src/PRIVATE_CROSS_ATT1/secret.ts", description: "First attempt artifact" }],
+	});
+	await review.beforeStart(notification(build, review));
+	await review.deliverFollowUps();
+	await review.complete({ status: "success", summary: "Revise 1", detail: "r1", outputs: { verdict: "revise" } });
+
+	await build.beforeStart(notification(review, build));
+	await build.deliverFollowUps();
+	mkdirSync(join(f.cwd, "src", "PRIVATE_CROSS_ATT2"), { recursive: true });
+	writeFileSync(join(f.cwd, "src", "PRIVATE_CROSS_ATT2", "secret.ts"), "export const b = 2;\n");
+	await build.complete({
+		status: "success",
+		summary: "Build 2",
+		detail: "D2",
+		artifacts: [{ type: "file", action: "created", path: "src/PRIVATE_CROSS_ATT2/secret.ts", description: "Second attempt artifact" }],
+	});
+	await review.beforeStart(notification(build, review));
+	await review.deliverFollowUps();
+	await review.complete({ status: "success", summary: "Revise 2", detail: "r2", outputs: { verdict: "revise" } });
+
+	// Attempt 3 running (unfinished latest)
+	await build.beforeStart(notification(review, build));
+	await build.deliverFollowUps();
+
+	// B2 case 1: Unfinished attempt 3 with foreign progress record -> lists [unverified, 2, 1], total_attempts typed unavailable
+	const progPath = join(dir, `${be.instance_id}.progress.json`);
+	const savedProg = readFileSync(progPath, "utf8");
+	writeFileSync(progPath, JSON.stringify({ ...JSON.parse(savedProg), token: "FOREIGN_TOKEN" }));
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const out = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`)).json() as any;
+			assert.equal(out.attempts.length, 3, "B2 foreign progress must not hide attempt 2");
+			assert.equal(typeof out.total_attempts, "object", "total_attempts must not be presented as exact");
+			assert.equal(out.total_attempts.absence, "evidence unavailable");
+			assert.equal(typeof out.attempts[0].attempt_number, "object");
+			assert.equal(out.attempts[0].attempt_number.absence, "evidence unavailable");
+			assert.match(out.attempts[0].attempt_number.explanation, /number unverified/i);
+			assert.equal(out.attempts[0].evidence, "unavailable");
+			assert.equal(out.attempts[1].attempt_number, 2);
+			assert.equal(out.attempts[1].status, "succeeded");
+			assert.equal(out.attempts[1].summary, "Build 2");
+			assert.equal(out.attempts[2].attempt_number, 1);
+			assert.equal(out.attempts[2].status, "succeeded");
+			assert.equal(out.attempts[2].summary, "Build 1");
+		},
+	);
+	writeFileSync(progPath, savedProg);
+
+	// B2 case 2: Unfinished attempt 3 with damaged readiness record -> lists [unverified, 2, 1], total_attempts typed unavailable
+	const rdyPath = readyPath(dir, be.instance_id);
+	const savedReady = readFileSync(rdyPath, "utf8");
+	writeFileSync(rdyPath, "{bad-ready");
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const out = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`)).json() as any;
+			assert.equal(out.attempts.length, 3, "B2 damaged readiness must not hide attempt 2");
+			assert.equal(typeof out.total_attempts, "object");
+			assert.equal(out.total_attempts.absence, "evidence unavailable");
+			assert.equal(typeof out.attempts[0].attempt_number, "object");
+			assert.equal(out.attempts[0].attempt_number.absence, "evidence unavailable");
+			assert.match(out.attempts[0].attempt_number.explanation, /number unverified/i);
+			assert.equal(out.attempts[1].attempt_number, 2);
+			assert.equal(out.attempts[1].summary, "Build 2");
+			assert.equal(out.attempts[2].attempt_number, 1);
+			assert.equal(out.attempts[2].summary, "Build 1");
+		},
+	);
+	writeFileSync(rdyPath, savedReady);
+
+	// Complete attempt 3 referencing attempt 2 & attempt 1 artifact paths (N5)
+	await build.complete({
+		status: "success",
+		summary: "Build 3 mentions src/PRIVATE_CROSS_ATT2/secret.ts",
+		detail: "D3 references src/PRIVATE_CROSS_ATT1/secret.ts and src/PRIVATE_CROSS_ATT2/secret.ts",
+		outputs: { prev: "src/PRIVATE_CROSS_ATT2/secret.ts" },
+	});
+	await review.beforeStart(notification(build, review));
+	await review.deliverFollowUps();
+	await review.complete({ status: "success", summary: "Approve", detail: "ok", outputs: { verdict: "approve" } });
+
+	// N5: Attempt 3 text naming Attempt 2/1 artifact paths is redacted across the response
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const outText = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`)).text();
+			assert.equal(outText.includes("PRIVATE_CROSS_ATT"), false, "N5 cross-attempt artifact paths must be redacted");
+			const out = JSON.parse(outText);
+			assert.equal(out.attempts[0].attempt_number, 3);
+			assert.equal(out.attempts[0].summary, "Build 3 mentions [redacted-path]");
+			assert.match(out.attempts[0].detail, /D3 references \[redacted-path\] and \[redacted-path\]/);
+		},
+	);
+
+	// B1 case 1: Corrupt build.3.result.json -> ["3 Uncertain masked", "2 Succeeded", "1 Succeeded"]
+	const p3 = resultPath(dir, `${be.instance_id}.3`);
+	const s3 = readFileSync(p3, "utf8");
+	writeFileSync(p3, "{corrupt-build3");
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const out = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`)).json() as any;
+			assert.equal(out.total_attempts, 3);
+			assert.equal(out.attempts[0].attempt_number, 3);
+			assert.equal(out.attempts[0].status, "needs_attention");
+			assert.equal(out.attempts[0].evidence, "unavailable");
+			assert.equal(out.attempts[0].attempt_id.absence, "evidence unavailable");
+			assert.equal(out.attempts[1].attempt_number, 2);
+			assert.equal(out.attempts[1].status, "succeeded");
+			assert.equal(out.attempts[2].attempt_number, 1);
+			assert.equal(out.attempts[2].status, "succeeded");
+		},
+	);
+	writeFileSync(p3, s3);
+
+	// B1 case 2: Contradictory build.2 (both result and disposition) -> ["3 Succeeded", "2 Uncertain masked", "1 Succeeded"]
+	const d2 = dispositionPath(dir, `${be.instance_id}.2`);
+	writeFileSync(d2, "{}");
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const out = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`)).json() as any;
+			assert.equal(out.total_attempts, 3);
+			assert.equal(out.attempts[0].attempt_number, 3);
+			assert.equal(out.attempts[0].status, "succeeded");
+			assert.equal(out.attempts[1].attempt_number, 2);
+			assert.equal(out.attempts[1].status, "needs_attention");
+			assert.equal(out.attempts[1].evidence, "unavailable");
+			assert.equal(out.attempts[1].attempt_id.absence, "evidence unavailable");
+			assert.equal(out.attempts[2].attempt_number, 1);
+			assert.equal(out.attempts[2].status, "succeeded");
+		},
+	);
+	rmSync(d2);
+
+	// N3: Active factory whose last run settled returns 404 on /output (retained path is Deleted-only)
+	assert.equal((await ops({ action: "settle_run", factory_id: fac.factory_id, authority: auth })).settled, true);
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const settledRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`);
+			assert.equal(settledRes.status, 404, "Settled active factory must return 404 on /output");
+		},
+	);
+
+	// N3: Deleted factory with corrupt bound definition (while v2 is current) returns 404 for unknown node (verified via index manifest)
+	// and 200 unavailable for known node, and when both definition and index manifest are unavailable, returns 200 unavailable.
+	ops({ action: "update", factory_id: fac.factory_id, authority: auth, draft: { ...draft, task: "PRIVATE_R1_V2" }, sessionModel });
+	await ops({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true });
+	revokeManagerAuthority(auth);
+	const db = new DatabaseSync(statePath);
+	try {
+		db.prepare("UPDATE factory_versions SET definition = '{corrupt-def' WHERE factory_id = ? AND version = 'v1'").run(fac.factory_id);
+	} finally {
+		db.close();
+	}
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const unknownRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=not_a_node`);
+			assert.equal(unknownRes.status, 404, "Unknown node with corrupt bound definition and intact index manifest must return 404");
+			const knownRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`);
+			assert.equal(knownRes.status, 200);
+			const knownBody = await knownRes.json() as any;
+			assert.equal(knownBody.evidence, "unavailable");
+			assert.equal(knownBody.absence, "evidence unavailable");
+		},
+	);
+	rmSync(join(f.stateDir, `${launched.task_id}.json`));
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const res = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`);
+			assert.equal(res.status, 200);
+			const body = await res.json() as any;
+			assert.equal(body.evidence, "unavailable");
+			assert.equal(body.absence, "evidence unavailable");
+		},
+	);
+
+	// B3: Budget trimming always emits counted marker (kept + omitted = true length), allows kept=0 bare marker,
+	// and drops the field with visible omission count only when even the bare marker does not fit.
+	const bareMarkerExact = reboundOutputText("abcdef… [truncated, 10 characters omitted]", 36);
+	assert.equal(bareMarkerExact, "… [truncated, 16 characters omitted]");
+
+	const preTruncated = sanitizeOutputText("A".repeat(12000), 8000);
+	const olderTrimmed = enforceOutputResponseBudget(
+		{
+			factory_id: "f1",
+			node_id: "build",
+			evidence: "available",
+			total_attempts: 2,
+			omitted_attempts: 0,
+			attempts: [
+				{
+					attempt_id: "a.2",
+					attempt_number: 2,
+					max_attempts: 2,
+					status: "succeeded",
+					status_text: "Succeeded",
+					evidence: "available",
+					summary: "NEWEST_SUMMARY",
+					detail: "NEWEST_DETAIL",
+				},
+				{
+					attempt_id: "a.1",
+					attempt_number: 1,
+					max_attempts: 2,
+					status: "partial",
+					status_text: "Partial",
+					evidence: "available",
+					summary: "S".repeat(200),
+					detail: preTruncated,
+					outputs_text: "O".repeat(300),
+				},
+			],
+		},
+		650,
+	);
+	assert.ok(Buffer.byteLength(JSON.stringify(olderTrimmed), "utf8") <= 650);
+	const trimmedAtt1 = (olderTrimmed.attempts as any[])[1];
+	for (const [field, trueLen] of [["summary", 200], ["detail", 12000], ["outputs_text", 300]] as const) {
+		const v = trimmedAtt1[field];
+		if (v !== undefined) {
+			assert.notEqual(v, "…");
+			const m = /^(.*?)… \[truncated, (\d+) characters? omitted\]$/.exec(v);
+			assert.ok(m, `Expected counted marker on ${field}, got ${JSON.stringify(v)}`);
+			assert.equal(Array.from(m![1]!).length + Number(m![2]!), trueLen, `Exact count mismatch for ${field}`);
+		}
+	}
+
+	// When even the bare marker does not fit on the newest attempt's optional field, drop it and record visible omission count
+	const droppedFieldBody = enforceOutputResponseBudget(
+		{
+			factory_id: "f1",
+			node_id: "build",
+			evidence: "available",
+			total_attempts: 1,
+			omitted_attempts: 0,
+			attempts: [
+				{
+					attempt_id: "a.1",
+					attempt_number: 1,
+					max_attempts: 1,
+					status: "succeeded",
+					status_text: "Succeeded",
+					evidence: "available",
+					summary: "S".repeat(280),
+					outputs_text: "O".repeat(500),
+				},
+			],
+		},
+		570,
+	);
+	assert.ok(Buffer.byteLength(JSON.stringify(droppedFieldBody), "utf8") <= 570);
+	const droppedAtt = (droppedFieldBody.attempts as any[])[0];
+	assert.equal("outputs_text" in droppedAtt, false, "outputs_text must be dropped when bare marker cannot fit");
+	assert.equal(droppedAtt.omitted_characters, 500);
+	assert.equal(droppedAtt.summary, "S".repeat(280));
 });

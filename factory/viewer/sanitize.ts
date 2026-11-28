@@ -24,10 +24,16 @@ const HAS_SEP_RE = /[\\/]/;
 const DOT_EXT_RE = /^\.[A-Za-z][A-Za-z0-9_-]{0,9}$/;
 const ONE_CHAR_STEM_DOT_EXT_RE = /^\.[A-Za-z]{2}[A-Za-z0-9_-]{0,8}$/;
 const DOTFILE_RE = /^\.[A-Za-z][\w-]+$/;
-const ARTIFACT_DELIM_CHAR_RE = /[\s"'<>()\[\]{}`*,;|!?=]/;
-const NON_ASCII_DELIM_RE = /[^\p{L}\p{N}\p{M}]/u;
+const ASCII_ARTIFACT_DELIM_CHARS = new Set(["\"", "'", "<", ">", "(", ")", "[", "]", "{", "}", "`", "*", ",", ";", "|", "!", "?", "="]);
+const ASCII_ARTIFACT_DELIM_TABLE = Uint8Array.from({ length: 128 }, (_, code) => {
+	if (code <= 32 || code === 127) return 1;
+	return ASCII_ARTIFACT_DELIM_CHARS.has(String.fromCharCode(code)) ? 1 : 0;
+});
+// Non-ASCII punctuation, symbols, non-ASCII numbers (\p{No}, \p{Nl}), modifier letters (\p{Lm}), and surrogate halves delimit.
+const NON_ASCII_DELIM_RE = /(?:[^\p{L}\p{N}\p{M}]|[\p{No}\p{Nl}\p{Lm}])/u;
+const HAS_ARTIFACT_DELIM_RE = /[\u0000-\u0020\u007F"'<>()\[\]{}`*,;|!?=]|[\u{10000}-\u{10FFFF}]|(?![\x00-\x7F])(?:[^\p{L}\p{N}\p{M}]|[\p{No}\p{Nl}\p{Lm}])/u;
 const ARTIFACT_SUFFIX_SPLIT_CHARS = [":", "#", "@", "~", "+", "&", "%", "$", "^"] as const;
-const LEADING_ARTIFACT_PREFIX_CHARS = new Set(["@", "#", "&", "%"]);
+const LEADING_ARTIFACT_PREFIX_CHARS = new Set(["@", "#", "&", "%", "+", "$", "^"]);
 const DRIVE_PREFIX_RE = /^[A-Za-z]:/;
 
 function escapeRegExp(value: string): string {
@@ -106,6 +112,7 @@ function preBoundCodePoints(wellFormed: string, maxCodePoints: number): { bounde
 export interface ArtifactRedactionMatcher {
 	exact: ReadonlySet<string>;
 	lower: ReadonlySet<string>;
+	fallback?: ArtifactRedactionMatcher;
 }
 
 const EMPTY_ARTIFACT_MATCHER: ArtifactRedactionMatcher = {
@@ -114,10 +121,7 @@ const EMPTY_ARTIFACT_MATCHER: ArtifactRedactionMatcher = {
 };
 
 function hasArtifactDelim(token: string): boolean {
-	for (let i = 0; i < token.length; i++) {
-		if (isArtifactDelimChar(token.charCodeAt(i), token[i]!)) return true;
-	}
-	return false;
+	return HAS_ARTIFACT_DELIM_RE.test(token);
 }
 
 function isRedactableArtifactForm(token: string): boolean {
@@ -131,18 +135,12 @@ function isRedactableArtifactForm(token: string): boolean {
 	return lastDot >= 2 && DOT_EXT_RE.test(token.slice(lastDot));
 }
 
-/**
- * Collect normalized forms (literal, trailing-separator-stripped, `./`/`../`-stripped, separator-swapped,
- * JSON-escaped, and project-joined absolute) from the projected artifacts (capped at 20 artifacts,
- * 512 tokens, and 256 KiB), excluding delimiter-containing forms and bare single words without a separator,
- * a 3+-char letter-led dotfile, a 2+-letter extension on a 1-char stem, or a 1–10-char letter-led
- * dot-extension on a 2+-char stem.
- */
-export function collectArtifactPathTokens(
-	artifacts: ReadonlyArray<{ path?: unknown }> | undefined,
+function collectArtifactTokensWithCoverage(
+	artifactLists: ReadonlyArray<ReadonlyArray<{ path?: unknown }> | undefined>,
 	projectCwd?: string,
-): string[] {
-	if (!Array.isArray(artifacts) || artifacts.length === 0) return [];
+): { tokens: string[]; covered: boolean[] } {
+	const covered = artifactLists.map(list => !Array.isArray(list) || list.length === 0);
+	if (!artifactLists.length) return { tokens: [], covered };
 	const tokens = new Set<string>();
 	let totalChars = 0;
 	const pushToken = (candidate: string) => {
@@ -153,7 +151,9 @@ export function collectArtifactPathTokens(
 		totalChars += candidate.length;
 	};
 	const addForm = (candidate: string) => {
+		if (tokens.size >= MAX_ARTIFACT_TOKENS) return;
 		const t = candidate.trim();
+		if (t.length < 2 || t.length > MAX_ARTIFACT_TOKEN_CHARS - totalChars) return;
 		if (!isRedactableArtifactForm(t)) return;
 		pushToken(t);
 		const jsonEscaped = t.replace(/\\/g, "\\\\");
@@ -170,16 +170,13 @@ export function collectArtifactPathTokens(
 			addForm(`${bwd}\\`);
 		}
 	};
-
-	const projected = artifacts.slice(0, MAX_ARTIFACT_TOKEN_SOURCES);
-	for (const art of projected) {
-		if (tokens.size >= MAX_ARTIFACT_TOKENS) break;
-		if (!art || typeof art !== "object" || typeof art.path !== "string") continue;
+	const addArtifact = (art: { path?: unknown } | undefined) => {
+		if (!art || typeof art !== "object" || typeof art.path !== "string") return;
 		const raw = art.path.trim();
-		if (!raw) continue;
+		if (!raw) return;
 		const hadTrailingSep = /[\\/]+$/.test(raw);
 		const normalizedRaw = raw.replace(/[\\/]+$/, "");
-		if (!normalizedRaw) continue;
+		if (!normalizedRaw) return;
 		addSeparatorForms(normalizedRaw, hadTrailingSep);
 		const noPrefix = normalizedRaw.replace(/^(?:\.\.?[\\/])+/, "");
 		if (noPrefix) {
@@ -212,8 +209,64 @@ export function collectArtifactPathTokens(
 				}
 			}
 		}
+	};
+
+	for (let i = 0; i < artifactLists.length; i++) {
+		const list = artifactLists[i];
+		if (!Array.isArray(list) || list.length === 0) continue;
+		if (tokens.size >= MAX_ARTIFACT_TOKENS) break;
+		const projected = list.slice(0, MAX_ARTIFACT_TOKEN_SOURCES);
+		let full = true;
+		for (const art of projected) {
+			if (tokens.size >= MAX_ARTIFACT_TOKENS) {
+				full = false;
+				break;
+			}
+			addArtifact(art);
+		}
+		covered[i] = full;
 	}
-	return [...tokens];
+	return { tokens: [...tokens], covered };
+}
+
+/**
+ * Collect normalized forms (literal, trailing-separator-stripped, `./`/`../`-stripped, separator-swapped,
+ * JSON-escaped, and project-joined absolute) newest-first from up to 20 projected artifacts per attempt
+ * across one or more attempts (capped globally at 512 tokens and 256 KiB), excluding delimiter-containing
+ * forms and bare single words without a separator, a 3+-char letter-led dotfile, a 2+-letter extension on
+ * a 1-char stem, or a 1–10-char letter-led dot-extension on a 2+-char stem.
+ */
+export function collectArtifactPathTokensUnion(
+	artifactLists: ReadonlyArray<ReadonlyArray<{ path?: unknown }> | undefined>,
+	projectCwd?: string,
+): string[] {
+	return collectArtifactTokensWithCoverage(artifactLists, projectCwd).tokens;
+}
+
+/**
+ * Build per-attempt artifact redaction matchers sharing the global union matcher while ensuring every
+ * attempt's own up-to-20 projected artifacts remain protected even if earlier attempts exhaust the 512-token cap.
+ */
+export function compileUnionArtifactMatchers(
+	artifactLists: ReadonlyArray<ReadonlyArray<{ path?: unknown }> | undefined>,
+	projectCwd?: string,
+): ArtifactRedactionMatcher[] {
+	const { tokens, covered } = collectArtifactTokensWithCoverage(artifactLists, projectCwd);
+	const shared = compileArtifactRedactionMatcher(tokens);
+	return artifactLists.map((list, i) => {
+		if (covered[i]) return shared;
+		const own = compileArtifactRedactionMatcher(collectArtifactPathTokens(list, projectCwd));
+		if (own.exact.size === 0 && own.lower.size === 0) return shared;
+		return { ...shared, fallback: own };
+	});
+}
+
+/** Collect normalized artifact path tokens from one attempt's projected artifacts (up to 20 artifacts). */
+export function collectArtifactPathTokens(
+	artifacts: ReadonlyArray<{ path?: unknown }> | undefined,
+	projectCwd?: string,
+): string[] {
+	return collectArtifactTokensWithCoverage(artifacts ? [artifacts] : [], projectCwd).tokens;
 }
 
 function isArtifactMatcher(value: readonly string[] | ArtifactRedactionMatcher): value is ArtifactRedactionMatcher {
@@ -238,9 +291,8 @@ export function compileArtifactRedactionMatcher(tokens: readonly string[] | Arti
 }
 
 function isArtifactDelimChar(code: number, ch: string): boolean {
-	if (code <= 32 || code === 127) return true; // whitespace / control
-	if (code > 127) return NON_ASCII_DELIM_RE.test(ch); // non-letter/number/mark Unicode punctuation; surrogate halves count as delimiters
-	return ARTIFACT_DELIM_CHAR_RE.test(ch);
+	if (code < 128) return ASCII_ARTIFACT_DELIM_TABLE[code] === 1;
+	return NON_ASCII_DELIM_RE.test(ch); // non-letter/number/mark Unicode punctuation, \p{No}/\p{Nl}/\p{Lm}, and surrogate halves
 }
 
 function matchesCandidatePrefix(
@@ -255,7 +307,10 @@ function matchesCandidatePrefix(
 		const lowerPrefix = lowerCand.length === cand.length
 			? (splitLen === cand.length ? lowerCand : lowerCand.slice(0, splitLen))
 			: prefix.toLowerCase();
-		return matcher.lower.has(lowerPrefix);
+		if (matcher.lower.has(lowerPrefix)) return true;
+	}
+	if (matcher.fallback) {
+		return matchesCandidatePrefix(cand, splitLen, matcher.fallback, lowerCand);
 	}
 	return false;
 }
@@ -388,8 +443,11 @@ function scrubExtraRedactedTokens(text: string, matcher: ArtifactRedactionMatche
 		let matchPrefixOffset = 0;
 		let matchedLen = findMatchedPrefixEnd(tok, matcher);
 		if (matchedLen < 0) {
-			const sigilOffset = tok.length > 1 && LEADING_ARTIFACT_PREFIX_CHARS.has(tok[0]!) ? 1 : 0;
-			if (sigilOffset > 0) {
+			let sigilOffset = 0;
+			while (sigilOffset < tok.length && LEADING_ARTIFACT_PREFIX_CHARS.has(tok[sigilOffset]!)) {
+				sigilOffset += 1;
+			}
+			if (sigilOffset > 0 && sigilOffset < tok.length) {
 				const subLen = findMatchedPrefixEnd(tok.slice(sigilOffset), matcher);
 				if (subLen > 0) {
 					matchPrefixOffset = sigilOffset;
@@ -441,16 +499,20 @@ function scrubBlockedAndGenericPaths(text: string, blockedPaths: readonly string
 	});
 }
 
+function formatOmissionMarker(omitted: number): string {
+	return `… [truncated, ${omitted} character${omitted === 1 ? "" : "s"} omitted]`;
+}
+
 function truncateWithOmissionMarker(codePoints: string[], maxChars: number, extraOmitted = 0): string {
 	if (maxChars <= 0) return "";
 	const total = codePoints.length + extraOmitted;
 	if (extraOmitted === 0 && codePoints.length <= maxChars) return codePoints.join("");
 	let kept = Math.min(codePoints.length, Math.max(0, maxChars - 40));
-	for (let i = 0; i < 4; i++) {
+	for (let i = 0; i < 8; i++) {
 		const omitted = total - kept;
-		const marker = `… [truncated, ${omitted} character${omitted === 1 ? "" : "s"} omitted]`;
+		const marker = formatOmissionMarker(omitted);
 		const markerLen = Array.from(marker).length;
-		if (markerLen >= maxChars) {
+		if (markerLen > maxChars) {
 			return maxChars === 1 ? "…" : `${codePoints.slice(0, maxChars - 1).join("")}…`;
 		}
 		const nextKept = Math.min(codePoints.length, maxChars - markerLen);
@@ -460,15 +522,21 @@ function truncateWithOmissionMarker(codePoints: string[], maxChars: number, extr
 		kept = nextKept;
 	}
 	const omitted = total - kept;
-	const marker = `… [truncated, ${omitted} character${omitted === 1 ? "" : "s"} omitted]`;
+	const marker = formatOmissionMarker(omitted);
+	if (Array.from(marker).length > maxChars) {
+		return maxChars === 1 ? "…" : `${codePoints.slice(0, maxChars - 1).join("")}…`;
+	}
 	return `${codePoints.slice(0, kept).join("")}${marker}`;
 }
 
 const TRAILING_TRUNCATION_MARKER_RE = /… \[truncated, (\d+) characters? omitted\]$/;
 
-/** Re-bound already-scrubbed text to `maxChars` Unicode code points, accumulating any existing omission count. */
-export function reboundOutputText(scrubbed: string, maxChars: number): string {
-	if (maxChars <= 0) return "";
+/** Parse an already-scrubbed output field into base Unicode code points and true total length (including prior omitted counts). */
+export function parseOutputOmission(scrubbed: string): {
+	baseCodePoints: string[];
+	priorOmitted: number;
+	totalCodePoints: number;
+} {
 	let base = scrubbed;
 	let priorOmitted = 0;
 	const match = TRAILING_TRUNCATION_MARKER_RE.exec(scrubbed);
@@ -476,9 +544,39 @@ export function reboundOutputText(scrubbed: string, maxChars: number): string {
 		priorOmitted = Number(match[1]);
 		base = scrubbed.slice(0, match.index);
 	}
-	const codePoints = Array.from(base);
-	if (priorOmitted === 0 && codePoints.length <= maxChars) return scrubbed;
-	return truncateWithOmissionMarker(codePoints, maxChars, priorOmitted);
+	const baseCodePoints = Array.from(base);
+	return {
+		baseCodePoints,
+		priorOmitted,
+		totalCodePoints: baseCodePoints.length + priorOmitted,
+	};
+}
+
+/** Format `kept` code points of a parsed field with an exact `… [truncated, N characters omitted]` marker when shortened. */
+export function formatOutputWithOmission(
+	baseCodePoints: readonly string[],
+	kept: number,
+	totalCodePoints: number,
+	priorOmitted = 0,
+	original?: string,
+): string {
+	const clampedKept = Math.max(0, Math.min(baseCodePoints.length, kept));
+	if (priorOmitted === 0 && clampedKept === baseCodePoints.length && original !== undefined) {
+		return original;
+	}
+	const omitted = totalCodePoints - clampedKept;
+	if (omitted <= 0) {
+		return baseCodePoints.slice(0, clampedKept).join("");
+	}
+	return `${baseCodePoints.slice(0, clampedKept).join("")}${formatOmissionMarker(omitted)}`;
+}
+
+/** Re-bound already-scrubbed text to `maxChars` Unicode code points, accumulating any existing omission count. */
+export function reboundOutputText(scrubbed: string, maxChars: number): string {
+	if (maxChars <= 0) return "";
+	const { baseCodePoints, priorOmitted } = parseOutputOmission(scrubbed);
+	if (priorOmitted === 0 && baseCodePoints.length <= maxChars) return scrubbed;
+	return truncateWithOmissionMarker(baseCodePoints, maxChars, priorOmitted);
 }
 
 /**

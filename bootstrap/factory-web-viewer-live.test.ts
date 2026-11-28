@@ -7,6 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority, type ClearanceDecision } from "../factory/operations.ts";
+import { resolveNodeObservation } from "../factory/viewer/attempt-resolution.ts";
 import { createViewerReader, startViewer } from "../factory/viewer/server.ts";
 import { cancelPath } from "./cancellation.ts";
 import { buildAttemptRow, buildInputRow } from "./factory-records.ts";
@@ -15,7 +16,7 @@ import { BootstrapService, type GenerateRequest } from "./lifecycle.ts";
 import { atomicJson, completionRecord, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
 import { finalizePath } from "./review-loop.ts";
 import { isolatedPiEnvironment, runSupervised } from "./test-harness.ts";
-import { serviceFixture, workerFromConfig } from "./test-support/chain-fixture.ts";
+import { serviceFixture, workerFromConfig, notification } from "./test-support/chain-fixture.ts";
 import { verifyReadOnlyViewer, verifyReadOnlyViewerInChild } from "./test-support/factory-viewer-fixture.ts";
 
 function tree(root: string): unknown {
@@ -346,9 +347,10 @@ test("Live Graph projects bound-version topology, joins, feedback edges, current
       const prepOutText = await prepOutRes.text();
       assertNoLeaks(prepOutText, "output prep");
       const prepOut = JSON.parse(prepOutText);
-      assert.equal(prepOut.latest_attempt.detail, "PUBLIC_LOG_DETAIL");
-      assert.equal(prepOut.latest_attempt.command.stdout_excerpt, "PUBLIC_STDOUT_LOG");
-      assert.equal(prepOut.latest_attempt.command.stderr_excerpt, "PUBLIC_STDERR_LOG");
+      assert.equal(prepOut.attempts.length, 1);
+      assert.equal(prepOut.attempts[0].detail, "PUBLIC_LOG_DETAIL");
+      assert.equal(prepOut.attempts[0].command.stdout_excerpt, "PUBLIC_STDOUT_LOG");
+      assert.equal(prepOut.attempts[0].command.stderr_excerpt, "PUBLIC_STDERR_LOG");
 
       // Factory isolation: other factory returns only its own launched graph and never leaks fac's ids/nodes.
       const otherText = await (await fetch(`${viewer.url}/api/factories/${otherFac.factory_id}/live`)).text();
@@ -3628,4 +3630,152 @@ test("Live Graph scrubs and bounds disposition, cancel, closure, cause, and admi
       }
     },
   );
+});
+
+test("Fix round 1 (N1): /live matches golden base03 snapshots across 12-stage review loop including damaged progress and latest result", async t => {
+  const f = serviceFixture(t, ["builder", "reviewer"]);
+  const statePath = join(f.root, "factories.sqlite");
+  const coordinationPath = join(f.root, "factory-coordination.sqlite");
+  const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+  const ops = factoryOperations(statePath, f.service, { coordinationPath });
+  const draft: GenerateRequest = {
+    project_cwd: f.cwd,
+    topology: "graph",
+    task: "T",
+    agents: [
+      { node_id: "build", persona: "builder", sub_task: "B" },
+      {
+        node_id: "review",
+        persona: "reviewer",
+        depends_on: ["build"],
+        sub_task: "R",
+        output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+        decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 3, on_exhausted: "failed" },
+      },
+      { node_id: "deploy", persona: "builder", depends_on: ["review"], sub_task: "D" },
+    ],
+  };
+  const sessionModel = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" as const };
+  const fac = ops({ action: "publish", name: "livecmp3", draft, sessionModel });
+  const auth = createManagerAuthority({ pi_session_id: "s" });
+  ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+  ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "r", brief: "B" });
+  const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+  revokeManagerAuthority(auth);
+
+  const dir = launched.manifest.session_dir;
+  const be = launched.manifest.pane_manifest.find(e => e.node_id === "build")!;
+  const re = launched.manifest.pane_manifest.find(e => e.node_id === "review")!;
+  const m = { provider: "test-provider", id: "test-model" };
+  const build = workerFromConfig(t, join(dir, `${be.instance_id}.config.json`), { model: m });
+  const review = workerFromConfig(t, join(dir, `${re.instance_id}.config.json`), { model: m });
+
+  const stages: Record<string, any> = {};
+  const snap = async (label: string) => {
+    await verifyReadOnlyViewer(
+      { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+      async viewer => {
+        const live = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).json() as any;
+        stages[label] = live;
+      },
+    );
+  };
+
+  await build.start();
+  await review.start();
+  await build.beforeStart();
+  await review.beforeStart();
+  await snap("start");
+  await build.complete({ status: "success", summary: "Build 1", detail: "D1" });
+  await snap("build1");
+  await review.beforeStart(notification(build, review));
+  await review.deliverFollowUps();
+  await review.complete({ status: "success", summary: "Revise 1", detail: "x", outputs: { verdict: "revise" } });
+  await snap("revise1");
+  await build.beforeStart(notification(review, build));
+  await build.deliverFollowUps();
+  await snap("build2-started");
+  await build.complete({ status: "success", summary: "Build 2", detail: "D2" });
+  await snap("build2");
+  await review.beforeStart(notification(build, review));
+  await review.deliverFollowUps();
+  await review.complete({ status: "success", summary: "Revise 2", detail: "x", outputs: { verdict: "revise" } });
+  await snap("revise2");
+  await build.beforeStart(notification(review, build));
+  await build.deliverFollowUps();
+  await snap("build3-started");
+
+  const pp = join(dir, `${be.instance_id}.progress.json`);
+  const savedProg = readFileSync(pp, "utf8");
+  writeFileSync(pp, JSON.stringify({ ...JSON.parse(savedProg), token: "FOREIGN" }));
+  await snap("build3-started-foreignprogress");
+  // N1: resolveNodeObservation keeps key=inst.N and expected when failing after currentAttempt (foreign progress)
+  const byInst = new Map(launched.manifest.pane_manifest.map(e => [e.instance_id, e.node_id]));
+  const postCurrObs = resolveNodeObservation(launched.manifest, be, byInst, []);
+  assert.equal(postCurrObs.key, `${be.instance_id}.3`);
+  assert.equal(postCurrObs.expected?.attempt_id, `${be.instance_id}.3`);
+  assert.equal(postCurrObs.process_state, "unknown");
+  writeFileSync(pp, savedProg);
+
+  await build.complete({ status: "success", summary: "Build 3", detail: "D3" });
+  await snap("build3");
+  await review.beforeStart(notification(build, review));
+  await review.deliverFollowUps();
+  await review.complete({ status: "success", summary: "Approve", detail: "ok", outputs: { verdict: "approve" } });
+  await snap("approve");
+
+  const p1 = resultPath(dir, `${be.instance_id}.1`);
+  const s1 = readFileSync(p1, "utf8");
+  writeFileSync(p1, "{");
+  await snap("corrupt-build1");
+  writeFileSync(p1, s1);
+
+  writeFileSync(resultPath(dir, `${be.instance_id}.3`), "{");
+  await snap("corrupt-build3");
+
+  const nodeOf = (label: string, id: string) => stages[label].graph.nodes.find((n: any) => n.id === id);
+  const edgeOf = (label: string, from: string, to: string) => stages[label].graph.edges.find((e: any) => e.from === from && e.to === to);
+
+  // Golden base03 checks across all 12 stages
+  assert.equal(nodeOf("start", "build").status, "running");
+  assert.equal(nodeOf("start", "review").status, "waiting");
+  assert.equal(nodeOf("start", "deploy").status, "pending");
+  assert.equal(edgeOf("start", "build", "review").state, "pending");
+
+  assert.equal(nodeOf("build1", "build").status_text, "Waiting (parked)");
+  assert.equal(nodeOf("build1", "build").current_attempt.summary, "Build 1");
+  assert.equal(nodeOf("revise1", "review").current_attempt.loop.last_verdict, "revise");
+  assert.equal(edgeOf("revise1", "build", "review").state, "fired");
+
+  assert.equal(nodeOf("build2-started", "build").attempt_id, `${be.instance_id}.2`);
+  assert.equal(nodeOf("build2", "build").current_attempt.summary, "Build 2");
+  assert.equal(nodeOf("revise2", "review").attempt_id, `${re.instance_id}.2`);
+  assert.equal(nodeOf("build3-started", "build").attempt_id, `${be.instance_id}.3`);
+
+  // Foreign progress on attempt 3: masked on /live, process_state: "unknown", attempt_number: 1
+  const fpBuild = nodeOf("build3-started-foreignprogress", "build");
+  assert.equal(fpBuild.status, "needs_attention");
+  assert.equal("attempt_id" in fpBuild, false);
+  assert.equal(fpBuild.current_attempt.attempt_id.absence, "evidence unavailable");
+  assert.equal(fpBuild.current_attempt.attempt_number, 1);
+  assert.equal(fpBuild.current_attempt.process_state, "unknown");
+  assert.equal(fpBuild.current_attempt.loop.attempt, 1);
+
+  assert.equal(nodeOf("build3", "build").current_attempt.summary, "Build 3");
+  assert.equal(nodeOf("approve", "build").status, "succeeded");
+  assert.equal(nodeOf("approve", "review").status, "succeeded");
+  assert.equal(edgeOf("approve", "review", "deploy").state, "fired");
+
+  // Older corrupt build.1 leaves build.3 Succeeded on /live
+  assert.equal(nodeOf("corrupt-build1", "build").status, "succeeded");
+  assert.equal(nodeOf("corrupt-build1", "build").attempt_id, `${be.instance_id}.3`);
+
+  // Corrupt latest build.3 on /live: Uncertain, masked identity, attempt_number: 1, process_state: "unknown"
+  const cb3 = nodeOf("corrupt-build3", "build");
+  assert.equal(cb3.status, "needs_attention");
+  assert.equal("attempt_id" in cb3, false);
+  assert.equal(cb3.current_attempt.attempt_id.absence, "evidence unavailable");
+  assert.equal(cb3.current_attempt.attempt_number, 1);
+  assert.equal(cb3.current_attempt.process_state, "unknown");
+  assert.equal(cb3.current_attempt.loop.attempt, 1);
 });

@@ -1,8 +1,20 @@
+import { join } from "node:path";
 import type { Inspection, ReleasedFactoryRun } from "../operations.ts";
 import type { ExecutionState } from "../../bootstrap/outcomes.ts";
-import type { CommandEvidence } from "../../bootstrap/session-store.ts";
 import {
+	assertTaskId,
+	parseManifest,
+	pathEntryExists,
+	type BootstrapManifest,
+	type CommandEvidence,
+} from "../../bootstrap/session-store.ts";
+import {
+	assertPathInsideDir,
+	assertRegularFileIfExists,
 	assertRunEvidenceConsistent,
+	MAX_EVIDENCE_FILE_BYTES,
+	readBoundedRegularJsonIfExists,
+	resolveNodeAttempts,
 	resolveRunObservations,
 	sanitizeCommandSignal,
 	STATUS_TEXT,
@@ -16,7 +28,10 @@ import type { TypedAbsence } from "./inspect.ts";
 import {
 	collectArtifactPathTokens,
 	compileArtifactRedactionMatcher,
+	compileUnionArtifactMatchers,
 	deletionMarkerFields,
+	formatOutputWithOmission,
+	parseOutputOmission,
 	reboundOutputText,
 	sanitizeOutputText,
 	type ArtifactRedactionMatcher,
@@ -28,6 +43,7 @@ export const OUTPUT_STRUCTURED_MAX_CHARS = 8000;
 export const OUTPUT_COMMAND_EXCERPT_MAX_CHARS = 4000;
 export const OUTPUT_LIST_ITEM_MAX_CHARS = 500;
 export const OUTPUT_LIST_MAX_ITEMS = 20;
+export const OUTPUT_MAX_ATTEMPTS = 20;
 export const OUTPUT_DISPOSITION_REASON_MAX_CHARS = 4000;
 export const OUTPUT_ERROR_MAX_CHARS = 4000;
 export const OUTPUT_MAX_RESPONSE_BYTES = 64 * 1024;
@@ -266,6 +282,10 @@ function itemsOmittedMarker(omitted: number): string {
 	return `… [truncated, ${omitted} item${omitted === 1 ? "" : "s"} omitted]`;
 }
 
+function attemptsOmittedMarker(omitted: number): string {
+	return `… [truncated, ${omitted} attempt${omitted === 1 ? "" : "s"} omitted]`;
+}
+
 function buildBoundedList<T, U>(raw: readonly T[] | undefined, maxItems: number, mapItem: (item: T) => U): BoundedList<U> | undefined {
 	if (!Array.isArray(raw) || raw.length === 0) return undefined;
 	const items = raw.slice(0, maxItems).map(mapItem);
@@ -326,9 +346,37 @@ function projectScrubbedCauses(causes: readonly ProjectedCause[] | undefined, bl
 }
 
 function trimBoundedListForBudget<T>(list: BoundedList<T>, targetBytes: number, measure: () => number): void {
-	while (list.items.length > 0 && measure() > targetBytes) {
-		list.items.pop();
-		list.omitted_count += 1;
+	if (list.items.length === 0 || measure() <= targetBytes) return;
+	const savedItems = list.items;
+	const savedOmitted = list.omitted_count;
+	const savedMarker = list.omitted_marker;
+	list.items = [];
+	list.omitted_count = savedOmitted + savedItems.length;
+	list.omitted_marker = itemsOmittedMarker(list.omitted_count);
+	if (measure() > targetBytes) {
+		return;
+	}
+	list.items = savedItems;
+	list.omitted_count = savedOmitted;
+	list.omitted_marker = savedMarker;
+	let low = 0;
+	let high = savedItems.length;
+	while (low < high) {
+		const mid = Math.ceil((low + high) / 2);
+		const dropped = savedItems.length - mid;
+		list.items = savedItems.slice(0, mid);
+		list.omitted_count = savedOmitted + dropped;
+		list.omitted_marker = list.omitted_count > 0 ? itemsOmittedMarker(list.omitted_count) : savedMarker;
+		if (measure() <= targetBytes) {
+			low = mid;
+		} else {
+			high = mid - 1;
+		}
+	}
+	const finalDropped = savedItems.length - low;
+	list.items = savedItems.slice(0, low);
+	list.omitted_count = savedOmitted + finalDropped;
+	if (list.omitted_count > 0) {
 		list.omitted_marker = itemsOmittedMarker(list.omitted_count);
 	}
 }
@@ -341,72 +389,218 @@ function trimStringFieldForBudget(
 ): void {
 	const cur = holder[key];
 	if (typeof cur !== "string" || !cur || measure() <= targetBytes) return;
-	const minChars = Math.min(Array.from(cur).length, 64);
-	let low = minChars;
-	let high = Array.from(cur).length;
-	// Binary search the largest code-point cap that fits within targetBytes.
+	const { baseCodePoints, priorOmitted, totalCodePoints } = parseOutputOmission(cur);
+	// Always keep at least the counted bare marker `… [truncated, N characters omitted]`, never bare "…".
+	holder[key] = formatOutputWithOmission(baseCodePoints, 0, totalCodePoints, priorOmitted, cur);
+	if (measure() > targetBytes) {
+		return;
+	}
+	let low = 0;
+	let high = baseCodePoints.length;
+	// Binary search the largest kept code-point count whose text + counted marker fits within targetBytes.
 	while (low < high) {
 		const mid = Math.ceil((low + high) / 2);
-		holder[key] = reboundOutputText(cur, mid);
+		holder[key] = formatOutputWithOmission(baseCodePoints, mid, totalCodePoints, priorOmitted, cur);
 		if (measure() <= targetBytes) {
 			low = mid;
 		} else {
 			high = mid - 1;
 		}
 	}
-	holder[key] = reboundOutputText(cur, low);
-	if (measure() > targetBytes) {
-		holder[key] = reboundOutputText(cur, 1);
+	holder[key] = formatOutputWithOmission(baseCodePoints, low, totalCodePoints, priorOmitted, cur);
+}
+
+function dropOverflowFieldsFromAttempt(
+	att: Record<string, unknown>,
+	measureBody: () => number,
+	maxBytes: number,
+	includeSummary = false,
+): void {
+	if (measureBody() <= maxBytes) return;
+	const dropField = (holder: Record<string, unknown>, key: string) => {
+		const cur = holder[key];
+		if (typeof cur !== "string") return;
+		const { totalCodePoints } = parseOutputOmission(cur);
+		delete holder[key];
+		att.omitted_characters = (typeof att.omitted_characters === "number" ? att.omitted_characters : 0) + totalCodePoints;
+	};
+	dropField(att, "outputs_text");
+	if (measureBody() <= maxBytes) return;
+	const cmd = att.command as Record<string, unknown> | undefined;
+	if (cmd && typeof cmd === "object") {
+		for (const cmdKey of ["stderr_excerpt", "stdout_excerpt", "termination_error", "spawn_error"] as const) {
+			dropField(cmd, cmdKey);
+			if (measureBody() <= maxBytes) return;
+		}
+	}
+	const bodyKeys = includeSummary
+		? (["detail", "error_message", "disposition_reason", "summary"] as const)
+		: (["detail", "error_message", "disposition_reason"] as const);
+	for (const strKey of bodyKeys) {
+		dropField(att, strKey);
+		if (measureBody() <= maxBytes) return;
 	}
 }
 
-// Ticket 03 will extend this budget across multiple attempts of the selected node.
-export function enforceOutputResponseBudget(body: Record<string, unknown>, maxBytes = OUTPUT_MAX_RESPONSE_BYTES): Record<string, unknown> {
-	const measure = () => Buffer.byteLength(JSON.stringify(body), "utf8");
-	if (measure() <= maxBytes) return body;
-	const att = body.latest_attempt as Record<string, unknown> | undefined;
-	if (att && typeof att === "object") {
-		trimStringFieldForBudget(att, "outputs_text", maxBytes, measure);
-		if (measure() <= maxBytes) return body;
+function trimAttemptOptionalSections(
+	att: Record<string, unknown>,
+	targetBytes: number,
+	measure: () => number,
+): void {
+	trimStringFieldForBudget(att, "outputs_text", targetBytes, measure);
+	if (measure() <= targetBytes) return;
 
-		for (const listKey of ["artifacts", "next_steps", "warnings", "verification", "causes"] as const) {
-			const list = att[listKey] as BoundedList<unknown> | undefined;
-			if (list && Array.isArray(list.items)) {
-				trimBoundedListForBudget(list, maxBytes, measure);
-				if (measure() <= maxBytes) return body;
-			}
-		}
-
-		const cmd = att.command as Record<string, unknown> | undefined;
-		if (cmd && typeof cmd === "object") {
-			for (const cmdKey of ["stderr_excerpt", "stdout_excerpt", "termination_error", "spawn_error"] as const) {
-				trimStringFieldForBudget(cmd, cmdKey, maxBytes, measure);
-				if (measure() <= maxBytes) return body;
-			}
-		}
-
-		for (const strKey of ["detail", "error_message", "disposition_reason", "summary"] as const) {
-			trimStringFieldForBudget(att, strKey, maxBytes, measure);
-			if (measure() <= maxBytes) return body;
+	for (const listKey of ["artifacts", "next_steps", "warnings", "verification", "causes"] as const) {
+		const list = att[listKey] as BoundedList<unknown> | undefined;
+		if (list && Array.isArray(list.items)) {
+			trimBoundedListForBudget(list, targetBytes, measure);
+			if (measure() <= targetBytes) return;
 		}
 	}
 
-	if (measure() > maxBytes) {
-		const fallbackAttempt: Record<string, unknown> = {
-			attempt_id: att && (typeof att.attempt_id === "string" || (att.attempt_id && typeof att.attempt_id === "object"))
-				? att.attempt_id
-				: { absence: "evidence unavailable" as TypedAbsence, explanation: "Attempt identity could not be verified." },
-			attempt_number: att && typeof att.attempt_number === "number" ? att.attempt_number : 1,
-			max_attempts: att && typeof att.max_attempts === "number" ? att.max_attempts : 1,
-			status: att && typeof att.status === "string" ? att.status : "needs_attention",
-			status_text: att && typeof att.status_text === "string" ? att.status_text : "Uncertain",
-			evidence: "unavailable" as const,
-			absence: "evidence unavailable" as TypedAbsence,
-			explanation: "Attempt output exceeded the response size budget and cannot be displayed.",
+	const cmd = att.command as Record<string, unknown> | undefined;
+	if (cmd && typeof cmd === "object") {
+		for (const cmdKey of ["stderr_excerpt", "stdout_excerpt", "termination_error", "spawn_error"] as const) {
+			trimStringFieldForBudget(cmd, cmdKey, targetBytes, measure);
+			if (measure() <= targetBytes) return;
+		}
+	}
+}
+
+function trimAttemptBodyFields(
+	att: Record<string, unknown>,
+	targetBytes: number,
+	measure: () => number,
+	includeSummary: boolean,
+): void {
+	const keys = includeSummary
+		? (["detail", "error_message", "disposition_reason", "summary"] as const)
+		: (["detail", "error_message", "disposition_reason"] as const);
+	for (const strKey of keys) {
+		trimStringFieldForBudget(att, strKey, targetBytes, measure);
+		if (measure() <= targetBytes) return;
+	}
+}
+
+function buildBudgetFallbackAttempt(att: Record<string, unknown> | undefined): Record<string, unknown> {
+	return {
+		attempt_id: att && (typeof att.attempt_id === "string" || (att.attempt_id && typeof att.attempt_id === "object"))
+			? att.attempt_id
+			: { absence: "evidence unavailable" as TypedAbsence, explanation: "Attempt identity could not be verified." },
+		attempt_number: att && (typeof att.attempt_number === "number" || (att.attempt_number && typeof att.attempt_number === "object"))
+			? att.attempt_number
+			: { absence: "evidence unavailable" as TypedAbsence, explanation: "Attempt number could not be verified." },
+		max_attempts: att && typeof att.max_attempts === "number" ? att.max_attempts : 1,
+		status: att && typeof att.status === "string" ? att.status : "needs_attention",
+		status_text: att && typeof att.status_text === "string" ? att.status_text : "Uncertain",
+		evidence: "unavailable" as const,
+		absence: "evidence unavailable" as TypedAbsence,
+		explanation: "Attempt output exceeded the response size budget and cannot be displayed.",
+	};
+}
+
+/**
+ * Bound the full `/output` response at `maxBytes` (default 64 KiB) without splitting surrogate pairs.
+ *
+ * Trim order across multiple attempts (stopping as soon as the serialized response fits):
+ * 1. Oldest attempts' optional sections first (`i = attempts.length - 1` down to `1`: `outputs_text`,
+ *    then `artifacts`/`next_steps`/`warnings`/`verification`/`causes`, then `command` excerpts/errors).
+ * 2. Older attempts' bodies (`i = attempts.length - 1` down to `1`: `detail`, `error_message`,
+ *    `disposition_reason`, `summary`).
+ * 3. Drop entire oldest attempts (`attempts.pop()` down to `attempts[0]`), updating `omitted_attempts`
+ *    and `omitted_marker` (`… [truncated, N attempts omitted]`).
+ * 4. Newest attempt (`attempts[0]`) optional sections, then `detail`/`error_message`/`disposition_reason`
+ *    (never trimming the newest attempt's `summary` or `status`).
+ * 5. Hard budget stub fallback (`evidence: "unavailable"`) if even a single minimal attempt exceeds `maxBytes`.
+ */
+export function enforceOutputResponseBudget(body: Record<string, unknown>, maxBytes = OUTPUT_MAX_RESPONSE_BYTES): Record<string, unknown> {
+	const measureBody = () => Buffer.byteLength(JSON.stringify(body), "utf8");
+	if (measureBody() <= maxBytes) return body;
+
+	const attempts = Array.isArray(body.attempts)
+		? (body.attempts as Array<Record<string, unknown>>)
+		: undefined;
+
+	if (attempts && attempts.length > 0) {
+		const attBytes = attempts.map(a => Buffer.byteLength(JSON.stringify(a), "utf8"));
+		const measureEnvelope = () => {
+			const saved = body.attempts;
+			body.attempts = [];
+			const bytes = Buffer.byteLength(JSON.stringify(body), "utf8");
+			body.attempts = saved;
+			return bytes;
 		};
+		let envelopeBytes = measureEnvelope();
+		let sumAttBytes = attBytes.reduce((acc, b) => acc + b, 0);
+		const totalBytes = () => envelopeBytes + sumAttBytes + Math.max(0, attempts.length - 1);
+
+		const trimSingleAttempt = (idx: number, fn: (att: Record<string, unknown>, target: number, measureAtt: () => number) => void) => {
+			const att = attempts[idx]!;
+			const otherBytes = totalBytes() - attBytes[idx]!;
+			const attTarget = maxBytes - otherBytes;
+			fn(att, attTarget, () => Buffer.byteLength(JSON.stringify(att), "utf8"));
+			const nextBytes = Buffer.byteLength(JSON.stringify(att), "utf8");
+			sumAttBytes += nextBytes - attBytes[idx]!;
+			attBytes[idx] = nextBytes;
+		};
+
+		// 1. Oldest attempts' optional sections first (leaving newest attempts[0] intact)
+		for (let i = attempts.length - 1; i >= 1 && totalBytes() > maxBytes; i--) {
+			trimSingleAttempt(i, trimAttemptOptionalSections);
+		}
+		// 2. Older attempts' bodies (leaving newest attempts[0] intact)
+		for (let i = attempts.length - 1; i >= 1 && totalBytes() > maxBytes; i--) {
+			trimSingleAttempt(i, (att, target, measureAtt) => trimAttemptBodyFields(att, target, measureAtt, true));
+		}
+		// 3. Drop entire oldest attempts with visible omitted_marker
+		while (attempts.length > 1 && totalBytes() > maxBytes) {
+			attempts.pop();
+			const droppedBytes = attBytes.pop() ?? 0;
+			sumAttBytes -= droppedBytes;
+			const prevOmitted = typeof body.omitted_attempts === "number" ? body.omitted_attempts : 0;
+			const nextOmitted = prevOmitted + 1;
+			body.omitted_attempts = nextOmitted;
+			body.omitted_marker = attemptsOmittedMarker(nextOmitted);
+			envelopeBytes = measureEnvelope();
+		}
+		// 4. Newest attempt optional sections, then body (never summary or status)
+		if (totalBytes() > maxBytes) {
+			trimSingleAttempt(0, trimAttemptOptionalSections);
+		}
+		if (totalBytes() > maxBytes) {
+			trimSingleAttempt(0, (att, target, measureAtt) => trimAttemptBodyFields(att, target, measureAtt, false));
+		}
+		if (measureBody() > maxBytes) {
+			dropOverflowFieldsFromAttempt(attempts[0]!, measureBody, maxBytes, false);
+		}
+
+		if (measureBody() > maxBytes) {
+			const fallbackAttempt = buildBudgetFallbackAttempt(attempts[0]);
+			body.evidence = "unavailable";
+			body.attempts = [fallbackAttempt];
+			if (measureBody() > maxBytes) {
+				fallbackAttempt.attempt_id = { absence: "evidence unavailable" as TypedAbsence, explanation: "Attempt identity unavailable." };
+				fallbackAttempt.explanation = "Attempt output exceeded response budget.";
+			}
+		}
+		return body;
+	}
+
+	const att = body.latest_attempt as Record<string, unknown> | undefined;
+	if (att && typeof att === "object") {
+		trimAttemptOptionalSections(att, maxBytes, measureBody);
+		if (measureBody() <= maxBytes) return body;
+		trimAttemptBodyFields(att, maxBytes, measureBody, true);
+		if (measureBody() <= maxBytes) return body;
+		dropOverflowFieldsFromAttempt(att, measureBody, maxBytes, false);
+		if (measureBody() <= maxBytes) return body;
+	}
+
+	if (measureBody() > maxBytes) {
+		const fallbackAttempt = buildBudgetFallbackAttempt(att);
 		body.evidence = "unavailable";
 		body.latest_attempt = fallbackAttempt;
-		if (measure() > maxBytes) {
+		if (measureBody() > maxBytes) {
 			fallbackAttempt.attempt_id = { absence: "evidence unavailable" as TypedAbsence, explanation: "Attempt identity unavailable." };
 			fallbackAttempt.explanation = "Attempt output exceeded response budget.";
 		}
@@ -480,6 +674,7 @@ function projectAttemptFromObservation(
 	obs: ResolvedNodeObservation,
 	blockedPaths: readonly string[],
 	projectCwd?: string,
+	sharedArtifactMatcher?: ArtifactRedactionMatcher,
 ) {
 	const attemptIdVal = obs.corrupt_or_unverified || !obs.attempt_id
 		? {
@@ -487,7 +682,12 @@ function projectAttemptFromObservation(
 			explanation: "Attempt identity could not be verified.",
 		}
 		: obs.attempt_id;
-	const attemptNumber = obs.corrupt_or_unverified ? 1 : obs.attempt_number;
+	const attemptNumber = obs.attempt_number_unverified
+		? {
+			absence: "evidence unavailable" as TypedAbsence,
+			explanation: "Attempt number unverified; node-level context could not be verified.",
+		}
+		: obs.attempt_number;
 
 	const unavailable = (
 		status: ExecutionState,
@@ -569,7 +769,7 @@ function projectAttemptFromObservation(
 	if (obs.has_result && obs.result_record) {
 		const record = obs.result_record;
 		const res = record.result;
-		const artifactMatcher = compileArtifactRedactionMatcher(
+		const artifactMatcher = sharedArtifactMatcher ?? compileArtifactRedactionMatcher(
 			collectArtifactPathTokens(res.artifacts, projectCwd),
 		);
 		const summary = sanitizeOutputText(res.summary, OUTPUT_SUMMARY_MAX_CHARS, blockedPaths, artifactMatcher);
@@ -701,19 +901,140 @@ export type OutputSnapshotOutcome =
 	| { kind: "not_found"; error: string }
 	| { kind: "ok"; body: Record<string, unknown> };
 
-/** Project the latest attempt's scrubbed, bounded output for one node of a factory's displayed run. */
+export function findRetainedEndedAttempt(inspection: Inspection) {
+	const hasUnreleased = inspection.attempts.some(a => !a.historical && !a.release_authorized);
+	if (hasUnreleased) return undefined;
+	return inspection.attempts.findLast(
+		a => a.release_authorized && (a.state === "settled" || a.state === "cleared") && a.settlement && !a.uncertainty?.length,
+	);
+}
+
+function readVerifiedRetainedIndexManifest(
+	indexRoot: string,
+	ended: NonNullable<ReturnType<typeof findRetainedEndedAttempt>>,
+	factoryId: string,
+): BootstrapManifest | undefined {
+	try {
+		assertTaskId(ended.task_id);
+		const indexFile = join(indexRoot, `${ended.task_id}.json`);
+		if (!pathEntryExists(indexFile)) return undefined;
+		assertPathInsideDir(indexRoot, indexFile, "bootstrap index manifest");
+		assertRegularFileIfExists(indexFile, "bootstrap index manifest", MAX_EVIDENCE_FILE_BYTES);
+		const manifestRead = readBoundedRegularJsonIfExists<unknown>(indexRoot, indexFile, "bootstrap index manifest", MAX_EVIDENCE_FILE_BYTES);
+		if (!manifestRead.exists) return undefined;
+		const manifest: BootstrapManifest = parseManifest(manifestRead.value, ended.task_id);
+		const fm = manifest.factory_managed;
+		if (
+			!fm
+			|| fm.factory_id !== factoryId
+			|| fm.attempt_id !== ended.attempt_id
+			|| fm.bound_version !== ended.bound_version
+			|| fm.input_id !== ended.input_id
+		) {
+			return undefined;
+		}
+		return manifest;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Safely read the retained manifest for a Deleted factory's settled or cleared run
+ * using non-blocking regular-file checks without modifying or recovering state.
+ */
+export function loadRetainedRunForOutput(
+	factoryId: string,
+	nodeId: string,
+	inspection: Inspection,
+	indexRoot: string,
+	inspectBoundVersion: (version: string) => Inspection,
+): { kind: "none" } | { kind: "not_found" } | { kind: "unavailable"; explanation: string } | { kind: "ready"; release: ReleasedFactoryRun } {
+	if (!inspection.deleted) return { kind: "none" };
+	if (assertRunEvidenceConsistent(inspection, []).state !== "no_displayed_run") return { kind: "none" };
+	const ended = findRetainedEndedAttempt(inspection);
+	if (!ended) return { kind: "none" };
+	let boundInsp: Inspection | undefined;
+	try {
+		boundInsp = inspectBoundVersion(ended.bound_version);
+	} catch {
+		boundInsp = undefined;
+	}
+	const def = boundInsp?.definition;
+	if (!def) {
+		const indexManifest = readVerifiedRetainedIndexManifest(indexRoot, ended, factoryId);
+		if (indexManifest && !indexManifest.pane_manifest.some(entry => entry.node_id === nodeId)) {
+			return { kind: "not_found" };
+		}
+		return { kind: "unavailable", explanation: "Bound run definition could not be verified." };
+	}
+	if (!def.agents.some(entry => entry.node.node_id === nodeId)) {
+		return { kind: "not_found" };
+	}
+	try {
+		assertTaskId(ended.task_id);
+		const expectedSessionDir = join(def.project_cwd, ".pi", "agent-sessions", ended.task_id);
+		const localManifestFile = join(expectedSessionDir, "manifest.json");
+		const indexFile = join(indexRoot, `${ended.task_id}.json`);
+		const hasLocal = pathEntryExists(localManifestFile);
+		if (hasLocal) {
+			assertPathInsideDir(expectedSessionDir, localManifestFile, "run manifest.json");
+			assertRegularFileIfExists(localManifestFile, "run manifest.json", MAX_EVIDENCE_FILE_BYTES);
+		}
+		if (pathEntryExists(indexFile)) {
+			assertPathInsideDir(indexRoot, indexFile, "bootstrap index manifest");
+			assertRegularFileIfExists(indexFile, "bootstrap index manifest", MAX_EVIDENCE_FILE_BYTES);
+		}
+		const manifestRead = hasLocal
+			? readBoundedRegularJsonIfExists<unknown>(expectedSessionDir, localManifestFile, "run manifest.json", MAX_EVIDENCE_FILE_BYTES)
+			: readBoundedRegularJsonIfExists<unknown>(indexRoot, indexFile, "bootstrap index manifest", MAX_EVIDENCE_FILE_BYTES);
+		if (!manifestRead.exists) {
+			return { kind: "unavailable", explanation: "Retained run manifest is missing." };
+		}
+		const manifest: BootstrapManifest = parseManifest(manifestRead.value, ended.task_id);
+		const fm = manifest.factory_managed;
+		if (
+			!fm
+			|| fm.factory_id !== factoryId
+			|| fm.attempt_id !== ended.attempt_id
+			|| fm.bound_version !== ended.bound_version
+			|| fm.input_id !== ended.input_id
+		) {
+			return { kind: "unavailable", explanation: "Retained run metadata does not match the recorded attempt." };
+		}
+		if (manifest.session_dir_removed || manifest.session_dir !== expectedSessionDir || manifest.status !== "applied") {
+			return { kind: "unavailable", explanation: "Retained run session evidence is unavailable." };
+		}
+		return {
+			kind: "ready",
+			release: {
+				manifest,
+				definition: def,
+				attempt_id: ended.attempt_id,
+				bound_version: ended.bound_version,
+			},
+		};
+	} catch {
+		return { kind: "unavailable", explanation: "Retained run evidence could not be verified." };
+	}
+}
+
+export interface NodeOutputSnapshotOptions {
+	retainedRelease?: ReleasedFactoryRun;
+	retainedError?: string;
+}
+
+/** Project every attempt (newest first, up to 20) of one node of a factory's displayed or retained run. */
 export function nodeOutputSnapshot(
 	factoryId: string,
 	nodeId: string,
 	inspection: Inspection,
 	releases: ReleasedFactoryRun[],
 	blockedPaths: readonly string[] = [],
+	options: NodeOutputSnapshotOptions = {},
 ): OutputSnapshotOutcome {
 	const deletionFields = deletionMarkerFields(inspection, blockedPaths);
 	const consistent = assertRunEvidenceConsistent(inspection, releases);
-	if (consistent.state === "no_displayed_run") {
-		return { kind: "not_found", error: "Node not found in displayed run" };
-	}
 	if (consistent.state === "uncertain") {
 		if (releases.length > 0 && !releases.some(r => r.definition.agents.some(entry => entry.node.node_id === nodeId))) {
 			return { kind: "not_found", error: "Node not found in displayed run" };
@@ -731,16 +1052,39 @@ export function nodeOutputSnapshot(
 		};
 	}
 
-	const release = consistent.release;
+	let release: ReleasedFactoryRun | undefined;
+	if (consistent.state === "released") {
+		release = consistent.release;
+	} else if (options.retainedError) {
+		return {
+			kind: "ok",
+			body: {
+				factory_id: factoryId,
+				node_id: nodeId,
+				...deletionFields,
+				evidence: "unavailable",
+				absence: "evidence unavailable" as TypedAbsence,
+				explanation: options.retainedError,
+			},
+		};
+	} else if (options.retainedRelease) {
+		release = options.retainedRelease;
+	} else {
+		return { kind: "not_found", error: "Node not found in displayed run" };
+	}
+
 	if (!release.definition.agents.some(entry => entry.node.node_id === nodeId)) {
 		return { kind: "not_found", error: "Node not found in displayed run" };
 	}
 
 	let resolved: ReturnType<typeof resolveRunObservations>;
 	try {
-		// Enforce the 1 MiB record limit only on the requested node so upstream observations stay aligned with /live (N5).
-		// Ticket 03 will add per-attempt resolution across `<inst>.<n>.result.json` here.
-		resolved = resolveRunObservations(factoryId, release, blockedPaths, { enforceSizeLimitNodeId: nodeId });
+		// Enforce the 1 MiB record limit only on the requested node so upstream observations stay aligned with /live (N5),
+		// and defer per-attempt result/disposition/error checks on the requested node to independent per-attempt resolution.
+		resolved = resolveRunObservations(factoryId, release, blockedPaths, {
+			enforceSizeLimitNodeId: nodeId,
+			skipLoopResultPrecheckNodeId: nodeId,
+		});
 	} catch {
 		return {
 			kind: "ok",
@@ -756,19 +1100,51 @@ export function nodeOutputSnapshot(
 	}
 
 	const obs = resolved.observations.get(nodeId);
-	if (!obs) {
+	const launched = resolved.roster.get(nodeId);
+	if (!obs || !launched) {
 		return { kind: "not_found", error: "Node not found in displayed run" };
 	}
 
-	const latestAttempt = projectAttemptFromObservation(obs, resolved.runBlockedPaths, resolved.manifest.project_cwd);
+	const byInstance = new Map(resolved.manifest.pane_manifest.map(entry => [entry.instance_id, entry.node_id]));
+	const resolvedAttempts = resolveNodeAttempts(
+		resolved.manifest,
+		launched,
+		byInstance,
+		resolved.runBlockedPaths,
+		obs,
+		OUTPUT_MAX_ATTEMPTS,
+		{ resolved: true, context: resolved.contexts.get(nodeId) },
+	);
+	const attemptMatchers = compileUnionArtifactMatchers(
+		resolvedAttempts.attempts.map(attObs =>
+			!attObs.corrupt_or_unverified && attObs.has_result && attObs.result_record
+				? attObs.result_record.result.artifacts
+				: undefined,
+		),
+		resolved.manifest.project_cwd,
+	);
+	const projectedAttempts = resolvedAttempts.attempts.map((attObs, idx) =>
+		projectAttemptFromObservation(attObs, resolved.runBlockedPaths, resolved.manifest.project_cwd, attemptMatchers[idx]),
+	);
+	const totalAttemptsVal = resolvedAttempts.totalAttemptsExact
+		? resolvedAttempts.totalAttempts
+		: {
+			absence: "evidence unavailable" as TypedAbsence,
+			explanation: "Total attempt count could not be verified because node-level context failed.",
+		};
 	const body: Record<string, unknown> = {
 		factory_id: factoryId,
 		node_id: nodeId,
 		run_id: resolved.manifest.task_id,
 		bound_version: resolved.bound_version,
 		...deletionFields,
-		evidence: latestAttempt.evidence,
-		latest_attempt: latestAttempt,
+		evidence: projectedAttempts[0]?.evidence ?? "unavailable",
+		attempts: projectedAttempts,
+		total_attempts: totalAttemptsVal,
+		omitted_attempts: resolvedAttempts.omittedAttempts,
+		...(resolvedAttempts.omittedAttempts > 0
+			? { omitted_marker: attemptsOmittedMarker(resolvedAttempts.omittedAttempts) }
+			: {}),
 	};
 	return {
 		kind: "ok",
