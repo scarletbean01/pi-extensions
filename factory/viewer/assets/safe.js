@@ -888,6 +888,36 @@
     return false;
   }
 
+  function resolveFinishedOutputAnnouncement(nodeId, data, nodeSnapshot) {
+    if (typeof nodeId !== "string" || !nodeId) return "";
+    const nodeOut = extractNodeOutputState(nodeSnapshot);
+    const attempts = Array.isArray(data?.attempts)
+      ? data.attempts.filter((a) => a && typeof a === "object")
+      : (data?.latest_attempt && typeof data.latest_attempt === "object" ? [data.latest_attempt] : []);
+    const newest = attempts[0] || null;
+    const newestStatus = typeof newest?.status === "string" && newest.status.trim()
+      ? newest.status.trim().toLowerCase()
+      : "";
+    const attemptCompletedAt = typeof newest?.completed_at === "string" && newest.completed_at ? newest.completed_at : "";
+    const isFinished = newest
+      ? (FINISHED_OUTPUT_STATUSES.has(newestStatus) || Boolean(attemptCompletedAt) || (Boolean(nodeOut?.isFinished) && newestStatus !== "running"))
+      : Boolean(nodeOut?.isFinished);
+    if (!isFinished) return "";
+    const attemptNumber = typeof newest?.attempt_number === "number" && Number.isFinite(newest.attempt_number)
+      ? newest.attempt_number
+      : (nodeOut?.attemptNumber ?? null);
+    const rawStatus = newestStatus || nodeOut?.status || "";
+    const overrideLabel = (typeof newest?.status_text === "string" && newest.status_text.trim())
+      ? newest.status_text.trim()
+      : (!newestStatus && typeof nodeSnapshot?.status_text === "string" && nodeSnapshot.status_text.trim()
+        ? nodeSnapshot.status_text.trim()
+        : undefined);
+    const statusLabel = resolveStatusMeta(rawStatus, overrideLabel).label;
+    return attemptNumber !== null
+      ? `Attempt ${attemptNumber} of node ${nodeId} finished: ${statusLabel}`
+      : `Attempt of node ${nodeId} finished: ${statusLabel}`;
+  }
+
   root.FactoryViewerSafe = Object.freeze({
     VALID_ID,
     VALID_VERSION,
@@ -933,5 +963,6 @@
     computeNextPollAction,
     planKeyedDiff,
     shouldRefetchNodeOutput,
+    resolveFinishedOutputAnnouncement,
   });
 })(typeof globalThis !== "undefined" ? globalThis : this);

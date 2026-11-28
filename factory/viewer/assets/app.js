@@ -42,6 +42,7 @@ const {
   computeNextPollAction,
   planKeyedDiff,
   shouldRefetchNodeOutput,
+  resolveFinishedOutputAnnouncement,
 } = Safe;
 
 const FETCH_TIMEOUT_MS = 15000;
@@ -755,6 +756,7 @@ function createDetailState() {
     outputFactoryId: "",
     outputNodeSnapshot: null,
     outputHasRendered: false,
+    outputLastError: false,
     outputDisclosureOpen: new Map(),
     outputAttemptEntries: new Map(),
     outputTrackedDisclosures: new Map(),
@@ -770,6 +772,7 @@ function resetDetailOutputState(ds) {
   ds.outputFactoryId = "";
   ds.outputNodeSnapshot = null;
   ds.outputHasRendered = false;
+  ds.outputLastError = false;
   ds.outputDisclosureOpen = new Map();
   ds.outputAttemptEntries = new Map();
   ds.outputTrackedDisclosures = new Map();
@@ -869,8 +872,14 @@ function getAttemptDisclosureKey(att, idx, seenKeys) {
 
 function syncOpenDisclosuresFromDom(ds) {
   if (!ds || !(ds.outputTrackedDisclosures instanceof Map)) return;
-  for (const [key, detailsEl] of ds.outputTrackedDisclosures.entries()) {
-    ds.outputDisclosureOpen.set(key, Boolean(detailsEl.open));
+  for (const [key, tracked] of ds.outputTrackedDisclosures.entries()) {
+    if (!tracked || !tracked.detailsEl) continue;
+    const domOpen = Boolean(tracked.detailsEl.open);
+    if (domOpen !== tracked.defaultOpen) {
+      ds.outputDisclosureOpen.set(key, domOpen);
+    } else {
+      ds.outputDisclosureOpen.delete(key);
+    }
   }
 }
 
@@ -903,7 +912,7 @@ function upsertSubDisclosure(existingSub, subKey, focusKey, headingText, isOpen,
     }
   }
   setDetailsOpen(entry.details, isOpen);
-  nextTrackedDisclosures.set(subKey, entry.details);
+  nextTrackedDisclosures.set(subKey, { detailsEl: entry.details, defaultOpen: false });
   nextFocusTargets.set(focusKey, entry.summaryEl);
   return entry;
 }
@@ -977,7 +986,6 @@ function buildAttemptBodyNodes(att, attKey, ds, existingEntry, nextTrackedDisclo
       const outKey = `${attKey}:outputs`;
       const outFocusKey = `output:${outKey}`;
       const outOpen = ds?.outputDisclosureOpen?.has(outKey) ? Boolean(ds.outputDisclosureOpen.get(outKey)) : false;
-      ds?.outputDisclosureOpen?.set(outKey, outOpen);
       outputsEntry = upsertSubDisclosure(
         existingEntry?.outputsEntry || null,
         outKey,
@@ -996,7 +1004,6 @@ function buildAttemptBodyNodes(att, attKey, ds, existingEntry, nextTrackedDisclo
       const artKey = `${attKey}:artifacts`;
       const artFocusKey = `output:${artKey}`;
       const artOpen = ds?.outputDisclosureOpen?.has(artKey) ? Boolean(ds.outputDisclosureOpen.get(artKey)) : false;
-      ds?.outputDisclosureOpen?.set(artKey, artOpen);
       const artCount = att.artifacts.total_count ?? att.artifacts.items.length;
       const artSig = JSON.stringify(att.artifacts);
       artifactsEntry = upsertSubDisclosure(
@@ -1084,7 +1091,7 @@ function buildAttemptBodyNodes(att, attKey, ds, existingEntry, nextTrackedDisclo
   return { nodes, outputsEntry, artifactsEntry };
 }
 
-function upsertAttemptDisclosure(att, attKey, isOpen, ds, existingEntry, nextTrackedDisclosures, nextFocusTargets) {
+function upsertAttemptDisclosure(att, attKey, isOpen, defaultOpen, ds, existingEntry, nextTrackedDisclosures, nextFocusTargets) {
   const attemptHeading = typeof att.attempt_number === "number"
     ? `Attempt ${att.attempt_number} of ${att.max_attempts ?? "?"}`
     : `Attempt (number unverified) of ${att.max_attempts ?? "?"}`;
@@ -1136,7 +1143,7 @@ function upsertAttemptDisclosure(att, attKey, isOpen, ds, existingEntry, nextTra
         const outFocusKey = `output:${outKey}`;
         const outOpen = ds?.outputDisclosureOpen?.has(outKey) ? Boolean(ds.outputDisclosureOpen.get(outKey)) : false;
         setDetailsOpen(entry.outputsEntry.details, outOpen);
-        nextTrackedDisclosures.set(outKey, entry.outputsEntry.details);
+        nextTrackedDisclosures.set(outKey, { detailsEl: entry.outputsEntry.details, defaultOpen: false });
         nextFocusTargets.set(outFocusKey, entry.outputsEntry.summaryEl);
       }
       if (entry.artifactsEntry) {
@@ -1144,13 +1151,13 @@ function upsertAttemptDisclosure(att, attKey, isOpen, ds, existingEntry, nextTra
         const artFocusKey = `output:${artKey}`;
         const artOpen = ds?.outputDisclosureOpen?.has(artKey) ? Boolean(ds.outputDisclosureOpen.get(artKey)) : false;
         setDetailsOpen(entry.artifactsEntry.details, artOpen);
-        nextTrackedDisclosures.set(artKey, entry.artifactsEntry.details);
+        nextTrackedDisclosures.set(artKey, { detailsEl: entry.artifactsEntry.details, defaultOpen: false });
         nextFocusTargets.set(artFocusKey, entry.artifactsEntry.summaryEl);
       }
     }
   }
   setDetailsOpen(entry.details, isOpen);
-  nextTrackedDisclosures.set(attKey, entry.details);
+  nextTrackedDisclosures.set(attKey, { detailsEl: entry.details, defaultOpen });
   nextFocusTargets.set(focusKey, entry.summaryEl);
   return entry;
 }
@@ -1175,7 +1182,10 @@ function renderAttemptOutputBody(slot, data, errorInfo, ds) {
   syncOpenDisclosuresFromDom(ds);
   const focusedKey = getFocusedOutputKey(slot, ds);
   slot.setAttribute("aria-busy", "false");
-  if (ds) ds.outputHasRendered = true;
+  if (ds) {
+    ds.outputHasRendered = true;
+    ds.outputLastError = Boolean(errorInfo) || !data || typeof data !== "object";
+  }
 
   const clearRenderedEntries = () => {
     if (!ds) return;
@@ -1213,12 +1223,12 @@ function renderAttemptOutputBody(slot, data, errorInfo, ds) {
 
   attempts.forEach((att, idx) => {
     const attKey = getAttemptDisclosureKey(att, idx, seenKeys);
+    const defaultOpen = idx === 0;
     const isOpen = ds?.outputDisclosureOpen?.has(attKey)
       ? Boolean(ds.outputDisclosureOpen.get(attKey))
-      : idx === 0;
-    ds?.outputDisclosureOpen?.set(attKey, isOpen);
+      : defaultOpen;
     const existingEntry = ds?.outputAttemptEntries?.get(attKey) || null;
-    const entry = upsertAttemptDisclosure(att, attKey, isOpen, ds, existingEntry, nextTrackedDisclosures, nextFocusTargets);
+    const entry = upsertAttemptDisclosure(att, attKey, isOpen, defaultOpen, ds, existingEntry, nextTrackedDisclosures, nextFocusTargets);
     nextAttemptEntries.set(attKey, entry);
     nodes.push(entry.details);
   });
@@ -1242,17 +1252,18 @@ function renderAttemptOutputBody(slot, data, errorInfo, ds) {
   if (focusedKey && ds?.outputFocusTargets?.has(focusedKey)) {
     const focusTarget = ds.outputFocusTargets.get(focusedKey);
     if (focusTarget && document.activeElement !== focusTarget) {
-      focusTarget.focus();
+      focusTarget.focus({ preventScroll: true });
     }
   }
 }
 
-async function requestNodeOutput(factoryId, nodeId, ds, nodeSnapshot) {
+async function requestNodeOutput(factoryId, nodeId, ds, nodeSnapshot, options) {
   abortOutputRequest();
   const slot = ds.outputBody;
   if (!slot) return;
   const outputKey = `${factoryId}\u0000${nodeId}`;
   ds.outputLoadedKey = "";
+  ds.outputLastError = false;
   ds.outputFactoryId = factoryId;
   ds.outputNodeSnapshot = nodeSnapshot || null;
   const url = outputApiUrl(factoryId, nodeId);
@@ -1288,6 +1299,10 @@ async function requestNodeOutput(factoryId, nodeId, ds, nodeSnapshot) {
     }
     renderAttemptOutputBody(slot, data, null, ds);
     ds.outputLoadedKey = outputKey;
+    if (options?.announceOnFinish && state.liveDom?.announcer && state.liveDom.factoryId === factoryId) {
+      const msg = resolveFinishedOutputAnnouncement(nodeId, data, nodeSnapshot);
+      if (msg) setTextIfChanged(state.liveDom.announcer, msg);
+    }
   } catch (err) {
     if (err && err.name === "AbortError") return;
     if (seq !== state.outputRequestSeq || factoryId !== state.selectedFactoryId || nodeId !== state.selectedGraphNodeId || state.activeView !== "live") return;
@@ -1351,7 +1366,7 @@ function buildTimestampFactNodes(att) {
   return items;
 }
 
-function patchLiveNodeDetail(detailEl, node, boundVersion, detailState) {
+function patchLiveNodeDetail(detailEl, node, boundVersion, detailState, options) {
   const ds = detailState || createDetailState();
   if (!ds.headingEl) {
     ds.headingEl = el("h3", "Selected node", { class: "card-title" });
@@ -1425,7 +1440,7 @@ function patchLiveNodeDetail(detailEl, node, boundVersion, detailState) {
         c.check ? `${c.check.name} (${c.check.evidence})` : "—",
       ]))
       : null;
-    ds.outputSec = el("section", undefined, { class: "card" });
+    ds.outputSec = el("section", undefined, { class: "card", "aria-live": "off" });
     const outputCardBody = el("div", undefined, { class: "card-content" });
     outputCardBody.append(el("h4", "Attempt output", { class: "card-title" }));
     ds.outputBody = el("div", undefined, { "aria-busy": "false" });
@@ -1527,12 +1542,19 @@ function patchLiveNodeDetail(detailEl, node, boundVersion, detailState) {
   }
   ds.sigs = nextSigs;
   const outputKey = `${state.selectedFactoryId}\u0000${node.id}`;
+  const prevFactoryId = ds.outputFactoryId;
+  const isSameFactory = prevFactoryId === state.selectedFactoryId;
   const needsRefetch = shouldRefetchNodeOutput(ds.outputNodeSnapshot, node, {
-    prevFactoryId: ds.outputFactoryId,
+    prevFactoryId,
     nextFactoryId: state.selectedFactoryId,
   });
-  if (needsRefetch || (ds.outputLoadedKey !== outputKey && !state.outputController)) {
-    void requestNodeOutput(state.selectedFactoryId, node.id, ds, node);
+  ds.outputNodeSnapshot = node;
+  ds.outputFactoryId = state.selectedFactoryId;
+  const retryOnError = Boolean(options?.retryOutputOnError && ds.outputLastError && !state.outputController);
+  if (needsRefetch || retryOnError || (ds.outputLoadedKey !== outputKey && !state.outputController)) {
+    void requestNodeOutput(state.selectedFactoryId, node.id, ds, node, {
+      announceOnFinish: needsRefetch && isSameFactory,
+    });
   }
   return ds;
 }
@@ -1766,6 +1788,7 @@ function createGraphController(initialGraph, detailEl, initialBoundVersion) {
   let nodeOrder = [];
 
   function selectNodeById(nodeId) {
+    const reselectedSame = state.selectedGraphNodeId === nodeId;
     state.selectedGraphNodeId = nodeId;
     for (const [id, entry] of nodeEntries.entries()) {
       const active = id === nodeId;
@@ -1773,7 +1796,9 @@ function createGraphController(initialGraph, detailEl, initialBoundVersion) {
       setAttrIfChanged(entry.g, "aria-pressed", active ? "true" : "false");
     }
     const target = nodeEntries.get(nodeId)?.nodeData || null;
-    patchLiveNodeDetail(detailEl, target, currentBoundVersion, detailState);
+    patchLiveNodeDetail(detailEl, target, currentBoundVersion, detailState, {
+      retryOutputOnError: reselectedSame,
+    });
   }
 
   function createEdgeEntry(key, renderData) {
