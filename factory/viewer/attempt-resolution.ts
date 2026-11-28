@@ -411,151 +411,104 @@ export interface ResolvedNodeObservation {
 	source_instance?: string;
 }
 
-/** Resolve one node's latest attempt, expected identity, durable records, and derived status without mutating state. */
-export function resolveNodeObservation(
-	manifest: BootstrapManifest,
-	entry: AgentLaunch,
-	byInstanceNodeId: ReadonlyMap<string, string>,
-	blockedPaths: readonly string[],
-	options: { enforceNodeRecordSizeLimit?: boolean; enforceSizeLimitNodeId?: string } = {},
+export interface ResolveRunObservationsOptions {
+	enforceNodeRecordSizeLimit?: boolean;
+	enforceSizeLimitNodeId?: string;
+	skipLoopResultPrecheckNodeId?: string;
+}
+
+interface SharedNodeContext {
+	manifest: BootstrapManifest;
+	entry: AgentLaunch;
+	byInstanceNodeId: ReadonlyMap<string, string>;
+	blockedPaths: readonly string[];
+	recordMaxBytes: number;
+	loop?: ReturnType<typeof reviewLoopFor>;
+	maxAttempts: number;
+	latestAttemptNum: number;
+	latestAttemptId?: string;
+	latestSourceInstance?: string;
+	finalization?: ReturnType<typeof readFinalization>;
+	processState: ResolvedNodeObservation["process_state"];
+	readyAlive: boolean;
+	runCancelRecord?: ReturnType<typeof readRunCancelRecordSafe>["record"];
+	matchingProgress?: ProgressSnapshot;
+	startedAt?: string;
+	updatedAt?: string;
+	waitingForHumanSince?: string;
+}
+
+/**
+ * Resolve one attempt `targetAttemptNum` of a node from shared node context, independently catching
+ * file/identity/format errors so one damaged attempt never hides or blocks other attempts.
+ */
+function resolveSingleAttemptFromContext(
+	ctx: SharedNodeContext,
+	targetAttemptNum: number,
 ): ResolvedNodeObservation {
+	const {
+		manifest,
+		entry,
+		byInstanceNodeId,
+		blockedPaths,
+		recordMaxBytes,
+		loop,
+		maxAttempts,
+		latestAttemptNum,
+		latestSourceInstance,
+		finalization,
+		processState,
+		readyAlive,
+		runCancelRecord,
+		matchingProgress,
+		startedAt,
+		updatedAt,
+		waitingForHumanSince,
+	} = ctx;
 	const { session_dir: dir, task_id, review_plan } = manifest;
-	const enforceNodeRecordSizeLimit = Boolean(
-		options.enforceNodeRecordSizeLimit || options.enforceSizeLimitNodeId === entry.node_id,
-	);
-	const recordMaxBytes = enforceNodeRecordSizeLimit ? MAX_EVIDENCE_FILE_BYTES : Number.POSITIVE_INFINITY;
-	const loop = reviewLoopFor(review_plan, entry.instance_id);
-	const maxAttempts = loop ? loop.max_revisions + 1 : 1;
-	let resolvedAttemptNum = 1;
-	let resolvedAttemptId = entry.attempt_id;
-	let resolvedKey = entry.instance_id;
-	let resolvedExpected: CompletionExpectation | undefined;
+	const isLatest = targetAttemptNum === latestAttemptNum;
+	const inbound = inboundEdgesOf(entry);
+	const sourceInstance = isLatest
+		? latestSourceInstance
+		: (loop && entry.instance_id === loop.target && targetAttemptNum >= 2
+			? loop.reviewer
+			: (inbound.length === 1 ? inbound[0] : undefined));
+	const hasScopedAttempts = Boolean(review_plan && !manifest.session_dir_removed);
+	const attemptId = hasScopedAttempts || targetAttemptNum > 1
+		? `${entry.instance_id}.${targetAttemptNum}`
+		: entry.attempt_id;
+	const key = review_plan && (hasScopedAttempts || finalization || targetAttemptNum > 1)
+		? (attemptId ?? entry.instance_id)
+		: entry.instance_id;
+	const expected: CompletionExpectation = { ...expectationFor(manifest, entry), attempt_id: attemptId };
 
 	try {
-		assertRegularDirNoSymlink(dir, "session directory");
-		if (loop) {
-			assertPathInsideDir(dir, finalizePath(dir, entry.instance_id), "finalization record");
-			assertRegularFileIfExists(finalizePath(dir, entry.instance_id), "finalization record", MAX_EVIDENCE_FILE_BYTES);
-			assertPathInsideDir(dir, finalizePath(dir, loop.reviewer), "reviewer finalization record");
-			assertRegularFileIfExists(finalizePath(dir, loop.reviewer), "reviewer finalization record", MAX_EVIDENCE_FILE_BYTES);
-			for (let n = 1; n <= maxAttempts; n++) {
-				const keyN = `${entry.instance_id}.${n}`;
-				for (const [p, lbl] of [
-					[resultPath(dir, keyN), "loop result"],
-					[dispositionPath(dir, keyN), "loop disposition"],
-					[join(dir, `${keyN}.error.json`), "loop error"],
-					[join(dir, `${keyN}.transition.json`), "loop transition"],
-					[join(dir, `${loop.reviewer}.${n}.revision.json`), "revision reservation"],
-				] as const) {
-					assertPathInsideDir(dir, p, lbl);
-					assertRegularFileIfExists(p, lbl, MAX_EVIDENCE_FILE_BYTES);
-				}
-				for (const src of inboundEdgesOf(entry)) {
-					const claimP = handoffClaimPath(dir, keyN, src);
-					assertPathInsideDir(dir, claimP, "revision handoff claim");
-					assertRegularFileIfExists(claimP, "revision handoff claim", MAX_EVIDENCE_FILE_BYTES);
-				}
-				if (loop.target === entry.instance_id) {
-					const fbClaimP = handoffClaimPath(dir, keyN, loop.reviewer);
-					assertPathInsideDir(dir, fbClaimP, "feedback handoff claim");
-					assertRegularFileIfExists(fbClaimP, "feedback handoff claim", MAX_EVIDENCE_FILE_BYTES);
-				}
-			}
-		}
-
-		let attempt = currentAttempt(manifest, entry);
-		const finalization = loop && readFinalization(dir, task_id, loop, entry.instance_id, manifest.topology, manifest.version);
-		if (finalization && attempt && attemptNumber(finalization.attempt_id) < attempt.number) {
-			attempt = { ...attempt, number: attemptNumber(finalization.attempt_id) };
-		}
-		const attemptNum = attempt?.number ?? 1;
-		const attemptId = attempt ? `${entry.instance_id}.${attempt.number}` : entry.attempt_id;
-		resolvedAttemptNum = attemptNum;
-		resolvedAttemptId = attemptId;
-		if (finalization && attemptId && finalization.attempt_id !== attemptId) {
-			throw new Error("Finalization does not match the latest attempt");
-		}
-		const key = review_plan && (attempt || finalization) ? (attemptId ?? entry.instance_id) : entry.instance_id;
-		resolvedKey = key;
-		const expected: CompletionExpectation = { ...expectationFor(manifest, entry), attempt_id: attemptId };
-		resolvedExpected = expected;
 		const resFile = resultPath(dir, key);
 		const dispFile = dispositionPath(dir, key);
+		const claimFile = outcomeClaimPath(dir, key);
 		assertPathInsideDir(dir, resFile, "node result");
 		assertPathInsideDir(dir, dispFile, "node disposition");
+		assertPathInsideDir(dir, claimFile, "outcome claim");
+		assertRegularFileIfExists(claimFile, "outcome claim", MAX_EVIDENCE_FILE_BYTES);
+
 		const hasResult = pathEntryExists(resFile);
 		const hasDisposition = pathEntryExists(dispFile);
 		if (hasResult && hasDisposition) {
 			throw new Error("Contradictory result records");
 		}
 
-		const readyFile = readyPath(dir, entry.instance_id);
-		const progressFile = join(dir, `${entry.instance_id}.progress.json`);
-		const cancelFile = cancelPath(dir, entry.instance_id);
-		const runCancelFile = runCancelPath(dir);
-		const ffFile = failFastPath(dir);
-		const claimFile = outcomeClaimPath(dir, key);
-		assertPathInsideDir(dir, cancelFile, "cancel record");
-		assertPathInsideDir(dir, runCancelFile, "run cancel record");
-		assertPathInsideDir(dir, ffFile, "fail-fast record");
-		assertPathInsideDir(dir, claimFile, "outcome claim");
-		assertRegularFileIfExists(cancelFile, "cancel record", MAX_EVIDENCE_FILE_BYTES);
-		assertRegularFileIfExists(runCancelFile, "run cancel record", MAX_EVIDENCE_FILE_BYTES);
-		assertRegularFileIfExists(ffFile, "fail-fast record", MAX_EVIDENCE_FILE_BYTES);
-		assertRegularFileIfExists(claimFile, "outcome claim", MAX_EVIDENCE_FILE_BYTES);
-
-		const readyRead = readBoundedRegularJsonIfExists<unknown>(dir, readyFile, "worker readiness", recordMaxBytes);
-		let processState: ResolvedNodeObservation["process_state"] = "not_started";
-		let readyAlive = false;
-		if (readyRead.exists) {
-			const ready = parseWorkerReady(readyRead.value);
-			if (ready.token !== manifest.token || ready.task_id !== task_id || ready.instance_id !== entry.instance_id) {
-				throw new Error("Foreign readiness");
-			}
-			readyAlive = processAlive(ready);
-			processState = readyAlive ? "alive" : "exited";
-		}
-
-		const cancelInfo = readCancelRecordSafe(dir, {
+		const identity = {
 			run_id: task_id,
 			node_id: entry.node_id,
 			persona_name: entry.persona_name,
 			instance_id: entry.instance_id,
 			...(attemptId ? { attempt_id: attemptId } : {}),
-		});
-		const runCancelInfo = readRunCancelRecordSafe(dir, task_id);
-		const failFastInfo = readFailFast(dir, task_id, manifest.token);
-		const claimInfo = readOutcomeClaimSafe(dir, {
-			run_id: task_id,
-			node_id: entry.node_id,
-			persona_name: entry.persona_name,
-			instance_id: entry.instance_id,
-			...(attemptId ? { attempt_id: attemptId } : {}),
-		}, key);
-		if (cancelInfo.error || runCancelInfo.error || failFastInfo.error || claimInfo.error) {
-			throw new Error(cancelInfo.error ?? runCancelInfo.error ?? failFastInfo.error ?? claimInfo.error);
+		};
+		const cancelInfo = readCancelRecordSafe(dir, identity);
+		const claimInfo = readOutcomeClaimSafe(dir, identity, key);
+		if (cancelInfo.error || claimInfo.error) {
+			throw new Error(cancelInfo.error ?? claimInfo.error);
 		}
-
-		const progressRead = readBoundedRegularJsonIfExists<ProgressSnapshot>(dir, progressFile, "node progress", recordMaxBytes);
-		let matchingProgress: ProgressSnapshot | undefined;
-		if (progressRead.exists) {
-			const progress = progressRead.value;
-			if (progress.token !== manifest.token) throw new Error("Foreign progress");
-			if (progress.attempt_id !== undefined && progress.attempt_id !== attemptId) {
-				if (!(review_plan && progress.state === "completed" && progress.attempt_id.startsWith(`${entry.instance_id}.`))) {
-					throw new Error("Progress attempt mismatch");
-				}
-			} else if (review_plan && progress.attempt_id === undefined) {
-				throw new Error("Missing review progress attempt");
-			} else {
-				matchingProgress = progress;
-			}
-		}
-		const startedAt = matchingProgress && Number.isFinite(matchingProgress.started_at) ? new Date(matchingProgress.started_at!).toISOString() : undefined;
-		const updatedAt = matchingProgress && Number.isFinite(matchingProgress.updated_at) ? new Date(matchingProgress.updated_at).toISOString() : undefined;
-		const waitingForHumanSince = matchingProgress && Number.isFinite(matchingProgress.waiting_for_human_since)
-			? new Date(matchingProgress.waiting_for_human_since!).toISOString()
-			: undefined;
 
 		if (hasDisposition) {
 			const dispRead = readBoundedRegularJsonIfExists<unknown>(dir, dispFile, "node disposition", recordMaxBytes);
@@ -567,14 +520,16 @@ export function resolveNodeObservation(
 			const rawCauses = projectCauses(disp.causes);
 			const causes = projectCauses(disp.causes, blockedPaths);
 			const recordedAt = validateIsoTimestamp(disp.recorded_at);
-			const closedEdge = loop && blockedReviewForwardEdge(loop, finalization, entry.node_id, {
-				state: disp.state,
-				causes: disp.causes,
-				reason: disp.reason,
-			});
+			const closedEdge = isLatest && loop
+				? blockedReviewForwardEdge(loop, finalization, entry.node_id, {
+					state: disp.state,
+					causes: disp.causes,
+					reason: disp.reason,
+				})
+				: undefined;
 			return {
 				attempt_id: attemptId,
-				attempt_number: attemptNum,
+				attempt_number: targetAttemptNum,
 				max_attempts: maxAttempts,
 				instance_id: entry.instance_id,
 				key,
@@ -589,17 +544,17 @@ export function resolveNodeObservation(
 				reason: disp.reason ? sanitizeOperatorText(disp.reason, 1000, blockedPaths) : "The node has a recorded execution disposition.",
 				...(causes ? { causes } : {}),
 				...(rawCauses ? { raw_causes: rawCauses } : {}),
-				...(finalization ? { finalized: true } : {}),
+				...(isLatest && finalization ? { finalized: true } : {}),
 				...(disp.state === "needs_attention" ? { evidence_problem: "Attempt ended with unresolved evidence and no recorded result." } : {}),
 				resource_state: entry.status,
-				process_state: processState,
-				...(startedAt ? { started_at: startedAt } : {}),
-				...(updatedAt ? { updated_at: updatedAt } : {}),
+				process_state: isLatest ? processState : "exited",
+				...(isLatest && startedAt ? { started_at: startedAt } : {}),
+				...(isLatest && updatedAt ? { updated_at: updatedAt } : {}),
 				...(recordedAt ? { completed_at: recordedAt } : {}),
 				...(command ? { command } : {}),
 				...(loop ? { loop } : {}),
 				...(closedEdge ? { review_rejected_closure: closedEdge } : {}),
-				source_instance: attempt?.source,
+				source_instance: sourceInstance,
 			};
 		}
 
@@ -621,7 +576,7 @@ export function resolveNodeObservation(
 			const command = projectCommandOutcome(record.result.command_evidence, blockedPaths);
 			const completedAt = validateIsoTimestamp(record.completed_at);
 			const baseState = executionFromResult(record.result.status).state;
-			const rejection = loop && finalization
+			const rejection = isLatest && loop && finalization
 				? finalizedReviewRejection(loop, finalization, entry.node_id, scrubbedResult)
 				: undefined;
 			const attemptStatus = rejection ? rejection.state : baseState;
@@ -633,7 +588,7 @@ export function resolveNodeObservation(
 
 			const baseFields = {
 				attempt_id: attemptId,
-				attempt_number: attemptNum,
+				attempt_number: targetAttemptNum,
 				max_attempts: maxAttempts,
 				instance_id: entry.instance_id,
 				key,
@@ -642,18 +597,18 @@ export function resolveNodeObservation(
 				has_disposition: false,
 				result_record: record,
 				resource_state: entry.status,
-				process_state: processState,
-				...(startedAt ? { started_at: startedAt } : {}),
-				...(updatedAt ? { updated_at: updatedAt } : {}),
+				process_state: isLatest ? processState : ("exited" as const),
+				...(isLatest && startedAt ? { started_at: startedAt } : {}),
+				...(isLatest && updatedAt ? { updated_at: updatedAt } : {}),
 				...(completedAt ? { completed_at: completedAt } : {}),
 				result_status: record.result.status,
 				...(scrubbedSummary ? { summary: scrubbedSummary } : {}),
 				...(command ? { command } : {}),
 				...(loop ? { loop } : {}),
-				source_instance: attempt?.source,
+				source_instance: sourceInstance,
 			};
 
-			if (loop && !finalization) {
+			if (isLatest && loop && !finalization) {
 				return {
 					...baseFields,
 					status: "waiting",
@@ -666,7 +621,7 @@ export function resolveNodeObservation(
 					reason: "An attempt result is recorded; the review loop has not finalized this node.",
 				};
 			}
-			if (loop && finalization) {
+			if (isLatest && loop && finalization) {
 				const closedEdge = blockedReviewForwardEdge(
 					loop,
 					finalization,
@@ -706,13 +661,15 @@ export function resolveNodeObservation(
 				attempt_status: baseState,
 				attempt_status_text: STATUS_TEXT[baseState],
 				...(baseState === "failed" || baseState === "partial" ? { reason: scrubbedSummary ?? "" } : {}),
+				...(lastVerdict && isLatest ? { last_verdict: lastVerdict } : {}),
 			};
 		}
 
 		const scopedErrorFile = join(dir, `${key}.error.json`);
-		const errorFile = review_plan && !pathEntryExists(scopedErrorFile) && attemptNum === 1
+		const errorFile = review_plan && !pathEntryExists(scopedErrorFile) && targetAttemptNum === 1
 			? join(dir, `${entry.instance_id}.error.json`)
 			: scopedErrorFile;
+		assertPathInsideDir(dir, errorFile, "node error");
 		if (pathEntryExists(errorFile)) {
 			const errRead = readBoundedRegularJsonIfExists<{ error?: unknown }>(dir, errorFile, "node error", recordMaxBytes);
 			const rawErrorMsg = errRead.exists && typeof errRead.value?.error === "string" && errRead.value.error.trim()
@@ -720,7 +677,7 @@ export function resolveNodeObservation(
 				: undefined;
 			return {
 				attempt_id: attemptId,
-				attempt_number: attemptNum,
+				attempt_number: targetAttemptNum,
 				max_attempts: maxAttempts,
 				instance_id: entry.instance_id,
 				key,
@@ -736,17 +693,17 @@ export function resolveNodeObservation(
 				attempt_status_text: "Uncertain",
 				reason: "The node recorded an execution error without a verified outcome.",
 				resource_state: entry.status,
-				process_state: processState,
-				...(startedAt ? { started_at: startedAt } : {}),
-				...(updatedAt ? { updated_at: updatedAt } : {}),
+				process_state: isLatest ? processState : "exited",
+				...(isLatest && startedAt ? { started_at: startedAt } : {}),
+				...(isLatest && updatedAt ? { updated_at: updatedAt } : {}),
 				...(loop ? { loop } : {}),
-				source_instance: attempt?.source,
+				source_instance: sourceInstance,
 			};
 		}
-		if (entry.error) {
+		if (isLatest && entry.error) {
 			return {
 				attempt_id: attemptId,
-				attempt_number: attemptNum,
+				attempt_number: targetAttemptNum,
 				max_attempts: maxAttempts,
 				instance_id: entry.instance_id,
 				key,
@@ -766,7 +723,7 @@ export function resolveNodeObservation(
 				...(startedAt ? { started_at: startedAt } : {}),
 				...(updatedAt ? { updated_at: updatedAt } : {}),
 				...(loop ? { loop } : {}),
-				source_instance: attempt?.source,
+				source_instance: sourceInstance,
 			};
 		}
 
@@ -774,12 +731,12 @@ export function resolveNodeObservation(
 		const matchingNodeCancel = cancelInfo.record && (!review_plan || !cancelInfo.record.identity.attempt_id || cancelInfo.record.identity.attempt_id === attemptId)
 			? cancelInfo.record
 			: undefined;
-		const activeCancel = matchingNodeCancel ?? (claimOutcome === "completed" ? undefined : runCancelInfo.record);
+		const activeCancel = matchingNodeCancel ?? (claimOutcome === "completed" ? undefined : runCancelRecord);
 		if (activeCancel) {
-			if (matchingProgress?.state === "working" && readyAlive && entry.status !== "closed") {
+			if (isLatest && matchingProgress?.state === "working" && readyAlive && entry.status !== "closed") {
 				return {
 					attempt_id: attemptId,
-					attempt_number: attemptNum,
+					attempt_number: targetAttemptNum,
 					max_attempts: maxAttempts,
 					instance_id: entry.instance_id,
 					key,
@@ -798,13 +755,13 @@ export function resolveNodeObservation(
 					...(startedAt ? { started_at: startedAt } : {}),
 					...(updatedAt ? { updated_at: updatedAt } : {}),
 					...(loop ? { loop } : {}),
-					source_instance: attempt?.source,
+					source_instance: sourceInstance,
 				};
 			}
 			const cancelReason = activeCancel.reason || "Cancelled.";
 			return {
 				attempt_id: attemptId,
-				attempt_number: attemptNum,
+				attempt_number: targetAttemptNum,
 				max_attempts: maxAttempts,
 				instance_id: entry.instance_id,
 				key,
@@ -819,18 +776,44 @@ export function resolveNodeObservation(
 				attempt_status_text: "Cancelled",
 				reason: sanitizeOperatorText(cancelReason, 1000, blockedPaths),
 				resource_state: entry.status,
-				process_state: processState,
-				...(startedAt ? { started_at: startedAt } : {}),
-				...(updatedAt ? { updated_at: updatedAt } : {}),
+				process_state: isLatest ? processState : "exited",
+				...(isLatest && startedAt ? { started_at: startedAt } : {}),
+				...(isLatest && updatedAt ? { updated_at: updatedAt } : {}),
 				...(loop ? { loop } : {}),
-				source_instance: attempt?.source,
+				source_instance: sourceInstance,
+			};
+		}
+
+		if (!isLatest) {
+			return {
+				attempt_id: attemptId,
+				attempt_number: targetAttemptNum,
+				max_attempts: maxAttempts,
+				instance_id: entry.instance_id,
+				key,
+				expected,
+				has_result: false,
+				has_disposition: false,
+				...(claimOutcome ? { claim_outcome: claimOutcome } : {}),
+				evidence_problem: claimOutcome === "completed"
+					? "The attempt recorded completion without a readable result record."
+					: "The attempt ended before a verified result record was saved.",
+				status: "needs_attention",
+				status_text: "Uncertain",
+				attempt_status: "needs_attention",
+				attempt_status_text: "Uncertain",
+				reason: "The worker exited without a verified result.",
+				resource_state: entry.status,
+				process_state: "exited",
+				...(loop ? { loop } : {}),
+				source_instance: sourceInstance,
 			};
 		}
 
 		if (processState === "exited") {
 			return {
 				attempt_id: attemptId,
-				attempt_number: attemptNum,
+				attempt_number: targetAttemptNum,
 				max_attempts: maxAttempts,
 				instance_id: entry.instance_id,
 				key,
@@ -849,14 +832,14 @@ export function resolveNodeObservation(
 				...(startedAt ? { started_at: startedAt } : {}),
 				...(updatedAt ? { updated_at: updatedAt } : {}),
 				...(loop ? { loop } : {}),
-				source_instance: attempt?.source,
+				source_instance: sourceInstance,
 			};
 		}
 
 		if (entry.status === "closed") {
 			return {
 				attempt_id: attemptId,
-				attempt_number: attemptNum,
+				attempt_number: targetAttemptNum,
 				max_attempts: maxAttempts,
 				instance_id: entry.instance_id,
 				key,
@@ -875,7 +858,7 @@ export function resolveNodeObservation(
 				...(startedAt ? { started_at: startedAt } : {}),
 				...(updatedAt ? { updated_at: updatedAt } : {}),
 				...(loop ? { loop } : {}),
-				source_instance: attempt?.source,
+				source_instance: sourceInstance,
 			};
 		}
 
@@ -884,7 +867,7 @@ export function resolveNodeObservation(
 				if (waitingForHumanSince !== undefined) {
 					return {
 						attempt_id: attemptId,
-						attempt_number: attemptNum,
+						attempt_number: targetAttemptNum,
 						max_attempts: maxAttempts,
 						instance_id: entry.instance_id,
 						key,
@@ -905,12 +888,12 @@ export function resolveNodeObservation(
 						...(startedAt ? { started_at: startedAt } : {}),
 						...(updatedAt ? { updated_at: updatedAt } : {}),
 						...(loop ? { loop } : {}),
-						source_instance: attempt?.source,
+						source_instance: sourceInstance,
 					};
 				}
 				return {
 					attempt_id: attemptId,
-					attempt_number: attemptNum,
+					attempt_number: targetAttemptNum,
 					max_attempts: maxAttempts,
 					instance_id: entry.instance_id,
 					key,
@@ -928,7 +911,7 @@ export function resolveNodeObservation(
 					...(startedAt ? { started_at: startedAt } : {}),
 					...(updatedAt ? { updated_at: updatedAt } : {}),
 					...(loop ? { loop } : {}),
-					source_instance: attempt?.source,
+					source_instance: sourceInstance,
 				};
 			}
 			if (matchingProgress.state === "waiting") {
@@ -942,7 +925,7 @@ export function resolveNodeObservation(
 				}
 				return {
 					attempt_id: attemptId,
-					attempt_number: attemptNum,
+					attempt_number: targetAttemptNum,
 					max_attempts: maxAttempts,
 					instance_id: entry.instance_id,
 					key,
@@ -962,14 +945,14 @@ export function resolveNodeObservation(
 					...(startedAt ? { started_at: startedAt } : {}),
 					...(updatedAt ? { updated_at: updatedAt } : {}),
 					...(loop ? { loop } : {}),
-					source_instance: attempt?.source,
+					source_instance: sourceInstance,
 				};
 			}
 		}
 
 		return {
 			attempt_id: attemptId,
-			attempt_number: attemptNum,
+			attempt_number: targetAttemptNum,
 			max_attempts: maxAttempts,
 			instance_id: entry.instance_id,
 			key,
@@ -988,16 +971,188 @@ export function resolveNodeObservation(
 			...(startedAt ? { started_at: startedAt } : {}),
 			...(updatedAt ? { updated_at: updatedAt } : {}),
 			...(loop ? { loop } : {}),
-			source_instance: attempt?.source,
+			source_instance: sourceInstance,
 		};
 	} catch {
 		return {
-			attempt_id: resolvedAttemptId,
-			attempt_number: resolvedAttemptNum,
+			attempt_id: attemptId,
+			attempt_number: targetAttemptNum,
 			max_attempts: maxAttempts,
 			instance_id: entry.instance_id,
-			key: resolvedKey,
-			...(resolvedExpected ? { expected: resolvedExpected } : {}),
+			key,
+			expected,
+			has_result: false,
+			has_disposition: false,
+			corrupt_or_unverified: true,
+			evidence_problem: "Attempt output evidence is unavailable because the result record is missing, damaged, unreadable, or fails verification.",
+			status: "needs_attention",
+			status_text: "Uncertain",
+			attempt_status: "needs_attention",
+			attempt_status_text: "Uncertain",
+			reason: "Node evidence is missing, damaged or contradictory.",
+			resource_state: entry.status,
+			process_state: isLatest ? processState : "unknown",
+			...(loop ? { loop } : {}),
+		};
+	}
+}
+
+function resolveSharedNodeContext(
+	manifest: BootstrapManifest,
+	entry: AgentLaunch,
+	byInstanceNodeId: ReadonlyMap<string, string>,
+	blockedPaths: readonly string[],
+	options: ResolveRunObservationsOptions,
+): SharedNodeContext {
+	const { session_dir: dir, task_id, review_plan } = manifest;
+	const enforceNodeRecordSizeLimit = Boolean(
+		options.enforceNodeRecordSizeLimit || options.enforceSizeLimitNodeId === entry.node_id,
+	);
+	const recordMaxBytes = enforceNodeRecordSizeLimit ? MAX_EVIDENCE_FILE_BYTES : Number.POSITIVE_INFINITY;
+	const loop = reviewLoopFor(review_plan, entry.instance_id);
+	const maxAttempts = loop ? loop.max_revisions + 1 : 1;
+	const skipLoopResultPrecheck = options.skipLoopResultPrecheckNodeId === entry.node_id;
+
+	assertRegularDirNoSymlink(dir, "session directory");
+	if (loop) {
+		assertPathInsideDir(dir, finalizePath(dir, entry.instance_id), "finalization record");
+		assertRegularFileIfExists(finalizePath(dir, entry.instance_id), "finalization record", MAX_EVIDENCE_FILE_BYTES);
+		assertPathInsideDir(dir, finalizePath(dir, loop.reviewer), "reviewer finalization record");
+		assertRegularFileIfExists(finalizePath(dir, loop.reviewer), "reviewer finalization record", MAX_EVIDENCE_FILE_BYTES);
+		for (let n = 1; n <= maxAttempts; n++) {
+			const keyN = `${entry.instance_id}.${n}`;
+			const coordChecks: Array<readonly [string, string]> = [
+				[join(dir, `${keyN}.transition.json`), "loop transition"],
+				[join(dir, `${loop.reviewer}.${n}.revision.json`), "revision reservation"],
+			];
+			if (!skipLoopResultPrecheck) {
+				coordChecks.push(
+					[resultPath(dir, keyN), "loop result"],
+					[dispositionPath(dir, keyN), "loop disposition"],
+					[join(dir, `${keyN}.error.json`), "loop error"],
+				);
+			}
+			for (const [p, lbl] of coordChecks) {
+				assertPathInsideDir(dir, p, lbl);
+				assertRegularFileIfExists(p, lbl, MAX_EVIDENCE_FILE_BYTES);
+			}
+			for (const src of inboundEdgesOf(entry)) {
+				const claimP = handoffClaimPath(dir, keyN, src);
+				assertPathInsideDir(dir, claimP, "revision handoff claim");
+				assertRegularFileIfExists(claimP, "revision handoff claim", MAX_EVIDENCE_FILE_BYTES);
+			}
+			if (loop.target === entry.instance_id) {
+				const fbClaimP = handoffClaimPath(dir, keyN, loop.reviewer);
+				assertPathInsideDir(dir, fbClaimP, "feedback handoff claim");
+				assertRegularFileIfExists(fbClaimP, "feedback handoff claim", MAX_EVIDENCE_FILE_BYTES);
+			}
+		}
+	}
+
+	let attempt = currentAttempt(manifest, entry);
+	const finalization = loop && readFinalization(dir, task_id, loop, entry.instance_id, manifest.topology, manifest.version);
+	if (finalization && attempt && attemptNumber(finalization.attempt_id) < attempt.number) {
+		attempt = { ...attempt, number: attemptNumber(finalization.attempt_id) };
+	}
+	const attemptNum = attempt?.number ?? 1;
+	const attemptId = attempt ? `${entry.instance_id}.${attempt.number}` : entry.attempt_id;
+	if (finalization && attemptId && finalization.attempt_id !== attemptId) {
+		throw new Error("Finalization does not match the latest attempt");
+	}
+
+	const readyFile = readyPath(dir, entry.instance_id);
+	const progressFile = join(dir, `${entry.instance_id}.progress.json`);
+	const cancelFile = cancelPath(dir, entry.instance_id);
+	const runCancelFile = runCancelPath(dir);
+	const ffFile = failFastPath(dir);
+	assertPathInsideDir(dir, cancelFile, "cancel record");
+	assertPathInsideDir(dir, runCancelFile, "run cancel record");
+	assertPathInsideDir(dir, ffFile, "fail-fast record");
+	assertRegularFileIfExists(cancelFile, "cancel record", MAX_EVIDENCE_FILE_BYTES);
+	assertRegularFileIfExists(runCancelFile, "run cancel record", MAX_EVIDENCE_FILE_BYTES);
+	assertRegularFileIfExists(ffFile, "fail-fast record", MAX_EVIDENCE_FILE_BYTES);
+
+	const readyRead = readBoundedRegularJsonIfExists<unknown>(dir, readyFile, "worker readiness", recordMaxBytes);
+	let processState: ResolvedNodeObservation["process_state"] = "not_started";
+	let readyAlive = false;
+	if (readyRead.exists) {
+		const ready = parseWorkerReady(readyRead.value);
+		if (ready.token !== manifest.token || ready.task_id !== task_id || ready.instance_id !== entry.instance_id) {
+			throw new Error("Foreign readiness");
+		}
+		readyAlive = processAlive(ready);
+		processState = readyAlive ? "alive" : "exited";
+	}
+
+	const runCancelInfo = readRunCancelRecordSafe(dir, task_id);
+	const failFastInfo = readFailFast(dir, task_id, manifest.token);
+	if (runCancelInfo.error || failFastInfo.error) {
+		throw new Error(runCancelInfo.error ?? failFastInfo.error);
+	}
+
+	const progressRead = readBoundedRegularJsonIfExists<ProgressSnapshot>(dir, progressFile, "node progress", recordMaxBytes);
+	let matchingProgress: ProgressSnapshot | undefined;
+	if (progressRead.exists) {
+		const progress = progressRead.value;
+		if (progress.token !== manifest.token) throw new Error("Foreign progress");
+		if (progress.attempt_id !== undefined && progress.attempt_id !== attemptId) {
+			if (!(review_plan && progress.state === "completed" && progress.attempt_id.startsWith(`${entry.instance_id}.`))) {
+				throw new Error("Progress attempt mismatch");
+			}
+		} else if (review_plan && progress.attempt_id === undefined) {
+			throw new Error("Missing review progress attempt");
+		} else {
+			matchingProgress = progress;
+		}
+	}
+	const startedAt = matchingProgress && Number.isFinite(matchingProgress.started_at) ? new Date(matchingProgress.started_at!).toISOString() : undefined;
+	const updatedAt = matchingProgress && Number.isFinite(matchingProgress.updated_at) ? new Date(matchingProgress.updated_at).toISOString() : undefined;
+	const waitingForHumanSince = matchingProgress && Number.isFinite(matchingProgress.waiting_for_human_since)
+		? new Date(matchingProgress.waiting_for_human_since!).toISOString()
+		: undefined;
+
+	return {
+		manifest,
+		entry,
+		byInstanceNodeId,
+		blockedPaths,
+		recordMaxBytes,
+		loop,
+		maxAttempts,
+		latestAttemptNum: attemptNum,
+		latestAttemptId: attemptId,
+		latestSourceInstance: attempt?.source,
+		finalization,
+		processState,
+		readyAlive,
+		runCancelRecord: runCancelInfo.record,
+		matchingProgress,
+		startedAt,
+		updatedAt,
+		waitingForHumanSince,
+	};
+}
+
+/** Resolve one node's latest attempt, expected identity, durable records, and derived status without mutating state. */
+export function resolveNodeObservation(
+	manifest: BootstrapManifest,
+	entry: AgentLaunch,
+	byInstanceNodeId: ReadonlyMap<string, string>,
+	blockedPaths: readonly string[],
+	options: ResolveRunObservationsOptions = {},
+): ResolvedNodeObservation {
+	const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
+	const maxAttempts = loop ? loop.max_revisions + 1 : 1;
+	try {
+		const ctx = resolveSharedNodeContext(manifest, entry, byInstanceNodeId, blockedPaths, options);
+		return resolveSingleAttemptFromContext(ctx, ctx.latestAttemptNum);
+	} catch {
+		return {
+			attempt_id: entry.attempt_id,
+			attempt_number: 1,
+			max_attempts: maxAttempts,
+			instance_id: entry.instance_id,
+			key: entry.instance_id,
 			has_result: false,
 			has_disposition: false,
 			corrupt_or_unverified: true,
@@ -1014,23 +1169,113 @@ export function resolveNodeObservation(
 	}
 }
 
-export interface DependencyEdgeObservation {
-	from: string;
-	to: string;
-	kind: "dependency";
-	dependency_policy: "require_success" | "allow_partial";
-	state: EdgeState;
+/**
+ * Resolve up to `maxReturnedAttempts` attempts of one node, newest first, independently typing each
+ * attempt while preserving the graph-aligned latest attempt observation at index 0.
+ */
+export function resolveNodeAttempts(
+	manifest: BootstrapManifest,
+	entry: AgentLaunch,
+	byInstanceNodeId: ReadonlyMap<string, string>,
+	blockedPaths: readonly string[],
+	latestObservation: ResolvedNodeObservation,
+	maxReturnedAttempts = 20,
+): { attempts: ResolvedNodeObservation[]; totalAttempts: number; omittedAttempts: number } {
+	const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
+	const maxAttempts = loop ? loop.max_revisions + 1 : 1;
+	if (!loop || maxAttempts <= 1) {
+		return {
+			attempts: [latestObservation],
+			totalAttempts: 1,
+			omittedAttempts: 0,
+		};
+	}
+
+	let ctx: SharedNodeContext | undefined;
+	try {
+		ctx = resolveSharedNodeContext(manifest, entry, byInstanceNodeId, blockedPaths, {
+			enforceNodeRecordSizeLimit: true,
+			skipLoopResultPrecheckNodeId: entry.node_id,
+		});
+	} catch {
+		// Shared node context failed (e.g. corrupt handoff claim, finalization, or progress on the latest attempt).
+		// Probe 1..maxAttempts safely for earlier attempts that still have readable durable files without
+		// dropping the damaged latest attempt at index 0.
+		const fallbackCtx: SharedNodeContext = {
+			manifest,
+			entry,
+			byInstanceNodeId,
+			blockedPaths,
+			recordMaxBytes: MAX_EVIDENCE_FILE_BYTES,
+			loop,
+			maxAttempts,
+			latestAttemptNum: maxAttempts + 1,
+			processState: "exited",
+			readyAlive: false,
+		};
+		const dir = manifest.session_dir;
+		let highestExisting = 1;
+		const existingAttempts: number[] = [];
+		try {
+			assertRegularDirNoSymlink(dir, "session directory");
+			for (let n = 1; n <= maxAttempts; n++) {
+				const keyN = `${entry.instance_id}.${n}`;
+				const hasAny = [
+					resultPath(dir, keyN),
+					dispositionPath(dir, keyN),
+					join(dir, `${keyN}.error.json`),
+					outcomeClaimPath(dir, keyN),
+				].some(p => {
+					try {
+						assertPathInsideDir(dir, p, "attempt record");
+						return pathEntryExists(p);
+					} catch {
+						return false;
+					}
+				});
+				if (hasAny) {
+					highestExisting = Math.max(highestExisting, n);
+					existingAttempts.push(n);
+				}
+			}
+		} catch {
+			return { attempts: [latestObservation], totalAttempts: 1, omittedAttempts: 0 };
+		}
+		if (existingAttempts.length <= 1) {
+			return { attempts: [latestObservation], totalAttempts: Math.max(1, highestExisting), omittedAttempts: 0 };
+		}
+		const olderNums = existingAttempts
+			.filter(n => n < highestExisting)
+			.sort((a, b) => b - a)
+			.slice(0, Math.max(0, maxReturnedAttempts - 1));
+		const olderObs = olderNums.map(n => resolveSingleAttemptFromContext(fallbackCtx, n));
+		const totalAttempts = highestExisting;
+		const attempts = [latestObservation, ...olderObs].slice(0, maxReturnedAttempts);
+		return {
+			attempts,
+			totalAttempts,
+			omittedAttempts: Math.max(0, totalAttempts - attempts.length),
+		};
+	}
+
+	const totalAttempts = ctx.latestAttemptNum;
+	const stopAt = Math.max(1, totalAttempts - maxReturnedAttempts + 1);
+	const attempts: ResolvedNodeObservation[] = [latestObservation];
+	for (let n = totalAttempts - 1; n >= stopAt; n--) {
+		attempts.push(resolveSingleAttemptFromContext(ctx, n));
+	}
+	return {
+		attempts,
+		totalAttempts,
+		omittedAttempts: Math.max(0, totalAttempts - attempts.length),
+	};
 }
 
-/**
- * Resolve per-node observations and graph-level handoff / upstream-closure overrides once for both Live Graph
- * and Attempt output, so the two views never contradict each other.
- */
 export function resolveRunObservations(
 	factoryId: string,
 	release: ReleasedFactoryRun,
 	blockedPaths: readonly string[],
-	options: { enforceNodeRecordSizeLimit?: boolean; enforceSizeLimitNodeId?: string } = {},
+	options: ResolveRunObservationsOptions = {},
 ) {
 	const roster = verifyReleaseMatchesDefinition(factoryId, release);
 	const { definition, manifest, bound_version } = release;
