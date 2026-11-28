@@ -118,6 +118,15 @@
 
   const STALE_META = Object.freeze({ symbol: "⟳", label: "Stale", tone: "tone-stale" });
   const LIVE_POLL_INTERVAL_MS = 2000;
+  const FINISHED_OUTPUT_STATUSES = freezeSet([
+    "succeeded",
+    "partial",
+    "failed",
+    "blocked",
+    "skipped",
+    "cancelled",
+    "needs_attention",
+  ]);
 
   function resolveOrigin(baseOrigin) {
     if (typeof baseOrigin === "string" && baseOrigin && baseOrigin !== "null") {
@@ -829,6 +838,56 @@
     };
   }
 
+  function extractNodeOutputState(node) {
+    if (!node || typeof node !== "object") return null;
+    const att = node.current_attempt && typeof node.current_attempt === "object" ? node.current_attempt : null;
+    const rawStatus = typeof att?.status === "string" && att.status.trim()
+      ? att.status.trim().toLowerCase()
+      : (typeof node.status === "string" && node.status.trim() ? node.status.trim().toLowerCase() : "");
+    const rawAttemptNum = typeof att?.attempt_number === "number" && Number.isFinite(att.attempt_number)
+      ? att.attempt_number
+      : (typeof att?.loop?.attempt === "number" && Number.isFinite(att.loop.attempt) ? att.loop.attempt : null);
+    let attemptIdKey = null;
+    if (typeof att?.attempt_id === "string" && att.attempt_id) {
+      attemptIdKey = `id:${att.attempt_id}`;
+    } else if (isAbsenceObject(att?.attempt_id)) {
+      attemptIdKey = `absence:${att.attempt_id.absence}`;
+    } else if (typeof node.attempt_id === "string" && node.attempt_id) {
+      attemptIdKey = `id:${node.attempt_id}`;
+    }
+    const completedAt = typeof att?.completed_at === "string" && att.completed_at ? att.completed_at : "";
+    const resultStatus = typeof att?.result_status === "string" && att.result_status ? att.result_status : "";
+    const parked = Boolean(node.parked || att?.loop?.parked);
+    return {
+      id: typeof node.id === "string" ? node.id : "",
+      status: rawStatus,
+      parked,
+      attemptNumber: rawAttemptNum,
+      attemptIdKey,
+      completedAt,
+      resultStatus,
+      isFinished: FINISHED_OUTPUT_STATUSES.has(rawStatus) || parked || Boolean(completedAt) || Boolean(resultStatus),
+    };
+  }
+
+  function shouldRefetchNodeOutput(prevNode, nextNode, options) {
+    const next = extractNodeOutputState(nextNode);
+    if (!next) return false;
+    const prevFactoryId = options && typeof options.prevFactoryId === "string" ? options.prevFactoryId : "";
+    const nextFactoryId = options && typeof options.nextFactoryId === "string" ? options.nextFactoryId : "";
+    if (prevFactoryId !== nextFactoryId) return true;
+    const prev = extractNodeOutputState(prevNode);
+    if (!prev) return true;
+    if (prev.id !== next.id) return true;
+    if (next.attemptNumber !== prev.attemptNumber) return true;
+    if (next.attemptIdKey !== prev.attemptIdKey) return true;
+    if (next.completedAt && next.completedAt !== prev.completedAt) return true;
+    if (next.resultStatus && next.resultStatus !== prev.resultStatus) return true;
+    if (next.parked && !prev.parked) return true;
+    if (next.isFinished && next.status !== prev.status) return true;
+    return false;
+  }
+
   root.FactoryViewerSafe = Object.freeze({
     VALID_ID,
     VALID_VERSION,
@@ -873,5 +932,6 @@
     reduceLiveFetchOutcome,
     computeNextPollAction,
     planKeyedDiff,
+    shouldRefetchNodeOutput,
   });
 })(typeof globalThis !== "undefined" ? globalThis : this);
