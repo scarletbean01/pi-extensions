@@ -891,9 +891,15 @@ test("manual acceptance fixture helper covers scenarios 1-5 read-only without se
 			}
 
 			const list = await getChecked("/api/factories");
-			assert.equal(list.factories.length, 5);
+			assert.equal(list.factories.length, 6);
 			assert.deepEqual(list.deleted, []);
 			assert.deepEqual(list.damaged, []);
+
+			const attemptOutputLive = await getChecked(`/api/factories/${fixture.factories.attemptOutput}/live`);
+			const attemptOutputNodeIds = new Set(attemptOutputLive.graph.nodes.map((node: any) => node.id));
+			for (const nodeId of ["attempt_history", "attempt_review", "command_exit", "command_signal", "missing_result", "still_running"]) {
+				assert.ok(attemptOutputNodeIds.has(nodeId), `manual Attempt output fixture is missing node ${nodeId}`);
+			}
 
 			// Scenario 1 & 5 initial node state: bound v2 run while v3 is current; left parked with completed_at, right running with timestamps.
 			const alphaLive = await getChecked(`/api/factories/${fixture.factories.alphaLiveV2}/live`);
