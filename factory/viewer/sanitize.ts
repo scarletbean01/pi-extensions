@@ -61,6 +61,50 @@ function countCodePoints(text: string): number {
 	return count;
 }
 
+function findPreBoundDelimiterBoundary(text: string, endIndex: number, floor: number): number | undefined {
+	for (let k = endIndex - 1; k >= floor; k--) {
+		if (PRE_BOUND_DELIM_RE.test(text[k]!)) {
+			return k + 1;
+		}
+	}
+	return undefined;
+}
+
+function adjustSurrogateCut(text: string, cut: number, limit: number): number {
+	if (cut > 0 && cut < limit) {
+		const code = text.charCodeAt(cut);
+		const prev = text.charCodeAt(cut - 1);
+		if (code >= 0xdc00 && code <= 0xdfff && prev >= 0xd800 && prev <= 0xdbff) {
+			return cut - 1;
+		}
+	}
+	return cut;
+}
+
+/**
+ * Drop a trailing partial path run right before a runner-inserted `…` clip so a cut
+ * inside a relative or escaped path cannot leak an unmatched prefix.
+ */
+export function trimClippedExcerptPartialPath(raw: string): string {
+	if (!raw.endsWith("…")) return raw;
+	const prefixEnd = raw.length - 1;
+	const floor = Math.max(0, prefixEnd - PRE_BOUND_TRIM_LOOKBACK);
+	const boundary = findPreBoundDelimiterBoundary(raw, prefixEnd, floor);
+	const tokenStart = boundary ?? adjustSurrogateCut(raw, floor, prefixEnd);
+	const trailingRun = raw.slice(tokenStart, prefixEnd);
+	if (!trailingRun) return raw;
+	if (
+		trailingRun.includes("/")
+		|| trailingRun.includes("\\")
+		|| trailingRun.startsWith("~")
+		|| trailingRun.startsWith(".")
+		|| /^(?:file:|[A-Za-z]:)/.test(trailingRun)
+	) {
+		return `${raw.slice(0, tokenStart)}…`;
+	}
+	return raw;
+}
+
 function preBoundCodePoints(wellFormed: string, maxCodePoints: number): { bounded: string; droppedCodePoints: number } {
 	if (wellFormed.length <= maxCodePoints) {
 		return { bounded: wellFormed, droppedCodePoints: 0 };
@@ -79,24 +123,8 @@ function preBoundCodePoints(wellFormed: string, maxCodePoints: number): { bounde
 	let cut = i;
 	if (!PRE_BOUND_DELIM_RE.test(wellFormed[i]!)) {
 		const floor = Math.max(Math.ceil(i / 2), i - PRE_BOUND_TRIM_LOOKBACK);
-		let foundDelimiter = false;
-		for (let k = i - 1; k >= floor; k--) {
-			if (PRE_BOUND_DELIM_RE.test(wellFormed[k]!)) {
-				cut = k + 1;
-				foundDelimiter = true;
-				break;
-			}
-		}
-		if (!foundDelimiter) {
-			cut = floor;
-			if (cut > 0) {
-				const code = wellFormed.charCodeAt(cut);
-				const prev = wellFormed.charCodeAt(cut - 1);
-				if (code >= 0xdc00 && code <= 0xdfff && prev >= 0xd800 && prev <= 0xdbff) {
-					cut -= 1;
-				}
-			}
-		}
+		const boundary = findPreBoundDelimiterBoundary(wellFormed, i, floor);
+		cut = boundary ?? adjustSurrogateCut(wellFormed, floor, len);
 	}
 	if (cut > 0) {
 		const tail = wellFormed.slice(Math.max(0, cut - 512), cut);

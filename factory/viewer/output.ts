@@ -34,6 +34,7 @@ import {
 	parseOutputOmission,
 	reboundOutputText,
 	sanitizeOutputText,
+	trimClippedExcerptPartialPath,
 	type ArtifactRedactionMatcher,
 } from "./sanitize.ts";
 
@@ -312,15 +313,29 @@ function projectAttemptCommand(
 		: undefined;
 	return {
 		exit_code: ev.exit_code,
-		signal: sanitizeCommandSignal(ev.signal, blockedPaths, "output"),
+		signal: sanitizeCommandSignal(ev.signal, blockedPaths, "output", artifactMatcher),
 		duration_ms: ev.duration_ms,
 		stdout_bytes: ev.stdout_bytes,
 		stderr_bytes: ev.stderr_bytes,
 		...(typeof ev.stdout_excerpt === "string"
-			? { stdout_excerpt: sanitizeOutputText(ev.stdout_excerpt, OUTPUT_COMMAND_EXCERPT_MAX_CHARS, blockedPaths, artifactMatcher) }
+			? {
+				stdout_excerpt: sanitizeOutputText(
+					trimClippedExcerptPartialPath(ev.stdout_excerpt),
+					OUTPUT_COMMAND_EXCERPT_MAX_CHARS,
+					blockedPaths,
+					artifactMatcher,
+				),
+			}
 			: {}),
 		...(typeof ev.stderr_excerpt === "string"
-			? { stderr_excerpt: sanitizeOutputText(ev.stderr_excerpt, OUTPUT_COMMAND_EXCERPT_MAX_CHARS, blockedPaths, artifactMatcher) }
+			? {
+				stderr_excerpt: sanitizeOutputText(
+					trimClippedExcerptPartialPath(ev.stderr_excerpt),
+					OUTPUT_COMMAND_EXCERPT_MAX_CHARS,
+					blockedPaths,
+					artifactMatcher,
+				),
+			}
 			: {}),
 		...(spawnError ? { spawn_error: spawnError } : {}),
 		...(terminationError ? { termination_error: terminationError } : {}),
