@@ -606,10 +606,20 @@ test("docs/factory-web-viewer.md, links, and GLOSSARY Run graph entry match the 
 	const attemptOutput = attemptOutputMatch[1]!;
 	const attemptOutputLower = attemptOutput.toLowerCase();
 	assert.match(attemptOutput, /Attempt output is allowed in scrubbed, bounded form/);
-	assert.doesNotMatch(
+	assert.match(
 		attemptOutput,
+		/raw prompts,\s*input briefs,\s*tokens,\s*endpoint paths,\s*worker configuration,\s*metrics,\s*artifact paths,?\s*and canonical checkout paths remain excluded\./,
+		"Attempt output privacy statement must preserve the full exclusion sentence",
+	);
+	assert.match(
+		attemptOutput,
+		/Session transcripts,\s*terminal capture,\s*thinking text,\s*and any log are also excluded/,
+		"Attempt output privacy statement must preserve the transcripts/log exclusion sentence",
+	);
+	assert.doesNotMatch(
+		viewerDoc,
 		/(?:responses?|the viewer)\s+(?:still\s+)?exclude[^\n]*\b(?:logs?|internal records)\b/i,
-		"Attempt output privacy wording must not exclude logs or internal records wholesale",
+		"Viewer guide privacy wording must not exclude logs or internal records wholesale",
 	);
 	for (const privacyTerm of [
 		"raw prompts", "input briefs", "tokens", "endpoint paths", "worker configuration", "metrics",

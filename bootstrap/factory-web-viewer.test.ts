@@ -1125,6 +1125,39 @@ test("createLiveFixtureAdvancer updates once and second invocation is harmless",
 	assert.equal(logs.length, 2);
 	assert.match(logs[0]!, /Updated node 'right'/);
 	assert.match(logs[1]!, /already updated to succeeded/);
+
+	await verifyReadOnlyViewer(
+		{
+			stateDirs: fixture.root,
+			viewerOptions: {
+				statePath: fixture.statePath,
+				coordinationPath: fixture.coordinationPath,
+				env: fixture.env,
+				home: fixture.home,
+			},
+		},
+		async viewer => {
+			const res = await fetch(`${viewer.url}/api/factories/${fixture.factories.alphaLiveV2}/output?node=right`);
+			assert.equal(res.status, 200);
+			const text = await res.text();
+			for (const s of fixture.sentinels) {
+				assert.equal(text.includes(s), false, `right /output leaked sentinel ${JSON.stringify(s)}`);
+			}
+			const out = JSON.parse(text);
+			assert.equal(out.evidence, "available");
+			const att = out.attempts[0];
+			assert.equal(att.status_text, "Succeeded");
+			assert.equal(att.evidence, "available");
+			assert.match(att.detail, /FAKE_DETAIL_LINE_2[\s\S]*\n- FAKE_DETAIL_LIST_ITEM/);
+			assert.equal(att.verification.items[0].check_id, "FAKE_LIVE_CHECK");
+			assert.match(att.verification.items[0].reason, /FAKE_VERIFICATION/);
+			assert.match(att.warnings.items[0], /FAKE_WARNING/);
+			assert.match(att.next_steps.items[0], /FAKE_NEXT_STEP/);
+			assert.match(att.outputs_text, /FAKE_STRUCTURED_OUTPUT_05/);
+			assert.match(att.outputs_text, /FAKE_VALUE_ALPHA/);
+			assert.match(att.outputs_text, /FAKE_VALUE_BETA/);
+		},
+	);
 });
 
 test("manual acceptance fixture CLI cleans up temp dir on signals during build and supports relative TMPDIR", async t => {
