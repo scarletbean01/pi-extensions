@@ -765,6 +765,58 @@ function abortOutputRequest() {
   }
 }
 
+function renderCommandOutputSection(cmd) {
+  const cmdSec = el("div", undefined, { class: "section" });
+  cmdSec.append(el("h6", "Command output"));
+  const metaDl = el("dl", undefined, { class: "row" });
+  metaDl.append(
+    factItem("Exit code", cmd.exit_code === null || cmd.exit_code === undefined ? "null" : String(cmd.exit_code)),
+    factItem("Signal", cmd.signal || "none"),
+    factItem("Duration", cmd.duration_ms !== undefined ? `${cmd.duration_ms} ms` : "Unknown (not provided)"),
+    factItem("Output bytes", `stdout ${cmd.stdout_bytes ?? 0} B, stderr ${cmd.stderr_bytes ?? 0} B`),
+  );
+  cmdSec.append(metaDl);
+  if (cmd.spawn_error) {
+    const errDiv = el("div", undefined, { class: "section" });
+    errDiv.append(el("strong", "Spawn error"), el("div", cmd.spawn_error, { class: "output-text" }));
+    cmdSec.append(errDiv);
+  }
+  if (cmd.termination_error) {
+    const errDiv = el("div", undefined, { class: "section" });
+    errDiv.append(el("strong", "Termination error"), el("div", cmd.termination_error, { class: "output-text" }));
+    cmdSec.append(errDiv);
+  }
+  const streamsRow = el("div", undefined, { class: "row" });
+  const outCol = el("div", undefined, { class: "col s12 m6" });
+  outCol.append(el("strong", "Standard output"));
+  outCol.append(typeof cmd.stdout_excerpt === "string" && cmd.stdout_excerpt.length > 0
+    ? el("div", cmd.stdout_excerpt, { class: "output-text mono" })
+    : el("p", "No standard output excerpt recorded.", { class: "grey-text text-darken-3" }));
+  const errCol = el("div", undefined, { class: "col s12 m6" });
+  errCol.append(el("strong", "Standard error"));
+  errCol.append(typeof cmd.stderr_excerpt === "string" && cmd.stderr_excerpt.length > 0
+    ? el("div", cmd.stderr_excerpt, { class: "output-text mono" })
+    : el("p", "No standard error excerpt recorded.", { class: "grey-text text-darken-3" }));
+  streamsRow.append(outCol, errCol);
+  cmdSec.append(streamsRow);
+  return cmdSec;
+}
+
+function renderBoundedTextListSection(title, listObj) {
+  if (!listObj || !Array.isArray(listObj.items) || listObj.items.length === 0) return null;
+  const sec = el("div", undefined, { class: "section" });
+  sec.append(el("h6", title));
+  const ul = el("ul", undefined, { class: "collection" });
+  for (const item of listObj.items) {
+    ul.append(el("li", item, { class: "collection-item output-text" }));
+  }
+  sec.append(ul);
+  if (listObj.omitted_count > 0) {
+    sec.append(el("p", listObj.omitted_marker || `… [truncated, ${listObj.omitted_count} items omitted]`, { class: "grey-text text-darken-3" }));
+  }
+  return sec;
+}
+
 function renderAttemptOutputBody(slot, data, errorInfo) {
   slot.setAttribute("aria-busy", "false");
   if (errorInfo) {
@@ -785,7 +837,8 @@ function renderAttemptOutputBody(slot, data, errorInfo) {
   const details = el("details", undefined, { class: "collapsible", open: true });
   const summaryEl = el("summary", undefined, { class: "collapsible-header" });
   summaryEl.append(
-    document.createTextNode(`Attempt ${att.attempt_number ?? "?"} of ${att.max_attempts ?? "?"} `),
+    el("h5", `Attempt ${att.attempt_number ?? "?"} of ${att.max_attempts ?? "?"}`, { class: "inline" }),
+    document.createTextNode(" "),
     statusPill(att.status, att.status_text || att.status),
   );
   const body = el("div", undefined, { class: "collapsible-body" });
@@ -798,20 +851,126 @@ function renderAttemptOutputBody(slot, data, errorInfo) {
     body.append(facts);
 
     const sumSec = el("div", undefined, { class: "section" });
-    sumSec.append(el("strong", "Summary"));
+    sumSec.append(el("h6", "Summary"));
     sumSec.append(att.summary
       ? el("div", att.summary, { class: "output-text" })
       : el("p", "No summary recorded.", { class: "grey-text text-darken-3" }));
     body.append(sumSec);
 
     const detSec = el("div", undefined, { class: "section" });
-    detSec.append(el("strong", "Detail"));
+    detSec.append(el("h6", "Detail"));
     detSec.append(att.detail
       ? el("div", att.detail, { class: "output-text" })
       : el("p", "No detail recorded.", { class: "grey-text text-darken-3" }));
     body.append(detSec);
+
+    if (att.command && typeof att.command === "object") {
+      body.append(renderCommandOutputSection(att.command));
+    }
+
+    if (att.verification && Array.isArray(att.verification.items) && att.verification.items.length > 0) {
+      const verSec = el("div", undefined, { class: "section" });
+      verSec.append(el("h6", "Verification"));
+      const verList = el("ul", undefined, { class: "collection" });
+      for (const item of att.verification.items) {
+        const li = el("li", undefined, { class: "collection-item" });
+        const head = el("div");
+        head.append(
+          statusPill(item.result, item.result),
+          document.createTextNode(" "),
+          el("code", item.check_id || "unknown"),
+          document.createTextNode(` · ${item.applicability || "unknown"} · ${item.scope_kind || "unknown"}`),
+        );
+        if (item.completed_at) head.append(document.createTextNode(` · ${item.completed_at}`));
+        li.append(head);
+        if (item.reason) li.append(el("div", item.reason, { class: "output-text" }));
+        verList.append(li);
+      }
+      verSec.append(verList);
+      if (att.verification.omitted_count > 0) {
+        verSec.append(el("p", att.verification.omitted_marker || `… [truncated, ${att.verification.omitted_count} items omitted]`, { class: "grey-text text-darken-3" }));
+      }
+      body.append(verSec);
+    }
+
+    const warnSec = renderBoundedTextListSection("Warnings", att.warnings);
+    if (warnSec) body.append(warnSec);
+
+    const nextSec = renderBoundedTextListSection("Next steps", att.next_steps);
+    if (nextSec) body.append(nextSec);
+
+    if (typeof att.outputs_text === "string") {
+      const outDetails = el("details", undefined, { class: "collapsible" });
+      const outSummary = el("summary", undefined, { class: "collapsible-header" });
+      outSummary.append(el("h6", "Structured outputs", { class: "inline" }));
+      const outBody = el("div", undefined, { class: "collapsible-body" });
+      outBody.append(el("div", att.outputs_text, { class: "output-text mono" }));
+      outDetails.append(outSummary, outBody);
+      body.append(outDetails);
+    }
+
+    if (att.artifacts && Array.isArray(att.artifacts.items) && att.artifacts.items.length > 0) {
+      const artDetails = el("details", undefined, { class: "collapsible" });
+      const artSummary = el("summary", undefined, { class: "collapsible-header" });
+      artSummary.append(el("h6", `Artifacts (${att.artifacts.total_count ?? att.artifacts.items.length})`, { class: "inline" }));
+      const artBody = el("div", undefined, { class: "collapsible-body" });
+      const artList = el("ul", undefined, { class: "collection" });
+      for (const art of att.artifacts.items) {
+        const li = el("li", undefined, { class: "collection-item" });
+        const head = el("div");
+        const label = art.action ? `${art.type || "artifact"} (${art.action})` : (art.type || "artifact");
+        head.append(el("strong", label));
+        if (art.missing) {
+          head.append(document.createTextNode(" "), statusPill("unavailable", "Missing"));
+        }
+        li.append(head);
+        li.append(art.description
+          ? el("div", art.description, { class: "output-text" })
+          : el("p", "No description recorded.", { class: "grey-text text-darken-3" }));
+        artList.append(li);
+      }
+      artBody.append(artList);
+      if (att.artifacts.omitted_count > 0) {
+        artBody.append(el("p", att.artifacts.omitted_marker || `… [truncated, ${att.artifacts.omitted_count} items omitted]`, { class: "grey-text text-darken-3" }));
+      }
+      artDetails.append(artSummary, artBody);
+      body.append(artDetails);
+    }
   } else {
     body.append(absenceNode(att));
+    if (att.disposition_reason) {
+      const dispSec = el("div", undefined, { class: "section" });
+      dispSec.append(el("h6", "Disposition reason"));
+      dispSec.append(el("div", att.disposition_reason, { class: "output-text" }));
+      body.append(dispSec);
+    }
+    if (att.error_message) {
+      const errSec = el("div", undefined, { class: "section" });
+      errSec.append(el("h6", "Recorded error"));
+      errSec.append(el("div", att.error_message, { class: "output-text" }));
+      body.append(errSec);
+    }
+    if (att.causes && Array.isArray(att.causes.items) && att.causes.items.length > 0) {
+      const causesSec = el("div", undefined, { class: "section" });
+      causesSec.append(el("h6", "Causes"));
+      causesSec.append(buildTable(
+        "Attempt causes",
+        ["Source node", "State", "Reason", "Check"],
+        att.causes.items.map((c) => [
+          el("code", c.node_id),
+          statusPill(c.state),
+          el("div", c.reason, { class: "output-text" }),
+          c.check ? `${c.check.name} (${c.check.evidence})` : "—",
+        ]),
+      ));
+      if (att.causes.omitted_count > 0) {
+        causesSec.append(el("p", att.causes.omitted_marker || `… [truncated, ${att.causes.omitted_count} items omitted]`, { class: "grey-text text-darken-3" }));
+      }
+      body.append(causesSec);
+    }
+    if (att.command && typeof att.command === "object") {
+      body.append(renderCommandOutputSection(att.command));
+    }
   }
   details.append(summaryEl, body);
   slot.replaceChildren(details);

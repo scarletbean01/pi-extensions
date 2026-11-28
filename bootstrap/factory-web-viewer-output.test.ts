@@ -3,10 +3,11 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
-import { nodeOutputSnapshot } from "../factory/viewer/output.ts";
-import { sanitizeOperatorText, sanitizeOutputText } from "../factory/viewer/sanitize.ts";
+import { enforceOutputResponseBudget, nodeOutputSnapshot } from "../factory/viewer/output.ts";
+import { collectArtifactPathTokens, compileArtifactRedactionMatcher, sanitizeOperatorText, sanitizeOutputText } from "../factory/viewer/sanitize.ts";
 import { createViewerReader } from "../factory/viewer/server.ts";
 import { atomicJson, completionRecord, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
+import { handoffOfferPath } from "./handoff.ts";
 import type { GenerateRequest } from "./lifecycle.ts";
 import { serviceFixture, workerFromConfig, notification } from "./test-support/chain-fixture.ts";
 import { verifyReadOnlyViewer, verifyReadOnlyViewerInChild } from "./test-support/factory-viewer-fixture.ts";
@@ -97,6 +98,18 @@ test("sanitizeOutputText preserves line breaks, scrubs blocked/generic paths and
 	assert.equal(sanitizeOperatorText(adjRaw, 1000, blocked), adjExpected);
 	assert.equal(sanitizeOutputText("x|/var/a/b| `/a/b`/c/d`", 8000, blocked), "x|[redacted-path]| `[redacted-path]`[redacted-path]`");
 
+	// N3-a: paths containing ',', ';', '|' inside segment names must redact whole path without leaking tail
+	for (const segPath of [
+		"/a,b/c/d",
+		"/opt/a,b/secret/k",
+		"/home/alice/My,Docs/secret.txt",
+		"/srv/x|y/z",
+		"/opt/semi;dir/file",
+	]) {
+		assert.equal(sanitizeOutputText(segPath, 8000, blocked), "[redacted-path]", `failed on ${segPath}`);
+		assert.equal(sanitizeOperatorText(segPath, 1000, blocked), "[redacted-path]", `operator failed on ${segPath}`);
+	}
+
 	// N-c: pin conservative lead-character behaviour and untouched non-path forms
 	const ncRedacted = "#/definitions/foo $/x/y +/x/y";
 	assert.equal(sanitizeOutputText(ncRedacted, 8000, blocked), "#[redacted-path] $[redacted-path] +[redacted-path]");
@@ -139,6 +152,8 @@ test("sanitizeOutputText and sanitizeOperatorText handle 200k hostile inputs in 
 		commaSlash: repeatTo(",/a", 200_000),
 		tildeRun: `,~${"a".repeat(200_000)}`,
 		deepPath: `/${"a/".repeat(100_000)}`,
+		commaInSeg: `/${"a,b/".repeat(50_000)}`,
+		pipeInSeg: `/${"a|b/".repeat(50_000)}`,
 	};
 	for (const [name, input] of Object.entries(hostileInputs)) {
 		const t0 = performance.now();
@@ -182,6 +197,63 @@ test("sanitizeOutputText and sanitizeOperatorText handle 200k hostile inputs in 
 	const giantOut = sanitizeOutputText(giantPath, 1000, []);
 	assert.ok(Array.from(giantOut).length <= 1000);
 	assert.match(giantOut, /^\[redacted-path\]… \[truncated, \d+ characters? omitted\]$/);
+
+	// N3-b: pre-bound cut inside a ~user or /first-segment prefix trims back to whitespace/delimiter without leaking ~alice or /secretdir
+	for (const cap of [50, 200]) {
+		const vsPrefix = "w\uFE0F ".repeat(cap); // 3 code points per "w\uFE0F ", shrinks to 2 ("w ")
+		const vsLen = Array.from(vsPrefix).length;
+		const padNeeded = 4 * cap - 7 - vsLen;
+		if (padNeeded >= 0) {
+			const input = `${vsPrefix}${"a".repeat(padNeeded)} ~alice/.ssh/id_rsa`;
+			const scrubbedCp = Array.from(input.replace(/\uFE0F/g, "").replace("~alice/.ssh/id_rsa", "[redacted-path]")).length;
+			const out = sanitizeOutputText(input, cap, []);
+			assert.equal(out.includes("~alice"), false, `cap=${cap} leaked ~alice: ${out}`);
+			assert.equal(out.includes("~al"), false, `cap=${cap} leaked ~al: ${out}`);
+			const m = /… \[truncated, (\d+) characters? omitted\]$/.exec(out);
+			assert.ok(m, `cap=${cap} missing marker`);
+			const kept = Array.from(out).length - Array.from(m[0]).length;
+			assert.equal(kept + Number(m[1]), scrubbedCp, `cap=${cap} N3-b marker arithmetic mismatch`);
+		}
+		const vsPad = "\uFE0F".repeat(4 * cap - 10);
+		const segInput = `${vsPad} /secretdir/inner/file`;
+		const segOut = sanitizeOutputText(segInput, cap, []);
+		assert.equal(segOut.includes("/secret"), false, `cap=${cap} leaked /secret: ${segOut}`);
+		assert.equal(segOut.includes("secretdir"), false, `cap=${cap} leaked secretdir: ${segOut}`);
+	}
+
+	// B1: no-space N3-b reproducers for ~alice/..., /secretdir/..., C:\Users\..., file:///... across caps and k
+	const leakPatterns = ["~alice", "~al", "/secretdir", "secretdir", "Users", "/etc", "bob", "alice"];
+	for (const cap of [50, 200, 1000, 8000]) {
+		for (const k of [0, 1, 5, 7, 10, 15, 25]) {
+			for (const tail of ["~alice/.ssh/id", "/home/alice/secret", "/secretdir/inner/file", "C:\\Users\\bob\\x", "file:///etc/pw"]) {
+				for (const fillerChar of ["\uFE0F", "§"]) {
+					const input = `${fillerChar.repeat(Math.max(0, 4 * cap - k))}${tail} end`;
+					const strippedCp = Array.from(input.replace(/[\uFE0E\uFE0F]/g, "")).length;
+					const out = sanitizeOutputText(input, cap, ["/home/alice"]);
+					const op = sanitizeOperatorText(input, cap, ["/home/alice"]);
+					assert.ok(Array.from(out).length <= cap, `B1 output exceeded cap=${cap}`);
+					assert.ok(Array.from(op).length <= cap, `B1 operator exceeded cap=${cap}`);
+					assert.equal(out.isWellFormed(), true);
+					assert.equal(op.isWellFormed(), true);
+					for (const bad of leakPatterns) {
+						assert.equal(out.includes(bad), false, `B1 output leaked ${JSON.stringify(bad)} (cap=${cap}, k=${k}, tail=${tail}, filler=${JSON.stringify(fillerChar)}): ${out}`);
+						assert.equal(op.includes(bad), false, `B1 operator leaked ${JSON.stringify(bad)} (cap=${cap}, k=${k}, tail=${tail}, filler=${JSON.stringify(fillerChar)}): ${op}`);
+					}
+					const m = /… \[truncated, (\d+) characters? omitted\]$/.exec(out);
+					if (m) {
+						const kept = Array.from(out).length - Array.from(m[0]).length;
+						const scrubbedTailInPreBound = fillerChar === "§" && k >= tail.length + 1;
+						const expectedCp = scrubbedTailInPreBound
+							? Array.from(input.replace(/[\uFE0E\uFE0F]/g, "").replace(tail, "[redacted-path]")).length
+							: strippedCp;
+						assert.equal(kept + Number(m[1]), expectedCp, `B1 marker arithmetic mismatch (cap=${cap}, k=${k}, tail=${tail})`);
+					} else {
+						assert.equal(fillerChar, "\uFE0F");
+					}
+				}
+			}
+		}
+	}
 });
 
 test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summary/detail/live-summary, caps fields, and handles absence and hostile files", async t => {
@@ -347,7 +419,7 @@ test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summa
 		claimed_at: "2026-01-01T00:00:03.000Z",
 	});
 
-	// 8. cmd_node: command result with command_evidence excerpts that must NOT leak in Ticket 01
+	// 8. cmd_node: command result with command_evidence excerpts (now allowed, scrubbed and bounded; command/args/cwd stay private)
 	const cmdEntry = entryOf("cmd_node");
 	const cmdCfg = readJson<WorkerConfig>(join(dir, `${cmdEntry.instance_id}.config.json`));
 	atomicJson(
@@ -372,8 +444,8 @@ test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summa
 					duration_ms: 1000,
 					stdout_bytes: 12,
 					stderr_bytes: 0,
-					stdout_excerpt: "PRIVATE_CMD_STDOUT_EXCERPT",
-					stderr_excerpt: "PRIVATE_CMD_STDERR_EXCERPT",
+					stdout_excerpt: `PUBLIC_CMD_STDOUT_EXCERPT\nfrom ${f.cwd}/out.txt\u200b`,
+					stderr_excerpt: "PUBLIC_CMD_STDERR_EXCERPT\nwarn /etc/probe_gen/cmd.err",
 				},
 			},
 			"not_required",
@@ -501,10 +573,19 @@ test("GET /api/factories/:id/output enforces query/not-found rules, scrubs summa
 				assert.equal(out.latest_attempt.absence, "evidence unavailable", badNode);
 			}
 
-			// /output for cmd_node must not leak command excerpts
+			// /output for cmd_node returns scrubbed stdout/stderr excerpts without leaking command/args/cwd/metrics
 			const cmdRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_node`);
 			assert.equal(cmdRes.status, 200);
-			scanSentinels(await cmdRes.text(), sentinels, "output cmd_node");
+			const cmdText = await cmdRes.text();
+			scanSentinels(cmdText, [...sentinels, "/etc/probe_gen/cmd.err"], "output cmd_node");
+			const cmdOut = JSON.parse(cmdText);
+			assert.equal(cmdOut.latest_attempt.command.exit_code, 0);
+			assert.equal(cmdOut.latest_attempt.command.signal, null);
+			assert.equal(cmdOut.latest_attempt.command.stdout_excerpt, "PUBLIC_CMD_STDOUT_EXCERPT\nfrom [redacted-path] [ctrl]");
+			assert.equal(cmdOut.latest_attempt.command.stderr_excerpt, "PUBLIC_CMD_STDERR_EXCERPT\nwarn [redacted-path]");
+			assert.equal("command" in cmdOut.latest_attempt.command, false);
+			assert.equal("args" in cmdOut.latest_attempt.command, false);
+			assert.equal("working_directory" in cmdOut.latest_attempt.command, false);
 		},
 	);
 });
@@ -769,7 +850,7 @@ test("GET /api/factories/:id/output keeps Live execution status alongside eviden
 	const entryOf = (nodeId: string) => launched.manifest.pane_manifest.find(e => e.node_id === nodeId)!;
 
 	const errEntry = entryOf("err_node");
-	atomicJson(join(dir, `${errEntry.instance_id}.error.json`), { error: "PRIVATE_ERR_JSON_MSG" });
+	atomicJson(join(dir, `${errEntry.instance_id}.error.json`), { error: `PUBLIC_ERR_JSON_MSG in ${f.cwd}/bad\u200b` });
 
 	const exitedEntry = entryOf("exited_node");
 	atomicJson(readyPath(dir, exitedEntry.instance_id), {
@@ -804,7 +885,8 @@ test("GET /api/factories/:id/output keeps Live execution status alongside eviden
 		async viewer => {
 			const liveRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
 			assert.equal(liveRes.status, 200);
-			const live = await liveRes.json() as any;
+			const liveText = await liveRes.text();
+			const live = JSON.parse(liveText) as any;
 			const liveById = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
 
 			for (const nodeId of ["err_node", "exited_node", "claim_only_node"]) {
@@ -812,6 +894,7 @@ test("GET /api/factories/:id/output keeps Live execution status alongside eviden
 				assert.equal(outRes.status, 200);
 				const outText = await outRes.text();
 				assert.equal(outText.includes("PRIVATE_"), false, `output for ${nodeId} leaked private sentinel`);
+				assert.equal(outText.includes(f.cwd), false, `output for ${nodeId} leaked project_cwd`);
 				const out = JSON.parse(outText);
 				const liveNode = liveById.get(nodeId);
 				assert.ok(liveNode, `missing ${nodeId} in live snapshot`);
@@ -819,6 +902,10 @@ test("GET /api/factories/:id/output keeps Live execution status alongside eviden
 				assert.equal(out.latest_attempt.absence, "evidence unavailable", nodeId);
 				assert.equal(out.latest_attempt.status, liveNode.status, `${nodeId} status must match Live`);
 				assert.equal(out.latest_attempt.status_text, liveNode.status_text, `${nodeId} status_text must match Live`);
+				if (nodeId === "err_node") {
+					assert.equal(out.latest_attempt.error_message, "PUBLIC_ERR_JSON_MSG in [redacted-path] [ctrl]");
+					assert.equal(liveText.includes("PUBLIC_ERR_JSON_MSG"), false, "/live must still not expose raw .error.json message");
+				}
 			}
 		},
 	);
@@ -882,6 +969,1468 @@ test("GET /api/factories/:id/output and /live respond quickly on 60k hostile pun
 			const liveText = await liveRes.text();
 			assert.equal(liveText.includes("/b/secret"), false);
 			assert.ok(liveMs < 1000, `/live with 60k hostile payload took ${liveMs.toFixed(0)}ms`);
+		},
+	);
+});
+
+
+test("GET /api/factories/:id/output projects verification, warnings, next_steps, command excerpts, structured outputs, artifact descriptions, dispositions, 64KB cap, and N-e alignment without leaking private sentinels", async t => {
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_T02_PROMPT",
+		agents: [
+			{ node_id: "rich_node", persona: "builder", sub_task: "PRIVATE_T02_RICH_SUB" },
+			{
+				node_id: "cmd_fail",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "process.exit(2)", "--sentinel-cmd-fail-arg"],
+				working_directory: f.cwd,
+				sub_task: "PRIVATE_T02_CMD_SUB",
+			},
+			{ node_id: "blk_node", persona: "builder", sub_task: "PRIVATE_T02_BLK_SUB" },
+			{ node_id: "skip_node", persona: "builder", sub_task: "PRIVATE_T02_SKIP_SUB" },
+			{ node_id: "cancel_node", persona: "builder", sub_task: "PRIVATE_T02_CAN_SUB" },
+			{ node_id: "huge_node", persona: "builder", sub_task: "PRIVATE_T02_HUGE_SUB" },
+			{ node_id: "handoff_src", persona: "builder", sub_task: "PRIVATE_T02_HSRC_SUB" },
+			{ node_id: "handoff_bad", persona: "builder", sub_task: "PRIVATE_T02_HBAD_SUB", depends_on: ["handoff_src"] },
+		],
+	};
+
+	const fac = ops({ action: "publish", name: "t02-output-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-t02-out", pi_session_file: join(f.root, "PRIVATE_MGR_SESSION.jsonl") });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "t02-ref-1", brief: "PRIVATE_T02_RAW_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const entryOf = (nodeId: string) => launched.manifest.pane_manifest.find(e => e.node_id === nodeId)!;
+
+	// 1. rich_node: >20 verification/warnings/next_steps with >500-char items, >8000-char outputs, artifacts with paths, metrics
+	const richEntry = entryOf("rich_node");
+	const richCfg = readJson<WorkerConfig>(join(dir, `${richEntry.instance_id}.config.json`));
+	const verList = Array.from({ length: 24 }, (_, idx) => ({
+		check_id: idx === 0 ? `chk-long-${"V".repeat(520)}` : `chk-${idx}`,
+		result: (idx === 0 ? "pass" : idx === 1 ? "fail" : idx === 2 ? "error" : "pass") as "pass" | "fail" | "error",
+		attempt_id: richEntry.attempt_id!,
+		completed_at: "2026-01-01T00:00:01.000Z",
+		scope_kind: "declared" as const,
+		applicability: idx === 1 ? ("stale" as const) : ("current" as const),
+		...(idx === 0 ? { reason: `Reason in ${f.cwd}/src/a.ts ${"R".repeat(520)}` } : {}),
+	}));
+	const warnList = Array.from({ length: 23 }, (_, idx) =>
+		idx === 0 ? `Warn at ${dir}/x \u202e ${"W".repeat(520)}` : `Warning ${idx}`,
+	);
+	const nextList = Array.from({ length: 22 }, (_, idx) =>
+		idx === 0 ? `Next step /opt/probe_gen/next ${"N".repeat(520)}` : `Next step ${idx}`,
+	);
+	const bigOutputs = {
+		verdict: "ok",
+		secretPathInJson: `${f.home}/.ssh/id_rsa`,
+		items: Array.from({ length: 250 }, (_, idx) => `item-${idx}-${"O".repeat(35)}`),
+	};
+	atomicJson(
+		resultPath(dir, richEntry.instance_id),
+		completionRecord(
+			richCfg,
+			{
+				agent_name: richEntry.persona_name,
+				node_id: "rich_node",
+				status: "success",
+				summary: "Rich summary",
+				detail: "Rich detail\nline 2",
+				verification: verList,
+				warnings: warnList,
+				next_steps: nextList,
+				outputs: bigOutputs,
+				metrics: { PRIVATE_METRIC_KEY: 12345 },
+				artifacts: [
+					{ type: "file", path: join(f.cwd, "PRIVATE_ARTIFACT_FILE_1.txt"), action: "created", description: `Built bundle at ${f.cwd}/dist/app.js` },
+					{ type: "file", path: join(f.cwd, "PRIVATE_ARTIFACT_FILE_2.txt"), action: "modified", description: `Long desc ${"A".repeat(530)}`, missing: true },
+				],
+			},
+			"sent",
+			"2026-01-01T00:00:01.000Z",
+		),
+	);
+
+	// 2. cmd_fail: failed command node with exit_code 2, signal SIGTERM, >4000 stdout & stderr excerpts
+	const cmdFailEntry = entryOf("cmd_fail");
+	const cmdFailCfg = readJson<WorkerConfig>(join(dir, `${cmdFailEntry.instance_id}.config.json`));
+	atomicJson(
+		resultPath(dir, cmdFailEntry.instance_id),
+		completionRecord(
+			cmdFailCfg,
+			{
+				agent_name: cmdFailEntry.persona_name,
+				node_id: "cmd_fail",
+				status: "failure",
+				summary: "Command failed",
+				detail: "Exited with 2",
+				command_evidence: {
+					version: 1,
+					command: process.execPath,
+					args: ["-e", "process.exit(2)", "--sentinel-cmd-fail-arg"],
+					working_directory: f.cwd,
+					exit_code: 2,
+					signal: "SIGTERM",
+					started_at: "2026-01-01T00:00:00.000Z",
+					finished_at: "2026-01-01T00:00:02.000Z",
+					duration_ms: 2000,
+					stdout_bytes: 5000,
+					stderr_bytes: 5000,
+					stdout_excerpt: `STDOUT_HEAD ${f.cwd}/a.log\n${"S".repeat(4200)}`,
+					stderr_excerpt: `STDERR_HEAD /etc/probe_gen/fail.err\u200b\n${"E".repeat(4200)}`,
+				},
+			},
+			"not_required",
+			"2026-01-01T00:00:02.000Z",
+		),
+	);
+
+	// 3. Dispositions: blocked, skipped, cancelled
+	const blkEntry = entryOf("blk_node");
+	atomicJson(
+		dispositionPath(dir, blkEntry.instance_id),
+		dispositionRecord(
+			{ ...blkEntry, task_id: launched.task_id },
+			"blocked",
+			`Blocked due to upstream failure in ${f.cwd}/upstream`,
+			[{ node_id: "cmd_fail", state: "failed", reason: `Failed at /opt/probe_gen/cause` }],
+			"2026-01-01T00:00:03.000Z",
+		),
+	);
+
+	const skipEntry = entryOf("skip_node");
+	atomicJson(
+		dispositionPath(dir, skipEntry.instance_id),
+		dispositionRecord(
+			{ ...skipEntry, task_id: launched.task_id },
+			"skipped",
+			`Skipped optional step under ${dir}/skip`,
+			[],
+			"2026-01-01T00:00:03.000Z",
+		),
+	);
+
+	const canEntry = entryOf("cancel_node");
+	atomicJson(
+		dispositionPath(dir, canEntry.instance_id),
+		dispositionRecord(
+			{ ...canEntry, task_id: launched.task_id },
+			"cancelled",
+			`Cancelled by operator in ${f.home}/.pi`,
+			[],
+			"2026-01-01T00:00:03.000Z",
+		),
+	);
+
+	// 4. huge_node: every field maxed out to exercise the 64 KB response budget
+	const hugeEntry = entryOf("huge_node");
+	const hugeCfg = readJson<WorkerConfig>(join(dir, `${hugeEntry.instance_id}.config.json`));
+	atomicJson(
+		resultPath(dir, hugeEntry.instance_id),
+		completionRecord(
+			hugeCfg,
+			{
+				agent_name: hugeEntry.persona_name,
+				node_id: "huge_node",
+				status: "partial",
+				summary: "H".repeat(950),
+				detail: "€".repeat(7950),
+				verification: Array.from({ length: 20 }, (_, idx) => ({
+					check_id: `huge-chk-${idx}-${"C".repeat(450)}`,
+					result: "pass" as const,
+					attempt_id: hugeEntry.attempt_id!,
+					completed_at: "2026-01-01T00:00:01.000Z",
+					scope_kind: "declared" as const,
+					applicability: "current" as const,
+					reason: "R".repeat(480),
+				})),
+				warnings: Array.from({ length: 20 }, (_, idx) => `W${idx}-${"W".repeat(480)}`),
+				next_steps: Array.from({ length: 20 }, (_, idx) => `N${idx}-${"N".repeat(480)}`),
+				outputs: { blob: "J".repeat(7900) },
+				artifacts: Array.from({ length: 20 }, (_, idx) => ({
+					type: "file",
+					path: join(f.cwd, `PRIVATE_HUGE_${idx}.txt`),
+					description: `Art${idx}-${"A".repeat(480)}`,
+				})),
+			},
+			"sent",
+			"2026-01-01T00:00:04.000Z",
+		),
+	);
+
+	// 5. N-e: handoff_bad has damaged handoff offer from handoff_src -> Live shows Uncertain, /output must also show Uncertain
+	const hBadEntry = entryOf("handoff_bad");
+	const { writeFileSync } = await import("node:fs");
+	writeFileSync(handoffOfferPath(dir, hBadEntry.instance_id, entryOf("handoff_src").instance_id), "{corrupt");
+
+	const sentinels = [
+		"PRIVATE_",
+		f.root,
+		f.cwd,
+		f.home,
+		dir,
+		statePath,
+		coordinationPath,
+		launched.manifest.token,
+		"/opt/probe_gen/next",
+		"/etc/probe_gen/fail.err",
+		"/opt/probe_gen/cause",
+	];
+	const runtimeCommandSentinels = [...sentinels, process.execPath, "--sentinel-cmd-fail-arg"];
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			// Whole-body sentinel scans on every endpoint
+			for (const ep of [
+				"/api/factories",
+				`/api/factories/${fac.factory_id}/live`,
+				`/api/factories/${fac.factory_id}/inspect`,
+				`/api/factories/${fac.factory_id}/queue?filter=all`,
+				`/api/factories/${fac.factory_id}/receipts?reference=t02-ref-1`,
+				`/api/factories/${fac.factory_id}/requests`,
+				`/api/factories/${fac.factory_id}/proposals`,
+			]) {
+				const res = await fetch(`${viewer.url}${ep}`);
+				assert.equal(res.status, 200, ep);
+				const bodyText = await res.text();
+				scanSentinels(bodyText, ep.endsWith("/live") ? runtimeCommandSentinels : sentinels, ep);
+			}
+
+			// rich_node: verification/warnings/next_steps capped at 20 items & 500 chars, outputs_text <= 8000, artifacts without paths
+			const richRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=rich_node`);
+			assert.equal(richRes.status, 200);
+			const richText = await richRes.text();
+			scanSentinels(richText, runtimeCommandSentinels, "output rich_node");
+			const richOut = JSON.parse(richText);
+			const richAtt = richOut.latest_attempt;
+			assert.equal(richAtt.verification.items.length, 20);
+			assert.equal(richAtt.verification.total_count, 24);
+			assert.equal(richAtt.verification.omitted_count, 4);
+			assert.match(richAtt.verification.omitted_marker, /\[truncated, 4 items omitted\]/);
+			assert.ok(Array.from(richAtt.verification.items[0].check_id).length <= 500);
+			assert.match(richAtt.verification.items[0].check_id, /\[truncated, \d+ characters? omitted\]$/);
+			assert.ok(Array.from(richAtt.verification.items[0].reason).length <= 500);
+			assert.match(richAtt.verification.items[0].reason, /\[redacted-path\]/);
+			assert.match(richAtt.verification.items[0].reason, /\[truncated, \d+ characters? omitted\]$/);
+
+			assert.equal(richAtt.warnings.items.length, 20);
+			assert.equal(richAtt.warnings.omitted_count, 3);
+			assert.match(richAtt.warnings.omitted_marker, /\[truncated, 3 items omitted\]/);
+			assert.ok(Array.from(richAtt.warnings.items[0]).length <= 500);
+			assert.match(richAtt.warnings.items[0], /\[redacted-path\]/);
+			assert.match(richAtt.warnings.items[0], /\[ctrl\]/);
+
+			assert.equal(richAtt.next_steps.items.length, 20);
+			assert.equal(richAtt.next_steps.omitted_count, 2);
+			assert.match(richAtt.next_steps.omitted_marker, /\[truncated, 2 items omitted\]/);
+			assert.ok(Array.from(richAtt.next_steps.items[0]).length <= 500);
+			assert.match(richAtt.next_steps.items[0], /\[redacted-path\]/);
+
+			assert.ok(Array.from(richAtt.outputs_text).length <= 8000);
+			assert.match(richAtt.outputs_text, /"verdict": "ok"/);
+			assert.match(richAtt.outputs_text, /"secretPathInJson": "\[redacted-path\]"/);
+			assert.match(richAtt.outputs_text, /\[truncated, \d+ characters? omitted\]$/);
+
+			assert.equal(richAtt.artifacts.items.length, 2);
+			assert.equal("path" in richAtt.artifacts.items[0], false);
+			assert.equal(richAtt.artifacts.items[0].description, "Built bundle at [redacted-path]");
+			assert.ok(Array.from(richAtt.artifacts.items[1].description).length <= 500);
+			assert.equal(richAtt.artifacts.items[1].missing, true);
+
+			// cmd_fail: exit_code, signal, 4000-char capped excerpts
+			const cmdRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_fail`);
+			assert.equal(cmdRes.status, 200);
+			const cmdText = await cmdRes.text();
+			scanSentinels(cmdText, runtimeCommandSentinels, "output cmd_fail");
+			const cmdOut = JSON.parse(cmdText);
+			assert.equal(cmdOut.latest_attempt.status, "failed");
+			assert.equal(cmdOut.latest_attempt.command.exit_code, 2);
+			assert.equal(cmdOut.latest_attempt.command.signal, "SIGTERM");
+			assert.ok(Array.from(cmdOut.latest_attempt.command.stdout_excerpt).length <= 4000);
+			assert.match(cmdOut.latest_attempt.command.stdout_excerpt, /^STDOUT_HEAD \[redacted-path\]\n/);
+			assert.match(cmdOut.latest_attempt.command.stdout_excerpt, /\[truncated, \d+ characters? omitted\]$/);
+			assert.ok(Array.from(cmdOut.latest_attempt.command.stderr_excerpt).length <= 4000);
+			assert.match(cmdOut.latest_attempt.command.stderr_excerpt, /^STDERR_HEAD \[redacted-path\] \[ctrl\]\n/);
+			assert.match(cmdOut.latest_attempt.command.stderr_excerpt, /\[truncated, \d+ characters? omitted\]$/);
+
+			// Dispositions: blocked, skipped, cancelled
+			const blkRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=blk_node`);
+			assert.equal(blkRes.status, 200);
+			const blkText = await blkRes.text();
+			scanSentinels(blkText, sentinels, "output blk_node");
+			const blkOut = JSON.parse(blkText);
+			assert.equal(blkOut.latest_attempt.evidence, "not applicable");
+			assert.equal(blkOut.latest_attempt.status, "blocked");
+			assert.equal(blkOut.latest_attempt.disposition_reason, "Blocked due to upstream failure in [redacted-path]");
+			assert.equal(blkOut.latest_attempt.causes.items[0].reason, "Failed at [redacted-path]");
+
+			const skipOut = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=skip_node`)).json() as any;
+			assert.equal(skipOut.latest_attempt.status, "skipped");
+			assert.equal(skipOut.latest_attempt.disposition_reason, "Skipped optional step under [redacted-path]");
+
+			const canOut = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cancel_node`)).json() as any;
+			assert.equal(canOut.latest_attempt.status, "cancelled");
+			assert.equal(canOut.latest_attempt.disposition_reason, "Cancelled by operator in [redacted-path]");
+
+			// huge_node: 64 KB response budget
+			const hugeRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=huge_node`);
+			assert.equal(hugeRes.status, 200);
+			const hugeText = await hugeRes.text();
+			scanSentinels(hugeText, sentinels, "output huge_node");
+			assert.ok(Buffer.byteLength(hugeText, "utf8") <= 64 * 1024, `expected <= 65536 bytes, got ${Buffer.byteLength(hugeText, "utf8")}`);
+			const hugeOut = JSON.parse(hugeText);
+			assert.ok(hugeOut.latest_attempt.outputs_text.includes("truncated") || hugeOut.latest_attempt.artifacts.omitted_count > 0);
+
+			// N-e: handoff_bad matches Live Graph status ("needs_attention" / "Uncertain")
+			const liveData = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).json() as any;
+			const liveHBad = liveData.graph.nodes.find((n: any) => n.id === "handoff_bad");
+			const outHBad = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=handoff_bad`)).json() as any;
+			assert.equal(liveHBad.status, "needs_attention");
+			assert.equal(outHBad.latest_attempt.status, "needs_attention");
+			assert.equal(outHBad.latest_attempt.status_text, "Uncertain");
+			assert.equal(outHBad.latest_attempt.evidence, "unavailable");
+		},
+	);
+});
+
+test("GET /api/factories/:id/output matches Live Graph upstream review-closure Blocked override (N-e)", async t => {
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_CLOSURE_PROMPT",
+		agents: [
+			{ node_id: "build", persona: "builder", sub_task: "PRIVATE_CLOSURE_BUILD" },
+			{
+				node_id: "review",
+				persona: "reviewer",
+				depends_on: ["build"],
+				sub_task: "PRIVATE_CLOSURE_REV",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 1, on_exhausted: "failed" },
+			},
+			{ node_id: "deploy", persona: "builder", depends_on: ["review"], sub_task: "PRIVATE_CLOSURE_DEP" },
+		],
+	};
+	const fac = ops({ action: "publish", name: "ne-closure-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-ne-close" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "ne-close-ref", brief: "PRIVATE_CLOSURE_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const buildEntry = launched.manifest.pane_manifest.find(e => e.node_id === "build")!;
+	const reviewEntry = launched.manifest.pane_manifest.find(e => e.node_id === "review")!;
+	const workerModel = { provider: "test-provider", id: "test-model" };
+	const build = workerFromConfig(t, join(dir, `${buildEntry.instance_id}.config.json`), { model: workerModel });
+	const review = workerFromConfig(t, join(dir, `${reviewEntry.instance_id}.config.json`), { model: workerModel });
+	await build.start();
+	await review.start();
+	await build.beforeStart();
+	await review.beforeStart();
+
+	await build.complete({ status: "success", summary: "Build 1", detail: "Detail 1" });
+	await review.beforeStart(notification(build, review));
+	await review.deliverFollowUps();
+	await review.complete({ status: "success", summary: "Revise 1", detail: "Needs fix", outputs: { verdict: "revise" } });
+	await build.beforeStart(notification(review, build));
+	await build.deliverFollowUps();
+	await build.complete({ status: "success", summary: "Build 2", detail: "Detail 2" });
+	await review.beforeStart(notification(build, review));
+	await review.deliverFollowUps();
+	await review.complete({ status: "success", summary: "Still bad", detail: "Exhausted", outputs: { verdict: "revise" } });
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const live = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).json() as any;
+			const liveDeploy = live.graph.nodes.find((n: any) => n.id === "deploy");
+			assert.equal(liveDeploy.status, "blocked");
+
+			const outRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=deploy`);
+			assert.equal(outRes.status, 200);
+			const outText = await outRes.text();
+			assert.equal(outText.includes("PRIVATE_"), false);
+			const out = JSON.parse(outText);
+			assert.equal(out.latest_attempt.status, "blocked");
+			assert.equal(out.latest_attempt.status_text, "Blocked");
+			assert.equal(out.latest_attempt.evidence, "not applicable");
+			assert.equal(out.latest_attempt.absence, "not applicable");
+			assert.ok(typeof out.latest_attempt.disposition_reason === "string" && out.latest_attempt.disposition_reason.length > 0);
+		},
+	);
+});
+
+test("GET /api/factories/:id/output and /live validate/scrub hostile timestamps, causes, signals, relative artifact paths, deep outputs, item caps, corrupt loop identity, and upstream size limits (B2, B3, N1, N2, N3, N5)", async t => {
+	const { writeFileSync } = await import("node:fs");
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_R1_PROMPT",
+		agents: [
+			{ node_id: "art_node", persona: "builder", sub_task: "PRIVATE_R1_ART" },
+			{ node_id: "deep_node", persona: "builder", sub_task: "PRIVATE_R1_DEEP" },
+			{ node_id: "disp_hostile", persona: "builder", sub_task: "PRIVATE_R1_DISP" },
+			{ node_id: "big_ts_node", persona: "builder", sub_task: "PRIVATE_R1_BIGTS" },
+			{
+				node_id: "cmd_hostile",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "process.exit(2)"],
+				working_directory: f.cwd,
+				sub_task: "PRIVATE_R1_CMD",
+			},
+			{ node_id: "item_cap_node", persona: "builder", sub_task: "PRIVATE_R1_ITEMS" },
+		],
+	};
+
+	const fac = ops({ action: "publish", name: "r1-hardening-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-r1-hard" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "r1-ref", brief: "PRIVATE_R1_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const entryOf = (nodeId: string) => launched.manifest.pane_manifest.find(e => e.node_id === nodeId)!;
+	const cfgOf = (e: ReturnType<typeof entryOf>) => readJson<WorkerConfig>(join(dir, `${e.instance_id}.config.json`));
+
+	// B2 + B3: art_node with relative artifact path in description/summary/detail/outputs, hostile completed_at, hostile verification fields
+	const artEntry = entryOf("art_node");
+	atomicJson(
+		resultPath(dir, artEntry.instance_id),
+		completionRecord(
+			cfgOf(artEntry),
+			{
+				agent_name: artEntry.persona_name,
+				node_id: "art_node",
+				status: "success",
+				summary: "Updated src/PRIVREL_ART.ts and ./src/PRIVREL_ART.ts",
+				detail: "Changed src\\PRIVREL_ART.ts in detail",
+				artifacts: [
+					{
+						type: "file",
+						path: "src/PRIVREL_ART.ts",
+						action: "modified",
+						description: `Wrote src/PRIVREL_ART.ts, ./src/PRIVREL_ART.ts, src\\PRIVREL_ART.ts, and ${join(f.cwd, "src/PRIVREL_ART.ts")}`,
+					},
+				],
+				outputs: {
+					artifact_ref: "src/PRIVREL_ART.ts",
+					public_rel: "src/PUBLIC_REL_OUT.ts",
+				},
+				verification: [
+					{
+						check_id: "v-hostile",
+						result: "pass",
+						applicability: { p: "/home/alice/PRIV_APP" } as any,
+						scope_kind: "/home/alice/PRIV_SCOPE" as any,
+						completed_at: "/home/alice/PRIV_VCOMP",
+					},
+				],
+			},
+			"sent",
+			"/home/alice/PRIV_COMPLETED_AT",
+		),
+	);
+
+	// N1: deep_node with 6,500-level nested outputs (under 1 MiB) must still render 200 with summary, detail, verification
+	const deepEntry = entryOf("deep_node");
+	const deepRec = JSON.stringify(
+		completionRecord(
+			cfgOf(deepEntry),
+			{
+				agent_name: deepEntry.persona_name,
+				node_id: "deep_node",
+				status: "success",
+				summary: "Deep summary ok",
+				detail: "Deep detail ok",
+				verification: [{ check_id: "deep-chk", result: "pass", applicability: "current", scope_kind: "declared" }],
+				outputs: { nested: "@@DEEP@@" },
+			},
+			"sent",
+			"2026-01-01T00:00:01.000Z",
+		),
+	);
+	writeFileSync(resultPath(dir, deepEntry.instance_id), deepRec.replace('"@@DEEP@@"', `${"[".repeat(6500)}1${"]".repeat(6500)}`));
+
+	// B2: disp_hostile with hostile state, check.evidence, node_id, and recorded_at
+	const dispEntry = entryOf("disp_hostile");
+	atomicJson(
+		dispositionPath(dir, dispEntry.instance_id),
+		dispositionRecord(
+			{ ...dispEntry, task_id: launched.task_id },
+			"blocked",
+			"Blocked reason",
+			[
+				{
+					node_id: "/home/alice/PRIV_CAUSE_NODE",
+					state: "/home/alice/PRIV_STATE" as any,
+					reason: "Cause reason",
+					check: { name: "chk", evidence: { p: "/home/alice/PRIV_EVID" } as any },
+				},
+			],
+			"/home/alice/PRIV_RECORDED_AT",
+		),
+	);
+
+	// B2: big_ts_node with 200,000-char completed_at must not exceed 64 KB response budget
+	const bigTsEntry = entryOf("big_ts_node");
+	atomicJson(
+		resultPath(dir, bigTsEntry.instance_id),
+		completionRecord(
+			cfgOf(bigTsEntry),
+			{ agent_name: bigTsEntry.persona_name, node_id: "big_ts_node", status: "success", summary: "ok", detail: "ok" },
+			"sent",
+			"Z".repeat(200_000),
+		),
+	);
+
+	// B2: cmd_hostile with hostile command_evidence.signal
+	const cmdHostileEntry = entryOf("cmd_hostile");
+	atomicJson(
+		resultPath(dir, cmdHostileEntry.instance_id),
+		completionRecord(
+			cfgOf(cmdHostileEntry),
+			{
+				agent_name: cmdHostileEntry.persona_name,
+				node_id: "cmd_hostile",
+				status: "failure",
+				summary: "Cmd hostile",
+				detail: "Cmd failed",
+				command_evidence: {
+					version: 1,
+					command: process.execPath,
+					args: ["-e", "process.exit(2)"],
+					working_directory: f.cwd,
+					exit_code: null,
+					signal: "/home/alice/PRIV_SIG" as any,
+					started_at: "2026-01-01T00:00:00.000Z",
+					finished_at: "2026-01-01T00:00:01.000Z",
+					duration_ms: 1000,
+					stdout_bytes: 0,
+					stderr_bytes: 0,
+				},
+			},
+			"not_required",
+			"2026-01-01T00:00:01.000Z",
+		),
+	);
+
+	// N2: item_cap_node with verification item and artifact item whose combined fields exceed 500 chars
+	const itemCapEntry = entryOf("item_cap_node");
+	atomicJson(
+		resultPath(dir, itemCapEntry.instance_id),
+		completionRecord(
+			cfgOf(itemCapEntry),
+			{
+				agent_name: itemCapEntry.persona_name,
+				node_id: "item_cap_node",
+				status: "success",
+				summary: "Item cap",
+				detail: "Item cap detail",
+				verification: [
+					{
+						check_id: `chk-${"C".repeat(450)}`,
+						result: "pass",
+						applicability: "current",
+						scope_kind: "declared",
+						completed_at: "2026-01-01T00:00:01.000Z",
+						reason: `rsn-${"R".repeat(450)}`,
+					},
+				],
+				artifacts: [
+					{
+						type: `type-${"T".repeat(120)}`,
+						path: "src/ok.ts",
+						action: `act-${"A".repeat(120)}`,
+						description: `desc-${"D".repeat(450)}`,
+					},
+				],
+			},
+			"sent",
+			"2026-01-01T00:00:01.000Z",
+		),
+	);
+
+	const sentinels = [
+		"PRIVREL_ART",
+		"PRIV_APP",
+		"PRIV_SCOPE",
+		"PRIV_VCOMP",
+		"PRIV_COMPLETED_AT",
+		"PRIV_CAUSE_NODE",
+		"PRIV_STATE",
+		"PRIV_EVID",
+		"PRIV_RECORDED_AT",
+		"PRIV_SIG",
+		"/home/alice",
+	];
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const liveRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
+			assert.equal(liveRes.status, 200);
+			const liveText = await liveRes.text();
+			scanSentinels(liveText, sentinels, "r1 live");
+
+			// art_node: relative artifact path redacted everywhere; public relative output path preserved
+			const artRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=art_node`);
+			assert.equal(artRes.status, 200);
+			const artText = await artRes.text();
+			scanSentinels(artText, sentinels, "r1 art_node");
+			const artOut = JSON.parse(artText);
+			assert.equal("completed_at" in artOut.latest_attempt, false, "invalid completed_at must be omitted");
+			assert.match(artOut.latest_attempt.summary, /\[redacted-path\]/);
+			assert.match(artOut.latest_attempt.detail, /\[redacted-path\]/);
+			assert.match(artOut.latest_attempt.artifacts.items[0].description, /\[redacted-path\]/);
+			assert.match(artOut.latest_attempt.outputs_text, /"public_rel": "src\/PUBLIC_REL_OUT\.ts"/);
+
+			// deep_node: 200 OK with summary, detail, verification, outputs_text
+			const deepRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=deep_node`);
+			assert.equal(deepRes.status, 200);
+			const deepOut = await deepRes.json() as any;
+			assert.equal(deepOut.latest_attempt.evidence, "available");
+			assert.equal(deepOut.latest_attempt.summary, "Deep summary ok");
+			assert.equal(deepOut.latest_attempt.detail, "Deep detail ok");
+			assert.equal(deepOut.latest_attempt.verification.items.length, 1);
+			assert.equal(typeof deepOut.latest_attempt.outputs_text, "string");
+
+			// disp_hostile: causes validated/scrubbed, invalid recorded_at omitted
+			const dispRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=disp_hostile`);
+			assert.equal(dispRes.status, 200);
+			const dispText = await dispRes.text();
+			scanSentinels(dispText, sentinels, "r1 disp_hostile");
+			const dispOut = JSON.parse(dispText);
+			assert.equal("recorded_at" in dispOut.latest_attempt, false, "invalid recorded_at must be omitted");
+			assert.equal(dispOut.latest_attempt.causes.items[0].state, "needs_attention");
+			assert.equal(dispOut.latest_attempt.causes.items[0].check.evidence, "unverified");
+
+			// big_ts_node: <= 64 KB
+			const bigRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=big_ts_node`);
+			assert.equal(bigRes.status, 200);
+			const bigText = await bigRes.text();
+			assert.ok(Buffer.byteLength(bigText, "utf8") <= 64 * 1024, `big_ts_node exceeded 64KB: ${Buffer.byteLength(bigText, "utf8")}`);
+
+			// cmd_hostile: hostile signal scrubbed
+			const cmdRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_hostile`);
+			assert.equal(cmdRes.status, 200);
+			const cmdText = await cmdRes.text();
+			scanSentinels(cmdText, sentinels, "r1 cmd_hostile");
+
+			// N2: total code points of verification item and artifact item <= 500
+			const itemRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=item_cap_node`);
+			assert.equal(itemRes.status, 200);
+			const itemOut = await itemRes.json() as any;
+			const vItem = itemOut.latest_attempt.verification.items[0];
+			const vTotalCp = Array.from(
+				`${vItem.check_id}${vItem.result}${vItem.applicability}${vItem.scope_kind}${vItem.completed_at ?? ""}${vItem.reason ?? ""}`,
+			).length;
+			assert.ok(vTotalCp <= 500, `verification item total code points ${vTotalCp} exceeded 500`);
+			const aItem = itemOut.latest_attempt.artifacts.items[0];
+			const aTotalCp = Array.from(`${aItem.type}${aItem.action ?? ""}${aItem.description ?? ""}`).length;
+			assert.ok(aTotalCp <= 500, `artifact item total code points ${aTotalCp} exceeded 500`);
+		},
+	);
+
+	// N3 + N5: review loop with corrupt attempt-2 result (N3 identity masked) and >1 MiB upstream record (N5 matches /live)
+	const fLoop = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath2 = join(fLoop.root, "factories.sqlite");
+	const coordinationPath2 = join(fLoop.root, "factory-coordination.sqlite");
+	const viewerEnv2 = { PATH: join(fLoop.root, "bin"), PI_BOOTSTRAP_STATE_DIR: fLoop.stateDir };
+	const ops2 = factoryOperations(statePath2, fLoop.service, { coordinationPath: coordinationPath2 });
+	const loopDraft: GenerateRequest = {
+		project_cwd: fLoop.cwd,
+		topology: "graph",
+		task: "PRIVATE_LOOP_R1",
+		agents: [
+			{ node_id: "build", persona: "builder", sub_task: "PRIVATE_BUILD" },
+			{
+				node_id: "review",
+				persona: "reviewer",
+				depends_on: ["build"],
+				sub_task: "PRIVATE_REV",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 1, on_exhausted: "failed" },
+			},
+			{ node_id: "deploy", persona: "builder", depends_on: ["review"], sub_task: "PRIVATE_DEP" },
+		],
+	};
+	const fac2 = ops2({ action: "publish", name: "r1-loop-fac", draft: loopDraft, sessionModel });
+	const auth2 = createManagerAuthority({ pi_session_id: "sess-r1-loop" });
+	ops2({ action: "resume", factory_id: fac2.factory_id, authority: auth2 });
+	ops2({ action: "submit", factory_id: fac2.factory_id, authority: auth2, reference: "r1-loop-ref", brief: "PRIVATE_BRIEF" });
+	const launched2 = await ops2({ action: "launch", factory_id: fac2.factory_id, authority: auth2 });
+	revokeManagerAuthority(auth2);
+
+	const dir2 = launched2.manifest.session_dir;
+	const be = launched2.manifest.pane_manifest.find(e => e.node_id === "build")!;
+	const re = launched2.manifest.pane_manifest.find(e => e.node_id === "review")!;
+	const wm = { provider: "test-provider", id: "test-model" };
+	const buildW = workerFromConfig(t, join(dir2, `${be.instance_id}.config.json`), { model: wm });
+	const reviewW = workerFromConfig(t, join(dir2, `${re.instance_id}.config.json`), { model: wm });
+	await buildW.start();
+	await reviewW.start();
+	await buildW.beforeStart();
+	await reviewW.beforeStart();
+	await buildW.complete({ status: "success", summary: "B1", detail: "D1" });
+	await reviewW.beforeStart(notification(buildW, reviewW));
+	await reviewW.deliverFollowUps();
+	await reviewW.complete({ status: "success", summary: "R1", detail: "Revise", outputs: { verdict: "revise" } });
+	await buildW.beforeStart(notification(reviewW, buildW));
+	await buildW.deliverFollowUps();
+	await buildW.complete({ status: "success", summary: "B2", detail: "D2" });
+	await reviewW.beforeStart(notification(buildW, reviewW));
+	await reviewW.deliverFollowUps();
+	await reviewW.complete({ status: "success", summary: "R2", detail: "Exhausted", outputs: { verdict: "revise" } });
+
+	// N5: Make review's progress.json > 1 MiB (valid JSON padded with spaces) and verify /live and /output?node=deploy agree on Blocked
+	const revProgPath = join(dir2, `${re.instance_id}.progress.json`);
+	const revProgText = JSON.stringify({
+		attempt_id: `${re.instance_id}.2`,
+		token: launched2.manifest.token,
+		updated_at: Date.now(),
+		started_at: Date.now() - 1000,
+		state: "completed",
+	});
+	writeFileSync(revProgPath, `${revProgText}${" ".repeat(1_200_000)}`);
+
+	// N3: Corrupt build attempt 2 result and verify /output masks attempt_id and attempt_number to 1 like /live
+	writeFileSync(resultPath(dir2, `${be.instance_id}.2`), "{corrupt");
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: fLoop.root, viewerOptions: { statePath: statePath2, coordinationPath: coordinationPath2, env: viewerEnv2, home: fLoop.home } },
+		async viewer => {
+			const live = await (await fetch(`${viewer.url}/api/factories/${fac2.factory_id}/live`)).json() as any;
+			const liveBuild = live.graph.nodes.find((n: any) => n.id === "build");
+			const liveDeploy = live.graph.nodes.find((n: any) => n.id === "deploy");
+
+			const outBuild = await (await fetch(`${viewer.url}/api/factories/${fac2.factory_id}/output?node=build`)).json() as any;
+			assert.equal(outBuild.latest_attempt.evidence, "unavailable");
+			assert.equal(outBuild.latest_attempt.attempt_number, liveBuild.current_attempt.attempt_number);
+			assert.equal(outBuild.latest_attempt.attempt_number, 1);
+			assert.equal(typeof outBuild.latest_attempt.attempt_id, "object");
+			assert.equal(outBuild.latest_attempt.attempt_id.absence, "evidence unavailable");
+
+			const outDeploy = await (await fetch(`${viewer.url}/api/factories/${fac2.factory_id}/output?node=deploy`)).json() as any;
+			assert.equal(liveDeploy.status, "blocked");
+			assert.equal(outDeploy.latest_attempt.status, liveDeploy.status);
+			assert.equal(outDeploy.latest_attempt.status_text, liveDeploy.status_text);
+		},
+	);
+
+	// B2 hard budget fallback: when trims cannot bring the response under maxBytes, latest_attempt collapses to an evidence-unavailable stub
+	const overBudget = enforceOutputResponseBudget(
+		{
+			factory_id: fac.factory_id,
+			node_id: "art_node",
+			evidence: "available",
+			latest_attempt: {
+				attempt_id: "a1-art_node.1",
+				attempt_number: 1,
+				max_attempts: 1,
+				status: "succeeded",
+				status_text: "Succeeded",
+				evidence: "available",
+				summary: "S".repeat(500),
+				detail: "D".repeat(500),
+				disposition_reason: "R".repeat(500),
+				error_message: "M".repeat(500),
+				command: {
+					exit_code: 0,
+					signal: null,
+					duration_ms: 1000,
+					stdout_bytes: 500,
+					stderr_bytes: 500,
+					stdout_excerpt: "O".repeat(500),
+					stderr_excerpt: "E".repeat(500),
+					spawn_error: "X".repeat(500),
+					termination_error: "Y".repeat(500),
+				},
+			},
+		},
+		450,
+	);
+	assert.ok(Buffer.byteLength(JSON.stringify(overBudget), "utf8") <= 450);
+	assert.equal(overBudget.evidence, "unavailable");
+	assert.equal((overBudget.latest_attempt as any).absence, "evidence unavailable");
+});
+
+test("Round 2 unit hardening: whole-token artifact redaction after path scrub (B1), O(N) perf (B2), prose trim (N1), single-word exclusion (N2), normalized forms (N3)", () => {
+	const cwd = "/home/alice/proj";
+	const blocked = ["/home/alice", cwd];
+
+	// B1: artifact path must never break absolute/tilde/win/file path scrubbing
+	const srcTokens = collectArtifactPathTokens([{ path: "src" }], cwd);
+	const docsTokens = collectArtifactPathTokens([{ path: "docs/a.md" }], cwd);
+	for (const [tokens, text] of [
+		[srcTokens, "see /opt/src/X now"],
+		[srcTokens, "at ~bob/src/X done"],
+		[srcTokens, "at C:\\w\\src\\X done"],
+		[srcTokens, "at file:///o/src/X done"],
+		[docsTokens, "and /srv/x/docs/a.md/X ok"],
+		[docsTokens, "at ~bob/docs/a.md/X done"],
+		[docsTokens, "at C:\\w\\docs\\a.md\\X done"],
+		[docsTokens, "at file:///o/docs/a.md/X done"],
+	] as const) {
+		const out = sanitizeOutputText(text, 1000, blocked, tokens);
+		const op = sanitizeOperatorText(text, 1000, blocked, tokens);
+		assert.equal(out.includes("X"), false, `output leaked X for ${JSON.stringify(text)}: ${out}`);
+		assert.equal(op.includes("X"), false, `operator leaked X for ${JSON.stringify(text)}: ${op}`);
+		assert.equal(out.includes("~bob"), false, `output leaked ~bob for ${JSON.stringify(text)}: ${out}`);
+		assert.equal(op.includes("~bob"), false, `operator leaked ~bob for ${JSON.stringify(text)}: ${op}`);
+		assert.equal(out.includes("[redacted-path][redacted-path]"), false, `doubled marker in ${out}`);
+	}
+
+	// B1 whole-token boundaries: must not partially match inside larger path/word tokens
+	assert.equal(
+		sanitizeOutputText("foo/docs/a.md/bar x-docs/a.md docs/a.md_2 docs/a.md.bak foo:docs/a.md", 1000, blocked, docsTokens),
+		"foo/docs/a.md/bar x-docs/a.md docs/a.md_2 docs/a.md.bak foo:docs/a.md",
+	);
+	assert.equal(
+		sanitizeOutputText("see docs/a.md, (docs/a.md), \"docs\\\\a.md\", docs/a.md. and docs/a.md:", 1000, blocked, docsTokens),
+		"see [redacted-path], ([redacted-path]), \"[redacted-path]\", [redacted-path]. and [redacted-path]:",
+	);
+
+	// N1: prose containing ' /' or '(/' before cap must not drop legitimate prose
+	const apiProse = `Use the API (/ v2) for this. ${"Then more words here. ".repeat(400)}`;
+	const apiOut = sanitizeOutputText(apiProse, 100, []);
+	assert.ok(apiOut.startsWith("Use the API (/ v2) for this. "), `unexpected API prose trim: ${apiOut}`);
+	assert.equal(sanitizeOperatorText(apiProse, 50, []).startsWith("Use the API (/ v2) for this."), true);
+
+	const slashProse = `a /b ${"lorem ipsum ".repeat(200)}`;
+	const slashOut = sanitizeOutputText(slashProse, 128, []);
+	assert.ok(slashOut.startsWith("a /b lorem ipsum "), `unexpected slash prose trim: ${slashOut}`);
+	assert.ok(sanitizeOperatorText(slashProse, 128, []).startsWith("a /b lorem ipsum "));
+
+	// N2: bare single-word artifacts must not redact prose or scrubber markers
+	const wordTokens = collectArtifactPathTokens(
+		[{ path: "src" }, { path: "it" }, { path: "path" }, { path: "ctrl" }, { path: "truncated" }, { path: "a" }],
+		cwd,
+	);
+	assert.equal(sanitizeOutputText("the src folder and it is what it is", 1000, blocked, wordTokens), "the src folder and it is what it is");
+	assert.equal(sanitizeOperatorText("the src folder and it is what it is", 1000, blocked, wordTokens), "the src folder and it is what it is");
+	assert.equal(
+		sanitizeOutputText("x\u0001y path [truncated, 5 characters omitted]", 1000, blocked, wordTokens),
+		"x [ctrl] y path [truncated-marker]",
+	);
+	const dotExtTokens = collectArtifactPathTokens([{ path: "secret-file.ts" }], cwd);
+	assert.equal(sanitizeOutputText("touched secret-file.ts ok", 1000, blocked, dotExtTokens), "touched [redacted-path] ok");
+
+	// N3: trailing separator, ../ stripped form, and case-insensitive drive/backslash forms
+	const trailSingle = collectArtifactPathTokens([{ path: "src/" }], cwd);
+	assert.equal(sanitizeOutputText("src/PRIVTR.ts is new", 1000, blocked, trailSingle), "src/PRIVTR.ts is new");
+	const trailSub = collectArtifactPathTokens([{ path: "src/sub/" }], cwd);
+	assert.equal(sanitizeOutputText("see src/sub and src/sub/ and src/sub/other.ts", 1000, blocked, trailSub), "see [redacted-path] and [redacted-path] and src/sub/other.ts");
+
+	const dotDotTokens = collectArtifactPathTokens([{ path: "../PRIVUP/x.ts" }], cwd);
+	assert.equal(sanitizeOutputText("see ../PRIVUP/x.ts and PRIVUP/x.ts", 1000, blocked, dotDotTokens), "see [redacted-path] and [redacted-path]");
+
+	const caseTokens = collectArtifactPathTokens([{ path: "src/PRIVCASE.ts" }], cwd);
+	assert.equal(
+		sanitizeOutputText("SRC\\privcase.ts .\\Src\\PRIVCASE.TS SRC/privcase.ts", 1000, blocked, caseTokens),
+		"[redacted-path] [redacted-path] SRC/privcase.ts",
+	);
+	const winCaseTokens = collectArtifactPathTokens([{ path: "C:\\Work\\PRIV.ts" }], cwd);
+	assert.equal(
+		sanitizeOutputText("see \"src\\\\PRIVREL.ts\" and c:\\work\\priv.ts", 1000, blocked, collectArtifactPathTokens([{ path: "src/PRIVREL.ts" }], cwd).concat(winCaseTokens)),
+		"see \"[redacted-path]\" and [redacted-path]",
+	);
+
+	// B2: only the first 20 projected artifacts are collected into free-text tokens
+	const beyond20Arts = Array.from({ length: 25 }, (_, i) => ({ path: `src/item_${i}.ts` }));
+	const beyond20Tokens = collectArtifactPathTokens(beyond20Arts, cwd);
+	assert.equal(sanitizeOutputText("keep src/item_0.ts vs src/item_20.ts", 1000, blocked, beyond20Tokens), "keep [redacted-path] vs src/item_20.ts");
+
+	// B2: 25,000 prefix-sharing artifacts + repeated prefix text must run in well under 500ms
+	const pre = `s/${"a".repeat(8)}`;
+	const manyArts = Array.from({ length: 25_000 }, (_, i) => ({ type: "file", path: `${pre}${i}` }));
+	const manyText = `${pre}x `.repeat(4000);
+	const t0 = performance.now();
+	const manyToks = collectArtifactPathTokens(manyArts, cwd);
+	assert.ok(manyToks.length <= 512, `expected bounded token count, got ${manyToks.length}`);
+	sanitizeOperatorText(manyText, 1000, blocked, manyToks);
+	sanitizeOutputText(manyText, 8000, blocked, manyToks);
+	for (let i = 0; i < 60; i++) sanitizeOutputText(manyText, 500, blocked, manyToks);
+	const elapsed = performance.now() - t0;
+	assert.ok(elapsed < 500, `25k-artifact unit scrub took too long: ${elapsed.toFixed(0)}ms`);
+});
+
+test("GET /api/factories/:id/output and /live fix B1 mid-segment leaks, B2 19k-artifact latency, and B3 true omitted counts", async t => {
+	const { writeFileSync } = await import("node:fs");
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_R2_PROMPT",
+		agents: [
+			{ node_id: "mid", persona: "builder", sub_task: "PRIVATE_R2_MID" },
+			{ node_id: "many", persona: "builder", sub_task: "PRIVATE_R2_MANY" },
+			{ node_id: "bigstr", persona: "builder", sub_task: "PRIVATE_R2_BIGSTR" },
+			{ node_id: "wide", persona: "builder", sub_task: "PRIVATE_R2_WIDE" },
+			{ node_id: "astral", persona: "builder", sub_task: "PRIVATE_R2_ASTRAL" },
+			{ node_id: "d63", persona: "builder", sub_task: "PRIVATE_R2_D63" },
+			{ node_id: "d64", persona: "builder", sub_task: "PRIVATE_R2_D64" },
+		],
+	};
+	const fac = ops({ action: "publish", name: "r2-fixes-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-r2-fixes" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "r2-ref", brief: "PRIVATE_R2_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const entryOf = (nodeId: string) => launched.manifest.pane_manifest.find(e => e.node_id === nodeId)!;
+	const cfgOf = (e: ReturnType<typeof entryOf>) => readJson<WorkerConfig>(join(dir, `${e.instance_id}.config.json`));
+
+	// B1: mid node with artifact "src" and "docs/a.md" inside absolute/tilde/win/file paths
+	const midEntry = entryOf("mid");
+	atomicJson(
+		resultPath(dir, midEntry.instance_id),
+		completionRecord(
+			cfgOf(midEntry),
+			{
+				agent_name: midEntry.persona_name,
+				node_id: "mid",
+				status: "success",
+				summary: "Read /opt/build/src/PRIV_MID_SUM and ~bob/src/PRIV_TILDE and C:\\w\\src\\PRIV_WIN and file:///o/src/PRIV_FILE",
+				detail: "see /var/data/src/PRIV_MID_DET and /srv/x/docs/a.md/PRIV_DOC_DET",
+				artifacts: [
+					{ type: "dir", path: "src", description: "touched /etc/src/PRIV_MID_DESC and ~bob/src/PRIV_DESC_TILDE" },
+					{ type: "file", path: "docs/a.md", description: "see C:\\w\\docs\\a.md\\PRIV_DOC_DESC" },
+				],
+			},
+			"sent",
+			"2026-01-01T00:00:01.000Z",
+		),
+	);
+
+	// B2: 19,000 artifacts sharing prefix s/aaaaaaaa
+	const pre = "s/aaaaaaaa";
+	const txt = `${pre}x `.repeat(170);
+	const manyEntry = entryOf("many");
+	writeFileSync(
+		resultPath(dir, manyEntry.instance_id),
+		JSON.stringify(
+			completionRecord(
+				cfgOf(manyEntry),
+				{
+					agent_name: manyEntry.persona_name,
+					node_id: "many",
+					status: "success",
+					summary: txt,
+					detail: txt.repeat(14),
+					warnings: Array.from({ length: 20 }, () => txt),
+					next_steps: Array.from({ length: 20 }, () => txt),
+					artifacts: Array.from({ length: 19_000 }, (_, i) => ({ type: "file", path: `${pre}${i}` })),
+				},
+				"sent",
+				"2026-01-01T00:00:01.000Z",
+			),
+		),
+	);
+
+	// B3: 100k string, 100k-element array, depth 63 vs 64
+	const nest = (d: number): any => {
+		let v: any = { leaf: 1 };
+		for (let i = 0; i < d; i++) v = { k: v };
+		return v;
+	};
+	const bigStrVal = { s: "x".repeat(100_000) };
+	const wideVal = Array.from({ length: 100_000 }, (_, i) => i);
+	const astralVal = { s: "🚀".repeat(30_000) };
+	const d63Val = nest(63);
+	const d64Val = nest(64);
+	for (const [nodeId, outputs] of [
+		["bigstr", bigStrVal],
+		["wide", wideVal],
+		["astral", astralVal],
+		["d63", d63Val],
+		["d64", d64Val],
+	] as const) {
+		const ent = entryOf(nodeId);
+		writeFileSync(
+			resultPath(dir, ent.instance_id),
+			JSON.stringify(
+				completionRecord(
+					cfgOf(ent),
+					{ agent_name: ent.persona_name, node_id: nodeId, status: "success", summary: `S-${nodeId}`, detail: "D", outputs },
+					"sent",
+					"2026-01-01T00:00:01.000Z",
+				),
+			),
+		);
+	}
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			// B1 + B2 on /live
+			const tLive0 = performance.now();
+			const liveRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
+			const liveMs = performance.now() - tLive0;
+			assert.equal(liveRes.status, 200);
+			const liveText = await liveRes.text();
+			assert.equal(liveText.includes("PRIV_"), false, `live leaked PRIV_: ${liveText}`);
+			assert.equal(liveText.includes("~bob"), false, `live leaked ~bob: ${liveText}`);
+			assert.ok(liveMs < 1000, `/live with 19k artifacts took ${liveMs.toFixed(0)}ms`);
+
+			// B1 on /output?node=mid
+			const midRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=mid`);
+			assert.equal(midRes.status, 200);
+			const midText = await midRes.text();
+			assert.equal(midText.includes("PRIV_"), false, `output mid leaked PRIV_: ${midText}`);
+			assert.equal(midText.includes("~bob"), false, `output mid leaked ~bob: ${midText}`);
+			assert.equal("path" in JSON.parse(midText).latest_attempt.artifacts.items[0], false);
+
+			// B2 on /output?node=many
+			const tMany0 = performance.now();
+			const manyRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=many`);
+			const manyMs = performance.now() - tMany0;
+			assert.equal(manyRes.status, 200);
+			assert.ok(manyMs < 1000, `/output with 19k artifacts took ${manyMs.toFixed(0)}ms`);
+
+			// B3 on bigstr, wide, astral, d63, d64
+			for (const [nodeId, rawVal] of [
+				["bigstr", bigStrVal],
+				["wide", wideVal],
+				["astral", astralVal],
+				["d63", d63Val],
+			] as const) {
+				const out = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=${nodeId}`)).json() as any;
+				const txtOut: string = out.latest_attempt.outputs_text;
+				const fullLen = Array.from(JSON.stringify(rawVal, null, 2)).length;
+				const m = /… \[truncated, (\d+) characters? omitted\]$/.exec(txtOut);
+				assert.ok(m, `${nodeId} missing truncation marker`);
+				const kept = Array.from(txtOut).length - Array.from(m[0]).length;
+				assert.equal(kept + Number(m[1]), fullLen, `${nodeId} omitted count mismatch`);
+				if (nodeId === "d63") {
+					assert.equal(txtOut, sanitizeOutputText(JSON.stringify(rawVal, null, 2), 8000, [], []));
+				}
+			}
+			const d64Out = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=d64`)).json() as any;
+			const d64Txt: string = d64Out.latest_attempt.outputs_text;
+			assert.ok(d64Txt.includes('"{...}"'), `d64 should contain depth-elided "{...}"`);
+			const d64m = /… \[truncated, (\d+) characters? omitted\]$/.exec(d64Txt);
+			assert.ok(d64m);
+		},
+	);
+});
+
+test("Round 3 unit hardening: R3-B1 line/anchor suffixes and file: prefix, R3-B2 drop multi-part with O(N) perf, N1 dotted stem/ext", () => {
+	const cwd = "/home/alice/proj";
+	const blocked = ["/home/alice", cwd];
+	const tokens = collectArtifactPathTokens(
+		[{ path: "src/PRIV_A.ts" }, { path: "src/@scope/PRIV_AT.ts" }, { path: "C:\\W\\Proj\\PRIV_WIN.ts" }, { path: "src\\PRIV_BS.ts" }],
+		cwd,
+	);
+
+	// R3-B1: suffixes and file: prefix redact in both scrubbers
+	const lineRefInput = "fixed src/PRIV_A.ts:12 and src/PRIV_A.ts:12:3, src/PRIV_A.ts#L5, src/PRIV_A.ts@HEAD, src/PRIV_A.ts/ , src/PRIV_A.ts~ , file:src/PRIV_A.ts, file:src/PRIV_A.ts:12, src/PRIV_A.ts&x, src/PRIV_A.ts+1, src/PRIV_A.ts%20, src/@scope/PRIV_AT.ts#L5, src\\PRIV_BS.ts:9, SRC\\priv_bs.ts@HEAD";
+	const lineRefExpected = "fixed [redacted-path]:12 and [redacted-path]:12:3, [redacted-path]#L5, [redacted-path]@HEAD, [redacted-path]/ , [redacted-path]~ , file:[redacted-path], file:[redacted-path]:12, [redacted-path]&x, [redacted-path]+1, [redacted-path]%20, [redacted-path]#L5, [redacted-path]:9, [redacted-path]@HEAD";
+	assert.equal(sanitizeOutputText(lineRefInput, 2000, blocked, tokens), lineRefExpected);
+	assert.equal(sanitizeOperatorText(lineRefInput, 2000, blocked, tokens), lineRefExpected);
+
+	// R3-B1: untouched non-matching words and subpaths
+	const untouched = "mysrc/PRIV_A.tsx src/PRIV_A.tsx xsrc/PRIV_A.ts src/PRIV_A.ts.bak src/PRIV_A.tsfoo PRIV_A.ts foo:src/PRIV_A.ts";
+	assert.equal(sanitizeOutputText(untouched, 2000, blocked, tokens), untouched);
+	assert.equal(sanitizeOperatorText(untouched, 2000, blocked, tokens), untouched);
+
+	// R3-B2: delimiter-containing artifact paths are excluded from free-text matching (and their pieces are not matched),
+	// while absolute/tilde/drive paths still scrub via generic scrubber
+	const multiTokens = collectArtifactPathTokens(
+		[{ path: "docs/my plan.md" }, { path: "a]b/c.ts" }, { path: "x[1]/y.ts" }],
+		cwd,
+	);
+	assert.deepEqual(multiTokens, []);
+	assert.equal(
+		sanitizeOutputText("docs/my plan.md and docs/my and plan.md and a]b/c.ts and x[1]/y.ts", 1000, blocked, multiTokens),
+		"docs/my plan.md and docs/my and plan.md and a]b/c.ts and x[1]/y.ts",
+	);
+	assert.equal(
+		sanitizeOutputText("at /opt/docs/my plan.md and ~bob/docs/my plan.md", 1000, blocked, multiTokens),
+		"at [redacted-path] plan.md and [redacted-path] plan.md",
+	);
+
+	// R3-B2: spaced prefix-sharing artifact paths + long repeating text run in linear time
+	const spacedArts = Array.from({ length: 20 }, (_, i) => ({ path: `${"a ".repeat(350)}/z${i}` }));
+	const spacedTokens = collectArtifactPathTokens(spacedArts, cwd);
+	assert.deepEqual(spacedTokens, []);
+	const spacedText = "a ".repeat(20_000);
+	const t0 = performance.now();
+	sanitizeOutputText(spacedText, 8000, blocked, spacedTokens);
+	for (let i = 0; i < 80; i++) sanitizeOutputText("a ".repeat(1000), 500, blocked, spacedTokens);
+	sanitizeOperatorText(spacedText, 1000, blocked, spacedTokens);
+	const elapsed = performance.now() - t0;
+	assert.ok(elapsed < 500, `spaced-artifact unit scrub took too long: ${elapsed.toFixed(0)}ms`);
+
+	// N1 / R4-N3: dotted prose words e.g, i.e, v1.2, x.12, a.c are not redacted as bare dotted paths,
+	// while >=3-char dotfiles (.env, .gitignore) and 1-char stems with >=2-letter extensions (x.py, a.ts) are redacted
+	const n1Tokens = collectArtifactPathTokens(
+		[{ path: "e.g" }, { path: "i.e" }, { path: "v1.2" }, { path: "x.12" }, { path: "a.c" }, { path: "a.ts" }, { path: "x.py" }, { path: ".env" }, { path: ".gitignore" }, { path: "secret-file.ts" }],
+		cwd,
+	);
+	assert.equal(
+		sanitizeOutputText("e.g i.e v1.2 x.12 a.c vs a.ts x.py .env .gitignore secret-file.ts", 1000, blocked, n1Tokens),
+		"e.g i.e v1.2 x.12 a.c vs [redacted-path] [redacted-path] [redacted-path] [redacted-path] [redacted-path]",
+	);
+	assert.equal(
+		sanitizeOperatorText("e.g i.e v1.2 x.12 a.c vs a.ts x.py .env .gitignore secret-file.ts", 1000, blocked, n1Tokens),
+		"e.g i.e v1.2 x.12 a.c vs [redacted-path] [redacted-path] [redacted-path] [redacted-path] [redacted-path]",
+	);
+});
+
+test("Round 4 unit hardening: R4-B1 non-ASCII punctuation delimiters, N1 leading sigils, N2 $/^ and first .digit splits, N3 dotfiles/short stems", () => {
+	const cwd = "/home/alice/proj";
+	const blocked = ["/home/alice", cwd];
+	const tokens = collectArtifactPathTokens([{ path: "src/a.ts" }], cwd);
+
+	// R4-B1: non-ASCII punctuation delimits like ASCII punctuation in both scrubbers
+	const uniCases: Array<[string, string]> = [
+		["“src/a.ts”", "“[redacted-path]”"],
+		["‘src/a.ts’", "‘[redacted-path]’"],
+		["«src/a.ts»", "«[redacted-path]»"],
+		["（src/a.ts）", "（[redacted-path]）"],
+		["src/a.ts—x", "[redacted-path]—x"],
+		["src/a.ts…", "[redacted-path]…"],
+		["src/a.ts’s", "[redacted-path]’s"],
+		["src/a.ts。", "[redacted-path]。"],
+		["src/a.ts、x", "[redacted-path]、x"],
+		["src/a.ts→x", "[redacted-path]→x"],
+		["→src/a.ts", "→[redacted-path]"],
+		["•src/a.ts", "•[redacted-path]"],
+		["🚀src/a.ts🚀", "🚀[redacted-path]🚀"],
+	];
+	for (const [input, expected] of uniCases) {
+		assert.equal(sanitizeOutputText(input, 1000, blocked, tokens), expected, `output failed on ${input}`);
+		assert.equal(sanitizeOperatorText(input, 1000, blocked, tokens), expected, `operator failed on ${input}`);
+	}
+
+	// R4-B1: ASCII word boundaries and non-ASCII letters still extend words (must stay untouched)
+	const nonMatches = "mysrc/a.tsx src/a.tsx xsrc/a.ts src/a.ts.bak src/a.tsfoo a.ts foo:src/a.ts ésrc/a.ts src/a.tsé e\u0301src/a.ts";
+	assert.equal(sanitizeOutputText(nonMatches, 1000, blocked, tokens), nonMatches);
+	assert.equal(sanitizeOperatorText(nonMatches, 1000, blocked, tokens), nonMatches);
+
+	// R4-B1: hasArtifactDelim agrees with scanning on non-ASCII punctuation / surrogate halves
+	assert.deepEqual(collectArtifactPathTokens([{ path: "src/a—b.ts" }, { path: "src/🚀.ts" }], cwd), []);
+
+	// N1: leading @, #, &, % prefixes redact while preserving prefix and leaving foo:src/a.ts untouched
+	const sigilInput = "@src/a.ts @src/a.ts:12 #src/a.ts &src/a.ts %src/a.ts @file:src/a.ts:3 foo:src/a.ts";
+	const sigilExpected = "@[redacted-path] @[redacted-path]:12 #[redacted-path] &[redacted-path] %[redacted-path] @file:[redacted-path]:3 foo:src/a.ts";
+	assert.equal(sanitizeOutputText(sigilInput, 1000, blocked, tokens), sigilExpected);
+	assert.equal(sanitizeOperatorText(sigilInput, 1000, blocked, tokens), sigilExpected);
+
+	// N2: $ and ^ split chars, plus first .digit split for multi-segment .1.2 / .1.1.1
+	const n2Tokens = collectArtifactPathTokens(
+		[{ path: "src/a.ts" }, { path: "a/b.ts" }, { path: "src/v1" }],
+		cwd,
+	);
+	const n2Input = "src/a.ts$x src/a.ts^x src/a.ts.1.2 a/b.ts.1.1.1 src/v1.2.3";
+	const n2Expected = "[redacted-path]$x [redacted-path]^x [redacted-path].1.2 [redacted-path].1.1.1 [redacted-path].2.3";
+	assert.equal(sanitizeOutputText(n2Input, 1000, blocked, n2Tokens), n2Expected);
+	assert.equal(sanitizeOperatorText(n2Input, 1000, blocked, n2Tokens), n2Expected);
+	const n2Untouched = "a/b.tsx.1 src/a.ts.bak a/b.ts.x1 a/b.ts.bak.1";
+	assert.equal(sanitizeOutputText(n2Untouched, 1000, blocked, n2Tokens), n2Untouched);
+	assert.equal(sanitizeOperatorText(n2Untouched, 1000, blocked, n2Tokens), n2Untouched);
+
+	// N2 perf: 200k runs of $, ^, and dots stay linear
+	const matcher = compileArtifactRedactionMatcher(n2Tokens);
+	const t0 = performance.now();
+	for (const unit of ["$", "^", ".", "src/a.ts$x "]) {
+		const big = unit.repeat(Math.ceil(200_000 / unit.length)).slice(0, 200_000);
+		sanitizeOutputText(big, 200_000, blocked, matcher);
+		sanitizeOperatorText(big, 1000, blocked, matcher);
+	}
+	assert.ok(performance.now() - t0 < 500, "200k split-char run took too long");
+
+	// N3: dotfiles >=3 chars and 1-char stem with >=2-letter extension; keep x.y / a.c / .a / .12 out
+	const n3Tokens = collectArtifactPathTokens(
+		[{ path: ".env" }, { path: ".gitignore" }, { path: "x.py" }, { path: "a.ts" }, { path: "a.c" }, { path: "e.g" }, { path: "i.e" }, { path: "v1.2" }, { path: "x.12" }, { path: ".a" }, { path: ".12" }],
+		cwd,
+	);
+	assert.equal(
+		sanitizeOutputText(".env .gitignore x.py a.ts a.c e.g i.e v1.2 x.12 .a .12", 1000, blocked, n3Tokens),
+		"[redacted-path] [redacted-path] [redacted-path] [redacted-path] a.c e.g i.e v1.2 x.12 .a .12",
+	);
+});
+
+test("GET /api/factories/:id/output and /live redact R3-B1 path:line/#L/@/file: forms across all fields and stay fast on spaced artifacts (R3-B2)", async t => {
+	const { writeFileSync } = await import("node:fs");
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_R3_PROMPT",
+		agents: [
+			{ node_id: "lineref", persona: "builder", sub_task: "PRIVATE_R3_LINE" },
+			{ node_id: "spaced", persona: "builder", sub_task: "PRIVATE_R3_SPACED" },
+		],
+	};
+	const fac = ops({ action: "publish", name: "r3-fixes-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-r3-fixes" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "r3-ref", brief: "PRIVATE_R3_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const entryOf = (nodeId: string) => launched.manifest.pane_manifest.find(e => e.node_id === nodeId)!;
+	const cfgOf = (e: ReturnType<typeof entryOf>) => readJson<WorkerConfig>(join(dir, `${e.instance_id}.config.json`));
+
+	// R3-B1: path:line, path:line:col, path#L5, path@HEAD, file:path across summary, detail, lists, outputs, artifact description, and /live summary
+	const lineEntry = entryOf("lineref");
+	atomicJson(
+		resultPath(dir, lineEntry.instance_id),
+		completionRecord(
+			cfgOf(lineEntry),
+			{
+				agent_name: lineEntry.persona_name,
+				node_id: "lineref",
+				status: "success",
+				summary: "Fixed src/PRIV_R3.ts:12 and src/PRIV_R3.ts:12:3 and src/PRIV_R3.ts#L5 and src/PRIV_R3.ts@HEAD and file:src/PRIV_R3.ts",
+				detail: "Details: src/PRIV_R3.ts:12 src/PRIV_R3.ts:12:3 src/PRIV_R3.ts#L5 src/PRIV_R3.ts@HEAD file:src/PRIV_R3.ts; keep mysrc/PRIV_R3.tsx src/PRIV_R3.ts.bak",
+				verification: [{ check_id: "chk src/PRIV_R3.ts:12", result: "pass", reason: "verified src/PRIV_R3.ts#L5 and file:src/PRIV_R3.ts" }],
+				warnings: ["warn src/PRIV_R3.ts:12:3 and src/PRIV_R3.ts@HEAD"],
+				next_steps: ["next file:src/PRIV_R3.ts and src/PRIV_R3.ts:99"],
+				outputs: { ref: "src/PRIV_R3.ts:12", anchor: "src/PRIV_R3.ts#L5", rev: "src/PRIV_R3.ts@HEAD", uri: "file:src/PRIV_R3.ts", safe: "src/PRIV_R3.tsx" },
+				artifacts: [{ type: "file", path: "src/PRIV_R3.ts", description: "desc src/PRIV_R3.ts:12 src/PRIV_R3.ts:12:3 src/PRIV_R3.ts#L5 src/PRIV_R3.ts@HEAD file:src/PRIV_R3.ts" }],
+			},
+			"sent",
+			"2026-01-01T00:00:01.000Z",
+		),
+	);
+
+	// R3-B2: route8-shape 339 KB record with 20 spaced prefix-sharing artifacts and long repeating text
+	const repeatTxt = "a ".repeat(2000);
+	const spacedEntry = entryOf("spaced");
+	writeFileSync(
+		resultPath(dir, spacedEntry.instance_id),
+		JSON.stringify(
+			completionRecord(
+				cfgOf(spacedEntry),
+				{
+					agent_name: spacedEntry.persona_name,
+					node_id: "spaced",
+					status: "success",
+					summary: repeatTxt,
+					detail: "a ".repeat(20_000),
+					outputs: { k: "a ".repeat(20_000) },
+					warnings: Array.from({ length: 20 }, () => repeatTxt),
+					next_steps: Array.from({ length: 20 }, () => repeatTxt),
+					artifacts: Array.from({ length: 20 }, (_, i) => ({
+						type: "file",
+						path: `${"a ".repeat(350)}/z${i}`,
+						description: repeatTxt,
+					})),
+				},
+				"sent",
+				"2026-01-01T00:00:01.000Z",
+			),
+		),
+	);
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const tLive0 = performance.now();
+			const liveRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
+			const liveMs = performance.now() - tLive0;
+			assert.equal(liveRes.status, 200);
+			const liveText = await liveRes.text();
+			assert.ok(liveMs < 1000, `/live with spaced artifacts took ${liveMs.toFixed(0)}ms`);
+			const live = JSON.parse(liveText);
+			const liveLine = live.graph.nodes.find((n: any) => n.id === "lineref");
+			assert.equal(
+				liveLine.current_attempt.summary,
+				"Fixed [redacted-path]:12 and [redacted-path]:12:3 and [redacted-path]#L5 and [redacted-path]@HEAD and file:[redacted-path]",
+			);
+
+			const lineOutRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=lineref`);
+			assert.equal(lineOutRes.status, 200);
+			const lineOutText = await lineOutRes.text();
+			const lineOut = JSON.parse(lineOutText);
+			const att = lineOut.latest_attempt;
+			assert.equal(
+				att.summary,
+				"Fixed [redacted-path]:12 and [redacted-path]:12:3 and [redacted-path]#L5 and [redacted-path]@HEAD and file:[redacted-path]",
+			);
+			assert.equal(
+				att.detail,
+				"Details: [redacted-path]:12 [redacted-path]:12:3 [redacted-path]#L5 [redacted-path]@HEAD file:[redacted-path]; keep mysrc/PRIV_R3.tsx src/PRIV_R3.ts.bak",
+			);
+			assert.match(att.verification.items[0].reason, /\[redacted-path\]#L5 and file:\[redacted-path\]/);
+			assert.equal(att.warnings.items[0], "warn [redacted-path]:12:3 and [redacted-path]@HEAD");
+			assert.equal(att.next_steps.items[0], "next file:[redacted-path] and [redacted-path]:99");
+			assert.ok(att.outputs_text.includes('"[redacted-path]:12"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path]#L5"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path]@HEAD"'));
+			assert.ok(att.outputs_text.includes('"file:[redacted-path]"'));
+			assert.ok(att.outputs_text.includes('"src/PRIV_R3.tsx"'));
+			assert.equal(
+				att.artifacts.items[0].description,
+				"desc [redacted-path]:12 [redacted-path]:12:3 [redacted-path]#L5 [redacted-path]@HEAD file:[redacted-path]",
+			);
+			assert.equal("path" in att.artifacts.items[0], false);
+			assert.equal(lineOutText.includes("src/PRIV_R3.ts:"), false);
+			assert.equal(lineOutText.includes("src/PRIV_R3.ts#"), false);
+			assert.equal(lineOutText.includes("src/PRIV_R3.ts@"), false);
+			assert.equal(lineOutText.includes("file:src/PRIV_R3.ts"), false);
+
+			const tSpaced0 = performance.now();
+			const spacedRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=spaced`);
+			const spacedMs = performance.now() - tSpaced0;
+			assert.equal(spacedRes.status, 200);
+			const spacedText = await spacedRes.text();
+			assert.ok(spacedMs < 1000, `/output with spaced artifacts took ${spacedMs.toFixed(0)}ms`);
+			const spacedBody = JSON.parse(spacedText);
+			assert.equal("path" in spacedBody.latest_attempt.artifacts.items[0], false);
+			assert.equal(spacedText.includes("/z0"), false);
+		},
+	);
+});
+
+test("GET /api/factories/:id/output and /live redact R4-B1 non-ASCII punctuation, N1 @, N2 $/^/.1.2, and N3 .env/x.py across all fields", async t => {
+	const f = serviceFixture(t, ["builder"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_R4_PROMPT",
+		agents: [
+			{ node_id: "uni", persona: "builder", sub_task: "PRIVATE_R4_UNI" },
+		],
+	};
+	const fac = ops({ action: "publish", name: "r4-fixes-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-r4-fixes" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "r4-ref", brief: "PRIVATE_R4_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const uniEntry = launched.manifest.pane_manifest.find(e => e.node_id === "uni")!;
+	const uniCfg = readJson<WorkerConfig>(join(dir, `${uniEntry.instance_id}.config.json`));
+
+	const textPayload = "“src/a.ts” src/a.ts—x src/a.ts… （src/a.ts） src/a.ts。 @src/a.ts src/a.ts$x src/a.ts^x src/a.ts.1.2 .env x.py | keep ésrc/a.ts src/a.tsé foo:src/a.ts mysrc/a.tsx src/a.ts.bak";
+	const expectedRedacted = "“[redacted-path]” [redacted-path]—x [redacted-path]… （[redacted-path]） [redacted-path]。 @[redacted-path] [redacted-path]$x [redacted-path]^x [redacted-path].1.2 [redacted-path] [redacted-path] | keep ésrc/a.ts src/a.tsé foo:src/a.ts mysrc/a.tsx src/a.ts.bak";
+
+	atomicJson(
+		resultPath(dir, uniEntry.instance_id),
+		completionRecord(
+			uniCfg,
+			{
+				agent_name: uniEntry.persona_name,
+				node_id: "uni",
+				status: "success",
+				summary: textPayload,
+				detail: textPayload,
+				verification: [{ check_id: "chk-uni", result: "pass", reason: textPayload }],
+				warnings: [textPayload],
+				next_steps: [textPayload],
+				outputs: {
+					quoted: "“src/a.ts”",
+					dash: "src/a.ts—x",
+					ellipsis: "src/a.ts…",
+					fullwidth: "（src/a.ts）",
+					cjk: "src/a.ts。",
+					mention: "@src/a.ts",
+					dollar: "src/a.ts$x",
+					caret: "src/a.ts^x",
+					multiDot: "src/a.ts.1.2",
+					dotfile: ".env",
+					shortStem: "x.py",
+					keepAccent: "ésrc/a.ts src/a.tsé",
+				},
+				artifacts: [
+					{ type: "file", path: "src/a.ts", description: textPayload },
+					{ type: "file", path: ".env", description: "dotfile .env" },
+					{ type: "file", path: "x.py", description: "short x.py" },
+				],
+			},
+			"sent",
+			"2026-01-01T00:00:01.000Z",
+		),
+	);
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const liveRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
+			assert.equal(liveRes.status, 200);
+			const live = await liveRes.json() as any;
+			const liveUni = live.graph.nodes.find((n: any) => n.id === "uni");
+			assert.equal(liveUni.current_attempt.summary, expectedRedacted);
+
+			const outRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=uni`);
+			assert.equal(outRes.status, 200);
+			const outText = await outRes.text();
+			const out = JSON.parse(outText);
+			const att = out.latest_attempt;
+			assert.equal(att.summary, expectedRedacted);
+			assert.equal(att.detail, expectedRedacted);
+			assert.equal(att.verification.items[0].reason, expectedRedacted);
+			assert.equal(att.warnings.items[0], expectedRedacted);
+			assert.equal(att.next_steps.items[0], expectedRedacted);
+			assert.equal(att.artifacts.items[0].description, expectedRedacted);
+			assert.equal(att.artifacts.items[1].description, "dotfile [redacted-path]");
+			assert.equal(att.artifacts.items[2].description, "short [redacted-path]");
+			assert.ok(att.outputs_text.includes('"“[redacted-path]”"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path]—x"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path]…"'));
+			assert.ok(att.outputs_text.includes('"（[redacted-path]）"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path]。"'));
+			assert.ok(att.outputs_text.includes('"@[redacted-path]"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path]$x"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path]^x"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path].1.2"'));
+			assert.ok(att.outputs_text.includes('"[redacted-path]"'));
+			assert.ok(att.outputs_text.includes('"ésrc/a.ts src/a.tsé"'));
+			for (const art of att.artifacts.items) {
+				assert.equal("path" in art, false);
+			}
+			for (const leakedForm of ["“src/a.ts”", "src/a.ts—", "src/a.ts…", "（src/a.ts）", "src/a.ts。", "@src/a.ts", "src/a.ts$", "src/a.ts^", "src/a.ts.1.2", "\".env\"", "\"x.py\""]) {
+				assert.equal(outText.includes(leakedForm), false, `/output leaked ${leakedForm}`);
+			}
 		},
 	);
 });
