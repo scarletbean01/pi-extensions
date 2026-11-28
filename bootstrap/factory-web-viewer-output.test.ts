@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
-import { nodeOutputSnapshot } from "../factory/viewer/output.ts";
+import { enforceOutputResponseBudget, nodeOutputSnapshot } from "../factory/viewer/output.ts";
 import { sanitizeOperatorText, sanitizeOutputText } from "../factory/viewer/sanitize.ts";
 import { createViewerReader } from "../factory/viewer/server.ts";
 import { atomicJson, completionRecord, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
@@ -205,20 +205,54 @@ test("sanitizeOutputText and sanitizeOperatorText handle 200k hostile inputs in 
 		const padNeeded = 4 * cap - 7 - vsLen;
 		if (padNeeded >= 0) {
 			const input = `${vsPrefix}${"a".repeat(padNeeded)} ~alice/.ssh/id_rsa`;
-			const totalCp = Array.from(input.replace(/\uFE0F/g, "")).length;
+			const scrubbedCp = Array.from(input.replace(/\uFE0F/g, "").replace("~alice/.ssh/id_rsa", "[redacted-path]")).length;
 			const out = sanitizeOutputText(input, cap, []);
 			assert.equal(out.includes("~alice"), false, `cap=${cap} leaked ~alice: ${out}`);
 			assert.equal(out.includes("~al"), false, `cap=${cap} leaked ~al: ${out}`);
 			const m = /… \[truncated, (\d+) characters? omitted\]$/.exec(out);
 			assert.ok(m, `cap=${cap} missing marker`);
 			const kept = Array.from(out).length - Array.from(m[0]).length;
-			assert.equal(kept + Number(m[1]), totalCp, `cap=${cap} N3-b marker arithmetic mismatch`);
+			assert.equal(kept + Number(m[1]), scrubbedCp, `cap=${cap} N3-b marker arithmetic mismatch`);
 		}
 		const vsPad = "\uFE0F".repeat(4 * cap - 10);
 		const segInput = `${vsPad} /secretdir/inner/file`;
 		const segOut = sanitizeOutputText(segInput, cap, []);
 		assert.equal(segOut.includes("/secret"), false, `cap=${cap} leaked /secret: ${segOut}`);
 		assert.equal(segOut.includes("secretdir"), false, `cap=${cap} leaked secretdir: ${segOut}`);
+	}
+
+	// B1: no-space N3-b reproducers for ~alice/..., /secretdir/..., C:\Users\..., file:///... across caps and k
+	const leakPatterns = ["~alice", "~al", "/secretdir", "secretdir", "Users", "/etc", "bob", "alice"];
+	for (const cap of [50, 200, 1000, 8000]) {
+		for (const k of [0, 1, 5, 7, 10, 15, 25]) {
+			for (const tail of ["~alice/.ssh/id", "/home/alice/secret", "/secretdir/inner/file", "C:\\Users\\bob\\x", "file:///etc/pw"]) {
+				for (const fillerChar of ["\uFE0F", "§"]) {
+					const input = `${fillerChar.repeat(Math.max(0, 4 * cap - k))}${tail} end`;
+					const strippedCp = Array.from(input.replace(/[\uFE0E\uFE0F]/g, "")).length;
+					const out = sanitizeOutputText(input, cap, ["/home/alice"]);
+					const op = sanitizeOperatorText(input, cap, ["/home/alice"]);
+					assert.ok(Array.from(out).length <= cap, `B1 output exceeded cap=${cap}`);
+					assert.ok(Array.from(op).length <= cap, `B1 operator exceeded cap=${cap}`);
+					assert.equal(out.isWellFormed(), true);
+					assert.equal(op.isWellFormed(), true);
+					for (const bad of leakPatterns) {
+						assert.equal(out.includes(bad), false, `B1 output leaked ${JSON.stringify(bad)} (cap=${cap}, k=${k}, tail=${tail}, filler=${JSON.stringify(fillerChar)}): ${out}`);
+						assert.equal(op.includes(bad), false, `B1 operator leaked ${JSON.stringify(bad)} (cap=${cap}, k=${k}, tail=${tail}, filler=${JSON.stringify(fillerChar)}): ${op}`);
+					}
+					const m = /… \[truncated, (\d+) characters? omitted\]$/.exec(out);
+					if (m) {
+						const kept = Array.from(out).length - Array.from(m[0]).length;
+						const scrubbedTailInPreBound = fillerChar === "§" && k >= tail.length + 1;
+						const expectedCp = scrubbedTailInPreBound
+							? Array.from(input.replace(/[\uFE0E\uFE0F]/g, "").replace(tail, "[redacted-path]")).length
+							: strippedCp;
+						assert.equal(kept + Number(m[1]), expectedCp, `B1 marker arithmetic mismatch (cap=${cap}, k=${k}, tail=${tail})`);
+					} else {
+						assert.equal(fillerChar, "\uFE0F");
+					}
+				}
+			}
+		}
 	}
 });
 
@@ -1111,7 +1145,7 @@ test("GET /api/factories/:id/output projects verification, warnings, next_steps,
 				node_id: "huge_node",
 				status: "partial",
 				summary: "H".repeat(950),
-				detail: "D".repeat(7950),
+				detail: "€".repeat(7950),
 				verification: Array.from({ length: 20 }, (_, idx) => ({
 					check_id: `huge-chk-${idx}-${"C".repeat(450)}`,
 					result: "pass" as const,
@@ -1343,4 +1377,406 @@ test("GET /api/factories/:id/output matches Live Graph upstream review-closure B
 			assert.ok(typeof out.latest_attempt.disposition_reason === "string" && out.latest_attempt.disposition_reason.length > 0);
 		},
 	);
+});
+
+test("GET /api/factories/:id/output and /live validate/scrub hostile timestamps, causes, signals, relative artifact paths, deep outputs, item caps, corrupt loop identity, and upstream size limits (B2, B3, N1, N2, N3, N5)", async t => {
+	const { writeFileSync } = await import("node:fs");
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_R1_PROMPT",
+		agents: [
+			{ node_id: "art_node", persona: "builder", sub_task: "PRIVATE_R1_ART" },
+			{ node_id: "deep_node", persona: "builder", sub_task: "PRIVATE_R1_DEEP" },
+			{ node_id: "disp_hostile", persona: "builder", sub_task: "PRIVATE_R1_DISP" },
+			{ node_id: "big_ts_node", persona: "builder", sub_task: "PRIVATE_R1_BIGTS" },
+			{
+				node_id: "cmd_hostile",
+				kind: "command",
+				command: process.execPath,
+				args: ["-e", "process.exit(2)"],
+				working_directory: f.cwd,
+				sub_task: "PRIVATE_R1_CMD",
+			},
+			{ node_id: "item_cap_node", persona: "builder", sub_task: "PRIVATE_R1_ITEMS" },
+		],
+	};
+
+	const fac = ops({ action: "publish", name: "r1-hardening-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-r1-hard" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "r1-ref", brief: "PRIVATE_R1_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	revokeManagerAuthority(auth);
+
+	const dir = launched.manifest.session_dir;
+	const entryOf = (nodeId: string) => launched.manifest.pane_manifest.find(e => e.node_id === nodeId)!;
+	const cfgOf = (e: ReturnType<typeof entryOf>) => readJson<WorkerConfig>(join(dir, `${e.instance_id}.config.json`));
+
+	// B2 + B3: art_node with relative artifact path in description/summary/detail/outputs, hostile completed_at, hostile verification fields
+	const artEntry = entryOf("art_node");
+	atomicJson(
+		resultPath(dir, artEntry.instance_id),
+		completionRecord(
+			cfgOf(artEntry),
+			{
+				agent_name: artEntry.persona_name,
+				node_id: "art_node",
+				status: "success",
+				summary: "Updated src/PRIVREL_ART.ts and ./src/PRIVREL_ART.ts",
+				detail: "Changed src\\PRIVREL_ART.ts in detail",
+				artifacts: [
+					{
+						type: "file",
+						path: "src/PRIVREL_ART.ts",
+						action: "modified",
+						description: `Wrote src/PRIVREL_ART.ts, ./src/PRIVREL_ART.ts, src\\PRIVREL_ART.ts, and ${join(f.cwd, "src/PRIVREL_ART.ts")}`,
+					},
+				],
+				outputs: {
+					artifact_ref: "src/PRIVREL_ART.ts",
+					public_rel: "src/PUBLIC_REL_OUT.ts",
+				},
+				verification: [
+					{
+						check_id: "v-hostile",
+						result: "pass",
+						applicability: { p: "/home/alice/PRIV_APP" } as any,
+						scope_kind: "/home/alice/PRIV_SCOPE" as any,
+						completed_at: "/home/alice/PRIV_VCOMP",
+					},
+				],
+			},
+			"sent",
+			"/home/alice/PRIV_COMPLETED_AT",
+		),
+	);
+
+	// N1: deep_node with 6,500-level nested outputs (under 1 MiB) must still render 200 with summary, detail, verification
+	const deepEntry = entryOf("deep_node");
+	const deepRec = JSON.stringify(
+		completionRecord(
+			cfgOf(deepEntry),
+			{
+				agent_name: deepEntry.persona_name,
+				node_id: "deep_node",
+				status: "success",
+				summary: "Deep summary ok",
+				detail: "Deep detail ok",
+				verification: [{ check_id: "deep-chk", result: "pass", applicability: "current", scope_kind: "declared" }],
+				outputs: { nested: "@@DEEP@@" },
+			},
+			"sent",
+			"2026-01-01T00:00:01.000Z",
+		),
+	);
+	writeFileSync(resultPath(dir, deepEntry.instance_id), deepRec.replace('"@@DEEP@@"', `${"[".repeat(6500)}1${"]".repeat(6500)}`));
+
+	// B2: disp_hostile with hostile state, check.evidence, node_id, and recorded_at
+	const dispEntry = entryOf("disp_hostile");
+	atomicJson(
+		dispositionPath(dir, dispEntry.instance_id),
+		dispositionRecord(
+			{ ...dispEntry, task_id: launched.task_id },
+			"blocked",
+			"Blocked reason",
+			[
+				{
+					node_id: "/home/alice/PRIV_CAUSE_NODE",
+					state: "/home/alice/PRIV_STATE" as any,
+					reason: "Cause reason",
+					check: { name: "chk", evidence: { p: "/home/alice/PRIV_EVID" } as any },
+				},
+			],
+			"/home/alice/PRIV_RECORDED_AT",
+		),
+	);
+
+	// B2: big_ts_node with 200,000-char completed_at must not exceed 64 KB response budget
+	const bigTsEntry = entryOf("big_ts_node");
+	atomicJson(
+		resultPath(dir, bigTsEntry.instance_id),
+		completionRecord(
+			cfgOf(bigTsEntry),
+			{ agent_name: bigTsEntry.persona_name, node_id: "big_ts_node", status: "success", summary: "ok", detail: "ok" },
+			"sent",
+			"Z".repeat(200_000),
+		),
+	);
+
+	// B2: cmd_hostile with hostile command_evidence.signal
+	const cmdHostileEntry = entryOf("cmd_hostile");
+	atomicJson(
+		resultPath(dir, cmdHostileEntry.instance_id),
+		completionRecord(
+			cfgOf(cmdHostileEntry),
+			{
+				agent_name: cmdHostileEntry.persona_name,
+				node_id: "cmd_hostile",
+				status: "failure",
+				summary: "Cmd hostile",
+				detail: "Cmd failed",
+				command_evidence: {
+					version: 1,
+					command: process.execPath,
+					args: ["-e", "process.exit(2)"],
+					working_directory: f.cwd,
+					exit_code: null,
+					signal: "/home/alice/PRIV_SIG" as any,
+					started_at: "2026-01-01T00:00:00.000Z",
+					finished_at: "2026-01-01T00:00:01.000Z",
+					duration_ms: 1000,
+					stdout_bytes: 0,
+					stderr_bytes: 0,
+				},
+			},
+			"not_required",
+			"2026-01-01T00:00:01.000Z",
+		),
+	);
+
+	// N2: item_cap_node with verification item and artifact item whose combined fields exceed 500 chars
+	const itemCapEntry = entryOf("item_cap_node");
+	atomicJson(
+		resultPath(dir, itemCapEntry.instance_id),
+		completionRecord(
+			cfgOf(itemCapEntry),
+			{
+				agent_name: itemCapEntry.persona_name,
+				node_id: "item_cap_node",
+				status: "success",
+				summary: "Item cap",
+				detail: "Item cap detail",
+				verification: [
+					{
+						check_id: `chk-${"C".repeat(450)}`,
+						result: "pass",
+						applicability: "current",
+						scope_kind: "declared",
+						completed_at: "2026-01-01T00:00:01.000Z",
+						reason: `rsn-${"R".repeat(450)}`,
+					},
+				],
+				artifacts: [
+					{
+						type: `type-${"T".repeat(120)}`,
+						path: "src/ok.ts",
+						action: `act-${"A".repeat(120)}`,
+						description: `desc-${"D".repeat(450)}`,
+					},
+				],
+			},
+			"sent",
+			"2026-01-01T00:00:01.000Z",
+		),
+	);
+
+	const sentinels = [
+		"PRIVREL_ART",
+		"PRIV_APP",
+		"PRIV_SCOPE",
+		"PRIV_VCOMP",
+		"PRIV_COMPLETED_AT",
+		"PRIV_CAUSE_NODE",
+		"PRIV_STATE",
+		"PRIV_EVID",
+		"PRIV_RECORDED_AT",
+		"PRIV_SIG",
+		"/home/alice",
+	];
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const liveRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
+			assert.equal(liveRes.status, 200);
+			const liveText = await liveRes.text();
+			scanSentinels(liveText, sentinels, "r1 live");
+
+			// art_node: relative artifact path redacted everywhere; public relative output path preserved
+			const artRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=art_node`);
+			assert.equal(artRes.status, 200);
+			const artText = await artRes.text();
+			scanSentinels(artText, sentinels, "r1 art_node");
+			const artOut = JSON.parse(artText);
+			assert.equal("completed_at" in artOut.latest_attempt, false, "invalid completed_at must be omitted");
+			assert.match(artOut.latest_attempt.summary, /\[redacted-path\]/);
+			assert.match(artOut.latest_attempt.detail, /\[redacted-path\]/);
+			assert.match(artOut.latest_attempt.artifacts.items[0].description, /\[redacted-path\]/);
+			assert.match(artOut.latest_attempt.outputs_text, /"public_rel": "src\/PUBLIC_REL_OUT\.ts"/);
+
+			// deep_node: 200 OK with summary, detail, verification, outputs_text
+			const deepRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=deep_node`);
+			assert.equal(deepRes.status, 200);
+			const deepOut = await deepRes.json() as any;
+			assert.equal(deepOut.latest_attempt.evidence, "available");
+			assert.equal(deepOut.latest_attempt.summary, "Deep summary ok");
+			assert.equal(deepOut.latest_attempt.detail, "Deep detail ok");
+			assert.equal(deepOut.latest_attempt.verification.items.length, 1);
+			assert.equal(typeof deepOut.latest_attempt.outputs_text, "string");
+
+			// disp_hostile: causes validated/scrubbed, invalid recorded_at omitted
+			const dispRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=disp_hostile`);
+			assert.equal(dispRes.status, 200);
+			const dispText = await dispRes.text();
+			scanSentinels(dispText, sentinels, "r1 disp_hostile");
+			const dispOut = JSON.parse(dispText);
+			assert.equal("recorded_at" in dispOut.latest_attempt, false, "invalid recorded_at must be omitted");
+			assert.equal(dispOut.latest_attempt.causes.items[0].state, "needs_attention");
+			assert.equal(dispOut.latest_attempt.causes.items[0].check.evidence, "unverified");
+
+			// big_ts_node: <= 64 KB
+			const bigRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=big_ts_node`);
+			assert.equal(bigRes.status, 200);
+			const bigText = await bigRes.text();
+			assert.ok(Buffer.byteLength(bigText, "utf8") <= 64 * 1024, `big_ts_node exceeded 64KB: ${Buffer.byteLength(bigText, "utf8")}`);
+
+			// cmd_hostile: hostile signal scrubbed
+			const cmdRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=cmd_hostile`);
+			assert.equal(cmdRes.status, 200);
+			const cmdText = await cmdRes.text();
+			scanSentinels(cmdText, sentinels, "r1 cmd_hostile");
+
+			// N2: total code points of verification item and artifact item <= 500
+			const itemRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=item_cap_node`);
+			assert.equal(itemRes.status, 200);
+			const itemOut = await itemRes.json() as any;
+			const vItem = itemOut.latest_attempt.verification.items[0];
+			const vTotalCp = Array.from(
+				`${vItem.check_id}${vItem.result}${vItem.applicability}${vItem.scope_kind}${vItem.completed_at ?? ""}${vItem.reason ?? ""}`,
+			).length;
+			assert.ok(vTotalCp <= 500, `verification item total code points ${vTotalCp} exceeded 500`);
+			const aItem = itemOut.latest_attempt.artifacts.items[0];
+			const aTotalCp = Array.from(`${aItem.type}${aItem.action ?? ""}${aItem.description ?? ""}`).length;
+			assert.ok(aTotalCp <= 500, `artifact item total code points ${aTotalCp} exceeded 500`);
+		},
+	);
+
+	// N3 + N5: review loop with corrupt attempt-2 result (N3 identity masked) and >1 MiB upstream record (N5 matches /live)
+	const fLoop = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath2 = join(fLoop.root, "factories.sqlite");
+	const coordinationPath2 = join(fLoop.root, "factory-coordination.sqlite");
+	const viewerEnv2 = { PATH: join(fLoop.root, "bin"), PI_BOOTSTRAP_STATE_DIR: fLoop.stateDir };
+	const ops2 = factoryOperations(statePath2, fLoop.service, { coordinationPath: coordinationPath2 });
+	const loopDraft: GenerateRequest = {
+		project_cwd: fLoop.cwd,
+		topology: "graph",
+		task: "PRIVATE_LOOP_R1",
+		agents: [
+			{ node_id: "build", persona: "builder", sub_task: "PRIVATE_BUILD" },
+			{
+				node_id: "review",
+				persona: "reviewer",
+				depends_on: ["build"],
+				sub_task: "PRIVATE_REV",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 1, on_exhausted: "failed" },
+			},
+			{ node_id: "deploy", persona: "builder", depends_on: ["review"], sub_task: "PRIVATE_DEP" },
+		],
+	};
+	const fac2 = ops2({ action: "publish", name: "r1-loop-fac", draft: loopDraft, sessionModel });
+	const auth2 = createManagerAuthority({ pi_session_id: "sess-r1-loop" });
+	ops2({ action: "resume", factory_id: fac2.factory_id, authority: auth2 });
+	ops2({ action: "submit", factory_id: fac2.factory_id, authority: auth2, reference: "r1-loop-ref", brief: "PRIVATE_BRIEF" });
+	const launched2 = await ops2({ action: "launch", factory_id: fac2.factory_id, authority: auth2 });
+	revokeManagerAuthority(auth2);
+
+	const dir2 = launched2.manifest.session_dir;
+	const be = launched2.manifest.pane_manifest.find(e => e.node_id === "build")!;
+	const re = launched2.manifest.pane_manifest.find(e => e.node_id === "review")!;
+	const wm = { provider: "test-provider", id: "test-model" };
+	const buildW = workerFromConfig(t, join(dir2, `${be.instance_id}.config.json`), { model: wm });
+	const reviewW = workerFromConfig(t, join(dir2, `${re.instance_id}.config.json`), { model: wm });
+	await buildW.start();
+	await reviewW.start();
+	await buildW.beforeStart();
+	await reviewW.beforeStart();
+	await buildW.complete({ status: "success", summary: "B1", detail: "D1" });
+	await reviewW.beforeStart(notification(buildW, reviewW));
+	await reviewW.deliverFollowUps();
+	await reviewW.complete({ status: "success", summary: "R1", detail: "Revise", outputs: { verdict: "revise" } });
+	await buildW.beforeStart(notification(reviewW, buildW));
+	await buildW.deliverFollowUps();
+	await buildW.complete({ status: "success", summary: "B2", detail: "D2" });
+	await reviewW.beforeStart(notification(buildW, reviewW));
+	await reviewW.deliverFollowUps();
+	await reviewW.complete({ status: "success", summary: "R2", detail: "Exhausted", outputs: { verdict: "revise" } });
+
+	// N5: Make review's progress.json > 1 MiB (valid JSON padded with spaces) and verify /live and /output?node=deploy agree on Blocked
+	const revProgPath = join(dir2, `${re.instance_id}.progress.json`);
+	const revProgText = JSON.stringify({
+		attempt_id: `${re.instance_id}.2`,
+		token: launched2.manifest.token,
+		updated_at: Date.now(),
+		started_at: Date.now() - 1000,
+		state: "completed",
+	});
+	writeFileSync(revProgPath, `${revProgText}${" ".repeat(1_200_000)}`);
+
+	// N3: Corrupt build attempt 2 result and verify /output masks attempt_id and attempt_number to 1 like /live
+	writeFileSync(resultPath(dir2, `${be.instance_id}.2`), "{corrupt");
+
+	await verifyReadOnlyViewer(
+		{ stateDirs: fLoop.root, viewerOptions: { statePath: statePath2, coordinationPath: coordinationPath2, env: viewerEnv2, home: fLoop.home } },
+		async viewer => {
+			const live = await (await fetch(`${viewer.url}/api/factories/${fac2.factory_id}/live`)).json() as any;
+			const liveBuild = live.graph.nodes.find((n: any) => n.id === "build");
+			const liveDeploy = live.graph.nodes.find((n: any) => n.id === "deploy");
+
+			const outBuild = await (await fetch(`${viewer.url}/api/factories/${fac2.factory_id}/output?node=build`)).json() as any;
+			assert.equal(outBuild.latest_attempt.evidence, "unavailable");
+			assert.equal(outBuild.latest_attempt.attempt_number, liveBuild.current_attempt.attempt_number);
+			assert.equal(outBuild.latest_attempt.attempt_number, 1);
+			assert.equal(typeof outBuild.latest_attempt.attempt_id, "object");
+			assert.equal(outBuild.latest_attempt.attempt_id.absence, "evidence unavailable");
+
+			const outDeploy = await (await fetch(`${viewer.url}/api/factories/${fac2.factory_id}/output?node=deploy`)).json() as any;
+			assert.equal(liveDeploy.status, "blocked");
+			assert.equal(outDeploy.latest_attempt.status, liveDeploy.status);
+			assert.equal(outDeploy.latest_attempt.status_text, liveDeploy.status_text);
+		},
+	);
+
+	// B2 hard budget fallback: when trims cannot bring the response under maxBytes, latest_attempt collapses to an evidence-unavailable stub
+	const overBudget = enforceOutputResponseBudget(
+		{
+			factory_id: fac.factory_id,
+			node_id: "art_node",
+			evidence: "available",
+			latest_attempt: {
+				attempt_id: "a1-art_node.1",
+				attempt_number: 1,
+				max_attempts: 1,
+				status: "succeeded",
+				status_text: "Succeeded",
+				evidence: "available",
+				summary: "S".repeat(500),
+				detail: "D".repeat(500),
+				disposition_reason: "R".repeat(500),
+				error_message: "M".repeat(500),
+				command: {
+					exit_code: 0,
+					signal: null,
+					duration_ms: 1000,
+					stdout_bytes: 500,
+					stderr_bytes: 500,
+					stdout_excerpt: "O".repeat(500),
+					stderr_excerpt: "E".repeat(500),
+					spawn_error: "X".repeat(500),
+					termination_error: "Y".repeat(500),
+				},
+			},
+		},
+		450,
+	);
+	assert.ok(Buffer.byteLength(JSON.stringify(overBudget), "utf8") <= 450);
+	assert.equal(overBudget.evidence, "unavailable");
+	assert.equal((overBudget.latest_attempt as any).absence, "evidence unavailable");
 });

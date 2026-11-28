@@ -1,5 +1,5 @@
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import type { FactoryDeletionInfo } from "../operations.ts";
 
 const CONTROL_AND_FORMAT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u034F\u115F\u1160\u180B-\u180D\u2800\u3164\uFE00-\uFE0D\uFFA0\u2028\u2029\u{E0100}-\u{E01EF}\p{Cf}]+/gu;
@@ -16,6 +16,7 @@ const TRAILING_SENTENCE_PUNCTUATION = new Set([".", ",", ";", ":", "!", "?"]);
 const PRE_BOUND_MULTIPLIER = 4;
 const PRE_BOUND_TRIM_LOOKBACK = 4096;
 const PRE_BOUND_DELIM_RE = /[\s"'<>()\[\]{}`*,;|]/;
+const INCOMPLETE_TRAILING_PATH_RE = /(?:^|[^A-Za-z0-9._~/-])(\/[^/]*|~[A-Za-z0-9._-]*[\\/]?|file:\/{0,2}|[A-Za-z]:[\\/]?)$/;
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -59,16 +60,103 @@ function preBoundCodePoints(wellFormed: string, maxCodePoints: number): { bounde
 	}
 	let cut = i;
 	if (!PRE_BOUND_DELIM_RE.test(wellFormed[i]!)) {
-		const floor = Math.max(0, i - PRE_BOUND_TRIM_LOOKBACK);
+		const floor = Math.max(Math.ceil(i / 2), i - PRE_BOUND_TRIM_LOOKBACK);
+		let foundDelimiter = false;
 		for (let k = i - 1; k >= floor; k--) {
 			if (PRE_BOUND_DELIM_RE.test(wellFormed[k]!)) {
 				cut = k + 1;
+				foundDelimiter = true;
 				break;
 			}
+		}
+		if (!foundDelimiter) {
+			cut = floor;
+			if (cut > 0) {
+				const code = wellFormed.charCodeAt(cut);
+				const prev = wellFormed.charCodeAt(cut - 1);
+				if (code >= 0xdc00 && code <= 0xdfff && prev >= 0xd800 && prev <= 0xdbff) {
+					cut -= 1;
+				}
+			}
+		}
+	}
+	if (cut > 0) {
+		const tail = wellFormed.slice(Math.max(0, cut - 512), cut);
+		const incomplete = INCOMPLETE_TRAILING_PATH_RE.exec(tail);
+		if (incomplete && incomplete[1]) {
+			cut -= incomplete[1].length;
 		}
 	}
 	const droppedCodePoints = countCodePoints(wellFormed.slice(cut));
 	return { bounded: wellFormed.slice(0, cut), droppedCodePoints };
+}
+
+/**
+ * Collect normalized forms (literal, no `./`, separator-swapped, JSON-escaped, and project-joined absolute)
+ * of recorded artifact paths so relative artifact paths are redacted alongside absolute paths.
+ */
+export function collectArtifactPathTokens(
+	artifacts: ReadonlyArray<{ path?: unknown }> | undefined,
+	projectCwd?: string,
+): string[] {
+	if (!Array.isArray(artifacts) || artifacts.length === 0) return [];
+	const tokens = new Set<string>();
+	const addForm = (candidate: string) => {
+		const t = candidate.trim();
+		if (t.length < 2 || t === "." || t === ".." || t === "./" || t === ".\\") return;
+		tokens.add(t);
+		const jsonEscaped = t.replace(/\\/g, "\\\\");
+		if (jsonEscaped !== t) tokens.add(jsonEscaped);
+	};
+	for (const art of artifacts) {
+		if (!art || typeof art !== "object" || typeof art.path !== "string") continue;
+		const raw = art.path.trim();
+		if (!raw) continue;
+		addForm(raw);
+		addForm(raw.replace(/\\/g, "/"));
+		addForm(raw.replace(/\//g, "\\"));
+		const noDot = raw.replace(/^(?:\.[\\/])+/, "");
+		if (noDot) {
+			addForm(noDot);
+			const forward = noDot.replace(/\\/g, "/");
+			const backward = noDot.replace(/\//g, "\\");
+			addForm(forward);
+			addForm(backward);
+			if (!isAbsolute(noDot) && !/^[A-Za-z]:[\\/]/.test(noDot)) {
+				addForm(`./${forward}`);
+				addForm(`.\\${backward}`);
+				if (projectCwd) {
+					const abs = resolve(projectCwd, forward);
+					addForm(abs);
+					addForm(abs.replace(/\\/g, "/"));
+					addForm(abs.replace(/\//g, "\\"));
+				}
+			} else if (projectCwd) {
+				const rel = relative(resolve(projectCwd), resolve(raw));
+				if (rel && !rel.startsWith("..") && !isAbsolute(rel) && rel !== ".") {
+					const relFwd = rel.replace(/\\/g, "/");
+					const relBwd = rel.replace(/\//g, "\\");
+					addForm(relFwd);
+					addForm(relBwd);
+					addForm(`./${relFwd}`);
+					addForm(`.\\${relBwd}`);
+				}
+			}
+		}
+	}
+	return [...tokens].sort((a, b) => b.length - a.length);
+}
+
+function scrubExtraRedactedTokens(text: string, tokens: readonly string[]): string {
+	if (!tokens.length || !text) return text;
+	let cleaned = text;
+	for (const token of tokens) {
+		if (!cleaned.includes(token)) continue;
+		const leftBoundary = /^[A-Za-z0-9_]/.test(token) ? "(?<![A-Za-z0-9_])" : "";
+		const rightBoundary = /[A-Za-z0-9_]$/.test(token) ? "(?![A-Za-z0-9_])" : "";
+		cleaned = cleaned.replace(new RegExp(`${leftBoundary}${escapeRegExp(token)}${rightBoundary}`, "g"), "[redacted-path]");
+	}
+	return cleaned;
 }
 
 function scrubBlockedAndGenericPaths(text: string, blockedPaths: readonly string[]): string {
@@ -138,16 +226,22 @@ export function reboundOutputText(scrubbed: string, maxChars: number): string {
  * and unsafe control/bidi characters never leak. Note: genuinely path-like question text (tokens
  * starting with `/`, `~`, `file://`, or a drive letter) is conservatively redacted to `[redacted-path]`.
  */
-export function sanitizeOperatorText(value: string, maxChars: number, blockedPaths: readonly string[] = []): string {
+export function sanitizeOperatorText(
+	value: string,
+	maxChars: number,
+	blockedPaths: readonly string[] = [],
+	extraRedactedTokens: readonly string[] = [],
+): string {
 	if (maxChars <= 0) return "";
-	const { bounded, droppedCodePoints } = preBoundCodePoints(value.trimStart().toWellFormed(), maxChars * PRE_BOUND_MULTIPLIER);
+	const stripped = value.toWellFormed().replace(VARIATION_SELECTORS_RE, "");
+	const { bounded, droppedCodePoints } = preBoundCodePoints(stripped.trimStart(), maxChars * PRE_BOUND_MULTIPLIER);
 	const normalized = bounded
-		.replace(VARIATION_SELECTORS_RE, "")
 		.replace(/[\r\n\t]+/g, " ")
 		.replace(CONTROL_AND_FORMAT_RE, " [ctrl] ")
 		.replace(/\s+/g, " ")
 		.trim();
-	const cleaned = scrubBlockedAndGenericPaths(normalized, blockedPaths)
+	const preScrubbed = scrubExtraRedactedTokens(normalized, extraRedactedTokens);
+	const cleaned = scrubBlockedAndGenericPaths(preScrubbed, blockedPaths)
 		.replace(SPOOFED_TRUNCATION_MARKER_RE, "[truncated-marker]");
 	const codePoints = Array.from(cleaned);
 	if (codePoints.length > maxChars || droppedCodePoints > 0) {
@@ -160,11 +254,16 @@ export function sanitizeOperatorText(value: string, maxChars: number, blockedPat
  * Scrub control/bidi/zero-width characters and blocked or generic absolute paths while preserving line breaks,
  * then bound by Unicode code points with an explicit omission-count marker without splitting surrogate pairs.
  */
-export function sanitizeOutputText(value: string, maxChars: number, blockedPaths: readonly string[] = []): string {
+export function sanitizeOutputText(
+	value: string,
+	maxChars: number,
+	blockedPaths: readonly string[] = [],
+	extraRedactedTokens: readonly string[] = [],
+): string {
 	if (maxChars <= 0) return "";
-	const { bounded, droppedCodePoints } = preBoundCodePoints(value.toWellFormed(), maxChars * PRE_BOUND_MULTIPLIER);
+	const stripped = value.toWellFormed().replace(VARIATION_SELECTORS_RE, "");
+	const { bounded, droppedCodePoints } = preBoundCodePoints(stripped, maxChars * PRE_BOUND_MULTIPLIER);
 	const normalized = bounded
-		.replace(VARIATION_SELECTORS_RE, "")
 		.replace(/\r\n?/g, "\n")
 		.replace(CONTROL_AND_FORMAT_RE, (match, offset: number, whole: string) => {
 			const before = offset > 0 ? whole[offset - 1]! : "";
@@ -173,7 +272,8 @@ export function sanitizeOutputText(value: string, maxChars: number, blockedPaths
 			const padRight = after !== "" && !/\s/.test(after) ? " " : "";
 			return `${padLeft}[ctrl]${padRight}`;
 		});
-	const cleaned = scrubBlockedAndGenericPaths(normalized, blockedPaths)
+	const preScrubbed = scrubExtraRedactedTokens(normalized, extraRedactedTokens);
+	const cleaned = scrubBlockedAndGenericPaths(preScrubbed, blockedPaths)
 		.replace(SPOOFED_TRUNCATION_MARKER_RE, "[truncated-marker]");
 	return truncateWithOmissionMarker(Array.from(cleaned), maxChars, droppedCodePoints);
 }

@@ -59,9 +59,46 @@ import {
 	type Disposition,
 	type WorkerCompletion,
 } from "../../bootstrap/session-store.ts";
-import { sanitizeOperatorText } from "./sanitize.ts";
+import { collectArtifactPathTokens, sanitizeOperatorText, sanitizeOutputText as sanitizeOutputTextHelper } from "./sanitize.ts";
 
 export const MAX_EVIDENCE_FILE_BYTES = 1024 * 1024;
+
+const ISO_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+const SIGNAL_RE = /^SIG[A-Z0-9]{1,32}$/;
+const EVIDENCE_STATUSES = new Set<EvidenceStatus>(["passing", "missing", "unverified", "stale", "failed"]);
+
+export function validateIsoTimestamp(value: unknown): string | undefined {
+	if (typeof value !== "string" || value.length > 64 || !ISO_TIMESTAMP_RE.test(value)) {
+		return undefined;
+	}
+	return Number.isFinite(Date.parse(value)) ? value : undefined;
+}
+
+export function validateExecutionState(value: unknown): ExecutionState {
+	return typeof value === "string" && Object.hasOwn(STATUS_TEXT, value)
+		? (value as ExecutionState)
+		: "needs_attention";
+}
+
+export function validateEvidenceStatus(value: unknown): EvidenceStatus {
+	return typeof value === "string" && EVIDENCE_STATUSES.has(value as EvidenceStatus)
+		? (value as EvidenceStatus)
+		: "unverified";
+}
+
+export function sanitizeCommandSignal(
+	signal: unknown,
+	blockedPaths: readonly string[],
+	mode: "operator" | "output",
+): string | null {
+	if (signal === null || signal === undefined) return null;
+	const raw = typeof signal === "string" ? signal : "";
+	if (!raw) return null;
+	if (raw.length <= 35 && SIGNAL_RE.test(raw)) return raw;
+	return mode === "output"
+		? sanitizeOutputTextHelper(raw, 128, blockedPaths)
+		: sanitizeOperatorText(raw, 128, blockedPaths);
+}
 
 export const STATUS_TEXT: Record<ExecutionState, string> = {
 	pending: "Pending",
@@ -158,30 +195,39 @@ export function readBoundedRegularJsonIfExists<T>(
 	}
 }
 
-export function projectCommandOutcome(ev: CommandEvidence | undefined) {
+export function projectCommandOutcome(ev: CommandEvidence | undefined, blockedPaths: readonly string[] = []) {
 	if (!ev) return undefined;
 	return {
 		exit_code: ev.exit_code,
-		signal: ev.signal,
+		signal: sanitizeCommandSignal(ev.signal, blockedPaths, "operator"),
 		duration_ms: ev.duration_ms,
 	};
 }
 
 export function projectCauses(causes: CauseRef[] | undefined, blockedPaths?: readonly string[]): ProjectedCause[] | undefined {
-	if (!causes?.length) return undefined;
-	return causes.map(cause => ({
-		node_id: cause.node_id,
-		state: cause.state,
-		reason: blockedPaths ? sanitizeOperatorText(cause.reason, 1000, blockedPaths) : cause.reason,
-		...(cause.check
-			? {
-				check: {
-					name: blockedPaths ? sanitizeOperatorText(cause.check.name, 500, blockedPaths) : cause.check.name,
-					evidence: cause.check.evidence,
-				},
-			}
-			: {}),
-	}));
+	if (!Array.isArray(causes) || causes.length === 0) return undefined;
+	const projected: ProjectedCause[] = [];
+	for (const cause of causes) {
+		if (!cause || typeof cause !== "object") continue;
+		const rawNodeId = typeof cause.node_id === "string" ? cause.node_id : "";
+		const rawReason = typeof cause.reason === "string" ? cause.reason : "";
+		const rawCheck = cause.check && typeof cause.check === "object" ? cause.check : undefined;
+		const rawCheckName = rawCheck && typeof rawCheck.name === "string" ? rawCheck.name : "";
+		projected.push({
+			node_id: blockedPaths ? sanitizeOperatorText(rawNodeId, 128, blockedPaths) : rawNodeId,
+			state: validateExecutionState(cause.state),
+			reason: blockedPaths ? sanitizeOperatorText(rawReason, 1000, blockedPaths) : rawReason,
+			...(rawCheck
+				? {
+					check: {
+						name: blockedPaths ? sanitizeOperatorText(rawCheckName, 500, blockedPaths) : rawCheckName,
+						evidence: validateEvidenceStatus(rawCheck.evidence),
+					},
+				}
+				: {}),
+		});
+	}
+	return projected.length > 0 ? projected : undefined;
 }
 
 export function assertRunEvidenceConsistent(inspection: Inspection, releases: ReleasedFactoryRun[]) {
@@ -366,10 +412,12 @@ export function resolveNodeObservation(
 	entry: AgentLaunch,
 	byInstanceNodeId: ReadonlyMap<string, string>,
 	blockedPaths: readonly string[],
-	options: { enforceNodeRecordSizeLimit?: boolean } = {},
+	options: { enforceNodeRecordSizeLimit?: boolean; enforceSizeLimitNodeId?: string } = {},
 ): ResolvedNodeObservation {
 	const { session_dir: dir, task_id, review_plan } = manifest;
-	const enforceNodeRecordSizeLimit = Boolean(options.enforceNodeRecordSizeLimit);
+	const enforceNodeRecordSizeLimit = Boolean(
+		options.enforceNodeRecordSizeLimit || options.enforceSizeLimitNodeId === entry.node_id,
+	);
 	const recordMaxBytes = enforceNodeRecordSizeLimit ? MAX_EVIDENCE_FILE_BYTES : Number.POSITIVE_INFINITY;
 	const loop = reviewLoopFor(review_plan, entry.instance_id);
 	const maxAttempts = loop ? loop.max_revisions + 1 : 1;
@@ -510,9 +558,10 @@ export function resolveNodeObservation(
 				throw new Error("Disposition record could not be read");
 			}
 			const disp = parseDisposition(dispRead.value, expected);
-			const command = projectCommandOutcome(disp.command_evidence);
+			const command = projectCommandOutcome(disp.command_evidence, blockedPaths);
 			const rawCauses = projectCauses(disp.causes);
 			const causes = projectCauses(disp.causes, blockedPaths);
+			const recordedAt = validateIsoTimestamp(disp.recorded_at);
 			const closedEdge = loop && blockedReviewForwardEdge(loop, finalization, entry.node_id, {
 				state: disp.state,
 				causes: disp.causes,
@@ -541,7 +590,7 @@ export function resolveNodeObservation(
 				process_state: processState,
 				...(startedAt ? { started_at: startedAt } : {}),
 				...(updatedAt ? { updated_at: updatedAt } : {}),
-				completed_at: disp.recorded_at,
+				...(recordedAt ? { completed_at: recordedAt } : {}),
 				...(command ? { command } : {}),
 				...(loop ? { loop } : {}),
 				...(closedEdge ? { review_rejected_closure: closedEdge } : {}),
@@ -555,22 +604,25 @@ export function resolveNodeObservation(
 				throw new Error("Result record could not be read");
 			}
 			const record = parseCompletion(resRead.value, expected);
+			const artifactTokens = collectArtifactPathTokens(record.result.artifacts, manifest.project_cwd);
 			const scrubbedSummary = record.result.summary
-				? sanitizeOperatorText(record.result.summary, 1000, blockedPaths)
+				? sanitizeOperatorText(record.result.summary, 1000, blockedPaths, artifactTokens)
 				: undefined;
 			const scrubbedResult = scrubbedSummary !== undefined
 				? { ...record.result, summary: scrubbedSummary }
 				: record.result;
-			const command = projectCommandOutcome(record.result.command_evidence);
+			const command = projectCommandOutcome(record.result.command_evidence, blockedPaths);
+			const completedAt = validateIsoTimestamp(record.completed_at);
 			const baseState = executionFromResult(record.result.status).state;
 			const rejection = loop && finalization
 				? finalizedReviewRejection(loop, finalization, entry.node_id, scrubbedResult)
 				: undefined;
 			const attemptStatus = rejection ? rejection.state : baseState;
 			const attemptStatusText = STATUS_TEXT[attemptStatus];
-			const lastVerdict = loop && loop.reviewer === entry.instance_id && record.result.status === "success"
+			const rawLastVerdict = loop && loop.reviewer === entry.instance_id && record.result.status === "success"
 				? (typeof record.result.outputs?.[loop.field] === "string" ? String(record.result.outputs[loop.field]) : undefined)
 				: undefined;
+			const lastVerdict = rawLastVerdict ? sanitizeOperatorText(rawLastVerdict, 128, blockedPaths) : undefined;
 
 			const baseFields = {
 				attempt_id: attemptId,
@@ -586,7 +638,7 @@ export function resolveNodeObservation(
 				process_state: processState,
 				...(startedAt ? { started_at: startedAt } : {}),
 				...(updatedAt ? { updated_at: updatedAt } : {}),
-				completed_at: record.completed_at,
+				...(completedAt ? { completed_at: completedAt } : {}),
 				result_status: record.result.status,
 				...(scrubbedSummary ? { summary: scrubbedSummary } : {}),
 				...(command ? { command } : {}),
@@ -971,7 +1023,7 @@ export function resolveRunObservations(
 	factoryId: string,
 	release: ReleasedFactoryRun,
 	blockedPaths: readonly string[],
-	options: { enforceNodeRecordSizeLimit?: boolean } = {},
+	options: { enforceNodeRecordSizeLimit?: boolean; enforceSizeLimitNodeId?: string } = {},
 ) {
 	const roster = verifyReleaseMatchesDefinition(factoryId, release);
 	const { definition, manifest, bound_version } = release;

@@ -3459,3 +3459,173 @@ test("Ticket 05: Failing reads return HTTP error (never fabricated snapshot), da
     }
   }
 });
+
+test("Live Graph scrubs and bounds disposition, cancel, closure, cause, and admission reasons, fails closed on missing session_dir, and rejects non-regular loop disposition/error files (N6)", { timeout: 30000 }, async t => {
+  const sessionModel = { provider: "test-provider", id: "test-model", thinkingLevel: "medium" as const };
+  const f = serviceFixture(t, ["builder", "reviewer"]);
+  const statePath = join(f.root, "factories.sqlite");
+  const coordinationPath = join(f.root, "factory-coordination.sqlite");
+  const ops = factoryOperations(statePath, f.service, { coordinationPath });
+
+  const draft: GenerateRequest = {
+    project_cwd: f.cwd,
+    topology: "graph",
+    task: "PRIVATE_N6_PROMPT",
+    agents: [
+      { node_id: "build", persona: "builder", sub_task: "PRIVATE_N6_BUILD" },
+      {
+        node_id: "review",
+        persona: "reviewer",
+        depends_on: ["build"],
+        sub_task: "PRIVATE_N6_REV",
+        output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+        decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 1, on_exhausted: "failed" },
+      },
+      { node_id: "deploy", persona: "builder", depends_on: ["review"], sub_task: "PRIVATE_N6_DEP" },
+      { node_id: "disp_n6", persona: "builder", sub_task: "PRIVATE_N6_DISP" },
+      { node_id: "cancel_n6", persona: "builder", sub_task: "PRIVATE_N6_CAN" },
+      { node_id: "adm_src", persona: "builder", sub_task: "PRIVATE_N6_ASRC" },
+      { node_id: "adm_wait", persona: "builder", sub_task: "PRIVATE_N6_AWAIT", depends_on: ["adm_src"], dependency_policy: "require_success" },
+    ],
+  };
+
+  const fac = ops({ action: "publish", name: "n6-live-fac", draft, sessionModel });
+  const auth = createManagerAuthority({ pi_session_id: "sess-n6-live" });
+  ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+  ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "n6-ref", brief: "PRIVATE_N6_BRIEF" });
+  const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+  revokeManagerAuthority(auth);
+
+  const dir = launched.manifest.session_dir;
+  const entryOf = (nodeId: string) => launched.manifest.pane_manifest.find(e => e.node_id === nodeId)!;
+
+  // 1. Disposition reason + cause reason with newlines, project/session paths, and > 1000 chars
+  const dispEntry = entryOf("disp_n6");
+  atomicJson(
+    dispositionPath(dir, dispEntry.attempt_id!),
+    dispositionRecord(
+      { ...dispEntry, task_id: launched.task_id },
+      "blocked",
+      `Line 1 in ${dir}/x\nLine 2 in ${f.cwd}/y ${"D".repeat(1100)}`,
+      [{ node_id: "adm_src", state: "failed", reason: `Cause at ${f.cwd}/c\nline2 ${"C".repeat(1100)}` }],
+      "2026-01-01T00:00:01.000Z",
+    ),
+  );
+
+  // 2. Cancel reason with newlines, path, and > 1000 chars
+  const cancelEntry = entryOf("cancel_n6");
+  atomicJson(cancelPath(dir, cancelEntry.instance_id), {
+    version: 1,
+    identity: { run_id: launched.task_id, node_id: "cancel_n6", persona_name: cancelEntry.persona_name, attempt_id: cancelEntry.attempt_id, instance_id: cancelEntry.instance_id },
+    scope: "node",
+    reason: `Cancelled in ${f.cwd}/stop\n${"K".repeat(1100)}`,
+    requested_at: "2026-01-01T00:00:01.000Z",
+    grace_ms: 5000,
+    force_close_after: "2026-01-01T00:00:06.000Z",
+  });
+
+  // 3. Admission wait reason with upstream failure reason containing path & > 1000 chars
+  const admSrcEntry = entryOf("adm_src");
+  const admSrcCfg = readJson<WorkerConfig>(join(dir, `${admSrcEntry.instance_id}.config.json`));
+  atomicJson(
+    resultPath(dir, admSrcEntry.attempt_id!),
+    completionRecord(admSrcCfg, { agent_name: admSrcEntry.persona_name, node_id: "adm_src", status: "failure", summary: `Failed at ${f.cwd}/src\n${"S".repeat(1100)}`, detail: "d" }, "not_required", "2026-01-01T00:00:01.000Z"),
+  );
+  const admWaitEntry = entryOf("adm_wait");
+  atomicJson(readyPath(dir, admWaitEntry.instance_id), {
+    version: 2,
+    direction_incarnation: "inc-adm-wait",
+    task_id: launched.task_id,
+    token: launched.manifest.token,
+    instance_id: admWaitEntry.instance_id,
+    pid: process.pid,
+    session_id: "sess-adm-wait",
+    name: admWaitEntry.instance_id,
+    model: "test-provider/test-model",
+  });
+  atomicJson(join(dir, `${admWaitEntry.instance_id}.progress.json`), {
+    attempt_id: admWaitEntry.attempt_id,
+    token: launched.manifest.token,
+    updated_at: Date.now(),
+    started_at: Date.now() - 500,
+    state: "waiting",
+  });
+
+  await verifyReadOnlyViewer(
+    { stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home } },
+    async viewer => {
+      const liveRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`);
+      assert.equal(liveRes.status, 200);
+      const liveText = await liveRes.text();
+      assert.equal(liveText.includes(f.cwd), false, "live leaked project_cwd");
+      assert.equal(liveText.includes(dir), false, "live leaked session_dir");
+      const live = JSON.parse(liveText) as any;
+      const byId = new Map<string, any>(live.graph.nodes.map((n: any) => [n.id, n]));
+      for (const id of ["disp_n6", "cancel_n6", "adm_wait"]) {
+        const node = byId.get(id);
+        assert.equal(node.reason.includes("\n"), false, `${id} reason must collapse whitespace`);
+        assert.ok(Array.from(node.reason).length <= 1000, `${id} reason exceeded 1000`);
+      }
+      assert.equal(byId.get("disp_n6").status, "blocked");
+      assert.equal(byId.get("cancel_n6").status, "cancelled");
+      assert.equal(byId.get("adm_wait").status, "waiting");
+      const dispNode = byId.get("disp_n6");
+      assert.equal(dispNode.current_attempt.causes[0].reason.includes("\n"), false);
+      assert.ok(Array.from(dispNode.current_attempt.causes[0].reason).length <= 1000);
+    },
+  );
+
+  // 4. Loop pre-checks reject non-regular .disposition.json and .error.json for any attempt number (FIFO + symlink) without blocking
+  const buildEntry = entryOf("build");
+  const loopErrSym = join(dir, `${buildEntry.instance_id}.2.error.json`);
+  const outsideFile = join(f.root, "outside-loop-err.json");
+  writeFileSync(outsideFile, JSON.stringify({ error: "PRIVATE_LOOP_ERR" }));
+  symlinkSync(outsideFile, loopErrSym);
+
+  const reviewEntry = entryOf("review");
+  const loopDispFifo = dispositionPath(dir, `${reviewEntry.instance_id}.2`);
+  execFileSync("mkfifo", [loopDispFifo]);
+
+  const [fifoLiveResp] = await verifyReadOnlyViewerInChild({
+    stateDirs: f.root,
+    viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home },
+    paths: [`/api/factories/${fac.factory_id}/live`],
+  });
+  assert.equal(fifoLiveResp!.status, 200);
+  assert.equal(fifoLiveResp!.text.includes("PRIVATE_"), false);
+  const fifoLive = JSON.parse(fifoLiveResp!.text) as any;
+  const fifoById = new Map<string, any>(fifoLive.graph.nodes.map((n: any) => [n.id, n]));
+  assert.equal(fifoById.get("build").status, "needs_attention");
+  assert.equal(fifoById.get("review").status, "needs_attention");
+
+  // 5. Missing session directory gives Uncertain instead of Pending
+  await verifyReadOnlyViewer(
+    {
+      stateDirs: f.root,
+      viewerOptions: { statePath, coordinationPath, env: { PATH: join(f.root, "bin") }, home: f.home },
+      start: opts => startViewer(opts, {
+        createReader: readerOpts => {
+          const inner = createViewerReader(readerOpts);
+          return {
+            ...inner,
+            inspectLive: (id: string) => {
+              const { inspection, releases } = inner.inspectLive(id);
+              const clonedReleases = structuredClone(releases);
+              if (clonedReleases[0]) {
+                clonedReleases[0].manifest.session_dir = join(f.root, "missing-session-dir");
+              }
+              return { inspection, releases: clonedReleases };
+            },
+          };
+        },
+      }),
+    },
+    async viewer => {
+      const live = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/live`)).json() as any;
+      for (const node of live.graph.nodes) {
+        assert.equal(node.status, "needs_attention", `missing session_dir should yield needs_attention for ${node.id}`);
+        assert.equal(node.status_text, "Uncertain");
+      }
+    },
+  );
+});
