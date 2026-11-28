@@ -3142,6 +3142,58 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				assert.match(mixedDetails[1]!.textContent, /Attempt 2 result record is damaged\./);
 				assert.match(mixedDetails[2]!.textContent, /Attempt 1 survived/);
 				appT03.assertSafeDom();
+
+				// 4. Unverified attempt number & total_attempts typed absence + omitted_characters rendering (B2/B3)
+				const appUnv = bootApp("?factory=fac_t03&view=live", async (url) => {
+					if (url === "/api/factories") return jsonResp(200, [{ factory_id: "fac_t03", name: "FacT03", current_version: "v1", management: "managed" }]);
+					if (url === "/api/factories/fac_t03/live") return jsonResp(200, snap);
+					if (url === "/api/factories/fac_t03/output?node=mixed_node") {
+						return jsonResp(200, {
+							factory_id: "fac_t03",
+							node_id: "mixed_node",
+							evidence: "unavailable",
+							total_attempts: { absence: "evidence unavailable", explanation: "Total attempt count could not be verified because node-level context failed." },
+							omitted_attempts: 0,
+							attempts: [
+								{
+									attempt_id: { absence: "evidence unavailable", explanation: "Attempt identity could not be verified." },
+									attempt_number: { absence: "evidence unavailable", explanation: "Attempt number unverified; node-level context could not be verified." },
+									max_attempts: 4,
+									status: "needs_attention",
+									status_text: "Uncertain",
+									evidence: "unavailable",
+									absence: "evidence unavailable",
+									explanation: "Node evidence is missing, damaged or contradictory.",
+								},
+								{
+									attempt_id: "m.2",
+									attempt_number: 2,
+									max_attempts: 4,
+									status: "succeeded",
+									status_text: "Succeeded",
+									evidence: "available",
+									summary: "Attempt 2 survived",
+									omitted_characters: 500,
+								},
+							],
+						});
+					}
+					throw new Error(`Unexpected URL ${url}`);
+				});
+				await flushMicrotasks();
+				const gMixedUnv = collectAllElements(appUnv.content).find(e => e.getAttribute("data-node-id") === "mixed_node")!;
+				for (const fn of gMixedUnv.listeners.get("click") ?? []) fn({});
+				await flushMicrotasks();
+				const unvH = collectAllElements(appUnv.content).find(e => e.tagName === "h4" && e.textContent === "Attempt output")!;
+				const unvSec = collectAllElements(appUnv.content).find(e => e.tagName === "section" && e.children.some(c => c.children.includes(unvH)))!;
+				const unvDetails = collectAllElements(unvSec).filter(e => e.tagName === "details");
+				assert.equal(unvDetails.length, 2);
+				assert.match(unvDetails[0]!.children[0]!.textContent, /Attempt \(number unverified\) of 4/);
+				assert.match(unvDetails[0]!.textContent, /Attempt number unverified/);
+				assert.match(unvDetails[1]!.children[0]!.textContent, /Attempt 2 of 4/);
+				assert.match(unvDetails[1]!.textContent, /… \[truncated, 500 characters omitted\]/);
+				assert.match(unvSec.textContent, /Total attempt count could not be verified/);
+				appUnv.assertSafeDom();
 			}
 		},
 	);

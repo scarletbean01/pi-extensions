@@ -3,9 +3,9 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import test from "node:test";
 import { createManagerAuthority, factoryOperations, revokeManagerAuthority } from "../factory/operations.ts";
-import { resolveNodeAttempts } from "../factory/viewer/attempt-resolution.ts";
+import { resolveNodeAttempts, resolveNodeObservation } from "../factory/viewer/attempt-resolution.ts";
 import { enforceOutputResponseBudget, nodeOutputSnapshot } from "../factory/viewer/output.ts";
-import { collectArtifactPathTokens, compileArtifactRedactionMatcher, sanitizeOperatorText, sanitizeOutputText } from "../factory/viewer/sanitize.ts";
+import { collectArtifactPathTokens, compileArtifactRedactionMatcher, reboundOutputText, sanitizeOperatorText, sanitizeOutputText } from "../factory/viewer/sanitize.ts";
 import { createViewerReader } from "../factory/viewer/server.ts";
 import { atomicJson, completionRecord, dispositionPath, dispositionRecord, readJson, readyPath, resultPath, type WorkerConfig } from "./session-store.ts";
 import { handoffOfferPath } from "./handoff.ts";
@@ -1732,7 +1732,7 @@ test("GET /api/factories/:id/output and /live validate/scrub hostile timestamps,
 	});
 	writeFileSync(revProgPath, `${revProgText}${" ".repeat(1_200_000)}`);
 
-	// N3: Corrupt build attempt 2 result and verify /output masks attempt_id and attempt_number to 1 like /live
+	// N3 (ticket 02) + B1 (ticket 03): Corrupt build attempt 2 result keeps verified positional attempt_number=2 on /output while /live masks to 1
 	writeFileSync(resultPath(dir2, `${be.instance_id}.2`), "{corrupt");
 
 	await verifyReadOnlyViewer(
@@ -1745,8 +1745,8 @@ test("GET /api/factories/:id/output and /live validate/scrub hostile timestamps,
 			const outBuild = await (await fetch(`${viewer.url}/api/factories/${fac2.factory_id}/output?node=build`)).json() as any;
 			assert.equal(outBuild.attempts.length, 2);
 			assert.equal(outBuild.attempts[0].evidence, "unavailable");
-			assert.equal(outBuild.attempts[0].attempt_number, liveBuild.current_attempt.attempt_number);
-			assert.equal(outBuild.attempts[0].attempt_number, 1);
+			assert.equal(liveBuild.current_attempt.attempt_number, 1);
+			assert.equal(outBuild.attempts[0].attempt_number, 2);
 			assert.equal(typeof outBuild.attempts[0].attempt_id, "object");
 			assert.equal(outBuild.attempts[0].attempt_id.absence, "evidence unavailable");
 			assert.equal(outBuild.attempts[1].evidence, "available");
@@ -1790,9 +1790,9 @@ test("GET /api/factories/:id/output and /live validate/scrub hostile timestamps,
 				},
 			},
 		},
-		450,
+		380,
 	);
-	assert.ok(Buffer.byteLength(JSON.stringify(overBudget), "utf8") <= 450);
+	assert.ok(Buffer.byteLength(JSON.stringify(overBudget), "utf8") <= 380);
 	assert.equal(overBudget.evidence, "unavailable");
 	assert.equal((overBudget.latest_attempt as any).absence, "evidence unavailable");
 });
@@ -2707,12 +2707,14 @@ test("Ticket 03: multi-attempt ordering, 20-attempt cap, 64KB response budget + 
 			assert.equal(bOut.attempts[0].status, "succeeded");
 			assert.equal(bOut.attempts[0].evidence, "available");
 			assert.equal(bOut.attempts[0].summary, "Build summary 11 in [redacted-path]");
-			// Attempt 10 (index 1) corrupt JSON -> evidence unavailable without hiding 11 or 8..1
+			// Attempt 10 (index 1) corrupt JSON -> evidence unavailable with verified attempt_number 10 without hiding 11 or 8..1
+			assert.equal(bOut.attempts[1].attempt_number, 10);
 			assert.equal(bOut.attempts[1].evidence, "unavailable");
 			assert.equal(bOut.attempts[1].absence, "evidence unavailable");
 			assert.equal(typeof bOut.attempts[1].attempt_id, "object");
 			assert.equal(bOut.attempts[1].attempt_id.absence, "evidence unavailable");
-			// Attempt 9 (index 2) wrong node_id -> evidence unavailable, zero leaked text
+			// Attempt 9 (index 2) wrong node_id -> evidence unavailable with verified attempt_number 9, zero leaked text
+			assert.equal(bOut.attempts[2].attempt_number, 9);
 			assert.equal(bOut.attempts[2].evidence, "unavailable");
 			assert.equal(bOut.attempts[2].absence, "evidence unavailable");
 			// Attempt 8 (index 3) and Attempt 1 (index 10) remain readable in order
@@ -2804,8 +2806,10 @@ test("Ticket 03: multi-attempt ordering, 20-attempt cap, 64KB response budget + 
 	assert.equal(resolved23.omittedAttempts, 3);
 	assert.equal(resolved23.attempts[0].attempt_number, 23);
 	assert.equal(resolved23.attempts[0].status, "succeeded");
+	assert.equal(resolved23.attempts[1].attempt_number, 22);
 	assert.equal(resolved23.attempts[1].corrupt_or_unverified, true);
 	assert.equal(resolved23.attempts[1].status, "needs_attention");
+	assert.equal(resolved23.attempts[2].attempt_number, 21);
 	assert.equal(resolved23.attempts[2].corrupt_or_unverified, true);
 	assert.equal(resolved23.attempts[2].status, "needs_attention");
 	assert.equal(resolved23.attempts[3].attempt_number, 20);
@@ -2933,12 +2937,25 @@ test("Ticket 03: multi-attempt ordering, 20-attempt cap, 64KB response budget + 
 			assert.equal(parsed.attempts[0].attempt_number, 11);
 			assert.equal(parsed.attempts[0].status, "succeeded");
 			assert.ok(parsed.attempts[0].summary.startsWith("Newest-protected summary 11 "));
-			assert.equal(parsed.attempts.length, 11);
-			assert.equal(parsed.omitted_attempts, 0);
+			assert.equal(parsed.attempts.length + parsed.omitted_attempts, 11);
+			assert.ok(parsed.attempts.length >= 1);
+			if (parsed.omitted_attempts > 0) {
+				assert.match(parsed.omitted_marker, /\[truncated, \d+ attempts? omitted\]/);
+			}
 			assert.ok(typeof parsed.attempts[0].detail === "string");
 			for (const a of parsed.attempts) {
 				if (typeof a.detail === "string") assert.equal(a.detail.isWellFormed(), true);
 				if (typeof a.outputs_text === "string") assert.equal(a.outputs_text.isWellFormed(), true);
+			}
+			// B3: Every trimmed older attempt field carries a counted truncation marker, never a bare "…"
+			for (const a of parsed.attempts.slice(1)) {
+				for (const field of ["summary", "detail", "outputs_text"] as const) {
+					const val = a[field];
+					if (typeof val === "string") {
+						assert.notEqual(val, "…", `Attempt ${a.attempt_number}.${field} must not be trimmed to bare "…"`);
+						assert.match(val, /… \[truncated, \d+ characters? omitted\]$/, `Attempt ${a.attempt_number}.${field} missing counted marker`);
+					}
+				}
 			}
 
 			const tLive0 = performance.now();
@@ -3299,4 +3316,315 @@ test("Ticket 03: Deleted factory retained multi-attempt output stays readable, d
 			assert.equal(out.absence, "evidence unavailable");
 		},
 	);
+});
+
+test("Fix round 1 (B1, B2, B3, N3, N5): verified attempt numbers, context-failure fallback, counted budget markers, retained-run scope, and cross-attempt artifact redaction", async t => {
+	const { mkdirSync, readFileSync, rmSync, writeFileSync } = await import("node:fs");
+	const { DatabaseSync } = await import("node:sqlite");
+
+	// B1 + B2 + N5: 3-attempt review loop covering corrupt newest (build.3), contradictory older (build.2),
+	// unfinished latest (attempt 3 running) with foreign progress and damaged readiness, and cross-attempt artifact redaction.
+	const f = serviceFixture(t, ["builder", "reviewer"]);
+	const statePath = join(f.root, "factories.sqlite");
+	const coordinationPath = join(f.root, "factory-coordination.sqlite");
+	const viewerEnv = { PATH: join(f.root, "bin"), PI_BOOTSTRAP_STATE_DIR: f.stateDir };
+	const ops = factoryOperations(statePath, f.service, { coordinationPath });
+	const draft: GenerateRequest = {
+		project_cwd: f.cwd,
+		topology: "graph",
+		task: "PRIVATE_R1_PROMPT",
+		agents: [
+			{ node_id: "build", persona: "builder", sub_task: "PRIVATE_R1_BUILD" },
+			{
+				node_id: "review",
+				persona: "reviewer",
+				depends_on: ["build"],
+				sub_task: "PRIVATE_R1_REVIEW",
+				output_contract: { required_fields: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise"] } } },
+				decision: { field: "verdict", approve: "approve", reject: "revise", on_reject: "build", max_revisions: 3, on_exhausted: "failed" },
+			},
+		],
+	};
+	const fac = ops({ action: "publish", name: "r1-loop-fac", draft, sessionModel });
+	const auth = createManagerAuthority({ pi_session_id: "sess-r1" });
+	ops({ action: "resume", factory_id: fac.factory_id, authority: auth });
+	ops({ action: "submit", factory_id: fac.factory_id, authority: auth, reference: "r1-ref", brief: "PRIVATE_R1_BRIEF" });
+	const launched = await ops({ action: "launch", factory_id: fac.factory_id, authority: auth });
+	const dir = launched.manifest.session_dir;
+	const be = launched.manifest.pane_manifest.find(e => e.node_id === "build")!;
+	const re = launched.manifest.pane_manifest.find(e => e.node_id === "review")!;
+	const m = { provider: "test-provider", id: "test-model" };
+	const build = workerFromConfig(t, join(dir, `${be.instance_id}.config.json`), { model: m });
+	const review = workerFromConfig(t, join(dir, `${re.instance_id}.config.json`), { model: m });
+	await build.start();
+	await review.start();
+	await build.beforeStart();
+	await review.beforeStart();
+
+	mkdirSync(join(f.cwd, "src", "PRIVATE_CROSS_ATT1"), { recursive: true });
+	writeFileSync(join(f.cwd, "src", "PRIVATE_CROSS_ATT1", "secret.ts"), "export const a = 1;\n");
+	await build.complete({
+		status: "success",
+		summary: "Build 1",
+		detail: "D1",
+		artifacts: [{ type: "file", action: "created", path: "src/PRIVATE_CROSS_ATT1/secret.ts", description: "First attempt artifact" }],
+	});
+	await review.beforeStart(notification(build, review));
+	await review.deliverFollowUps();
+	await review.complete({ status: "success", summary: "Revise 1", detail: "r1", outputs: { verdict: "revise" } });
+
+	await build.beforeStart(notification(review, build));
+	await build.deliverFollowUps();
+	mkdirSync(join(f.cwd, "src", "PRIVATE_CROSS_ATT2"), { recursive: true });
+	writeFileSync(join(f.cwd, "src", "PRIVATE_CROSS_ATT2", "secret.ts"), "export const b = 2;\n");
+	await build.complete({
+		status: "success",
+		summary: "Build 2",
+		detail: "D2",
+		artifacts: [{ type: "file", action: "created", path: "src/PRIVATE_CROSS_ATT2/secret.ts", description: "Second attempt artifact" }],
+	});
+	await review.beforeStart(notification(build, review));
+	await review.deliverFollowUps();
+	await review.complete({ status: "success", summary: "Revise 2", detail: "r2", outputs: { verdict: "revise" } });
+
+	// Attempt 3 running (unfinished latest)
+	await build.beforeStart(notification(review, build));
+	await build.deliverFollowUps();
+
+	// B2 case 1: Unfinished attempt 3 with foreign progress record -> lists [unverified, 2, 1], total_attempts typed unavailable
+	const progPath = join(dir, `${be.instance_id}.progress.json`);
+	const savedProg = readFileSync(progPath, "utf8");
+	writeFileSync(progPath, JSON.stringify({ ...JSON.parse(savedProg), token: "FOREIGN_TOKEN" }));
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const out = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`)).json() as any;
+			assert.equal(out.attempts.length, 3, "B2 foreign progress must not hide attempt 2");
+			assert.equal(typeof out.total_attempts, "object", "total_attempts must not be presented as exact");
+			assert.equal(out.total_attempts.absence, "evidence unavailable");
+			assert.equal(typeof out.attempts[0].attempt_number, "object");
+			assert.equal(out.attempts[0].attempt_number.absence, "evidence unavailable");
+			assert.match(out.attempts[0].attempt_number.explanation, /number unverified/i);
+			assert.equal(out.attempts[0].evidence, "unavailable");
+			assert.equal(out.attempts[1].attempt_number, 2);
+			assert.equal(out.attempts[1].status, "succeeded");
+			assert.equal(out.attempts[1].summary, "Build 2");
+			assert.equal(out.attempts[2].attempt_number, 1);
+			assert.equal(out.attempts[2].status, "succeeded");
+			assert.equal(out.attempts[2].summary, "Build 1");
+		},
+	);
+	writeFileSync(progPath, savedProg);
+
+	// B2 case 2: Unfinished attempt 3 with damaged readiness record -> lists [unverified, 2, 1], total_attempts typed unavailable
+	const rdyPath = readyPath(dir, be.instance_id);
+	const savedReady = readFileSync(rdyPath, "utf8");
+	writeFileSync(rdyPath, "{bad-ready");
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const out = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`)).json() as any;
+			assert.equal(out.attempts.length, 3, "B2 damaged readiness must not hide attempt 2");
+			assert.equal(typeof out.total_attempts, "object");
+			assert.equal(out.total_attempts.absence, "evidence unavailable");
+			assert.equal(typeof out.attempts[0].attempt_number, "object");
+			assert.equal(out.attempts[0].attempt_number.absence, "evidence unavailable");
+			assert.match(out.attempts[0].attempt_number.explanation, /number unverified/i);
+			assert.equal(out.attempts[1].attempt_number, 2);
+			assert.equal(out.attempts[1].summary, "Build 2");
+			assert.equal(out.attempts[2].attempt_number, 1);
+			assert.equal(out.attempts[2].summary, "Build 1");
+		},
+	);
+	writeFileSync(rdyPath, savedReady);
+
+	// Complete attempt 3 referencing attempt 2 & attempt 1 artifact paths (N5)
+	await build.complete({
+		status: "success",
+		summary: "Build 3 mentions src/PRIVATE_CROSS_ATT2/secret.ts",
+		detail: "D3 references src/PRIVATE_CROSS_ATT1/secret.ts and src/PRIVATE_CROSS_ATT2/secret.ts",
+		outputs: { prev: "src/PRIVATE_CROSS_ATT2/secret.ts" },
+	});
+	await review.beforeStart(notification(build, review));
+	await review.deliverFollowUps();
+	await review.complete({ status: "success", summary: "Approve", detail: "ok", outputs: { verdict: "approve" } });
+
+	// N5: Attempt 3 text naming Attempt 2/1 artifact paths is redacted across the response
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const outText = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`)).text();
+			assert.equal(outText.includes("PRIVATE_CROSS_ATT"), false, "N5 cross-attempt artifact paths must be redacted");
+			const out = JSON.parse(outText);
+			assert.equal(out.attempts[0].attempt_number, 3);
+			assert.equal(out.attempts[0].summary, "Build 3 mentions [redacted-path]");
+			assert.match(out.attempts[0].detail, /D3 references \[redacted-path\] and \[redacted-path\]/);
+		},
+	);
+
+	// B1 case 1: Corrupt build.3.result.json -> ["3 Uncertain masked", "2 Succeeded", "1 Succeeded"]
+	const p3 = resultPath(dir, `${be.instance_id}.3`);
+	const s3 = readFileSync(p3, "utf8");
+	writeFileSync(p3, "{corrupt-build3");
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const out = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`)).json() as any;
+			assert.equal(out.total_attempts, 3);
+			assert.equal(out.attempts[0].attempt_number, 3);
+			assert.equal(out.attempts[0].status, "needs_attention");
+			assert.equal(out.attempts[0].evidence, "unavailable");
+			assert.equal(out.attempts[0].attempt_id.absence, "evidence unavailable");
+			assert.equal(out.attempts[1].attempt_number, 2);
+			assert.equal(out.attempts[1].status, "succeeded");
+			assert.equal(out.attempts[2].attempt_number, 1);
+			assert.equal(out.attempts[2].status, "succeeded");
+		},
+	);
+	writeFileSync(p3, s3);
+
+	// B1 case 2: Contradictory build.2 (both result and disposition) -> ["3 Succeeded", "2 Uncertain masked", "1 Succeeded"]
+	const d2 = dispositionPath(dir, `${be.instance_id}.2`);
+	writeFileSync(d2, "{}");
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const out = await (await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`)).json() as any;
+			assert.equal(out.total_attempts, 3);
+			assert.equal(out.attempts[0].attempt_number, 3);
+			assert.equal(out.attempts[0].status, "succeeded");
+			assert.equal(out.attempts[1].attempt_number, 2);
+			assert.equal(out.attempts[1].status, "needs_attention");
+			assert.equal(out.attempts[1].evidence, "unavailable");
+			assert.equal(out.attempts[1].attempt_id.absence, "evidence unavailable");
+			assert.equal(out.attempts[2].attempt_number, 1);
+			assert.equal(out.attempts[2].status, "succeeded");
+		},
+	);
+	rmSync(d2);
+
+	// N3: Active factory whose last run settled returns 404 on /output (retained path is Deleted-only)
+	assert.equal((await ops({ action: "settle_run", factory_id: fac.factory_id, authority: auth })).settled, true);
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const settledRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`);
+			assert.equal(settledRes.status, 404, "Settled active factory must return 404 on /output");
+		},
+	);
+
+	// N3: Deleted factory with corrupt bound definition (while v2 is current) returns 404 for unknown node (verified via index manifest)
+	// and 200 unavailable for known node, and when both definition and index manifest are unavailable, returns 200 unavailable.
+	ops({ action: "update", factory_id: fac.factory_id, authority: auth, draft: { ...draft, task: "PRIVATE_R1_V2" }, sessionModel });
+	await ops({ action: "delete", factory_id: fac.factory_id, authority: auth, confirm: async () => true });
+	revokeManagerAuthority(auth);
+	const db = new DatabaseSync(statePath);
+	try {
+		db.prepare("UPDATE factory_versions SET definition = '{corrupt-def' WHERE factory_id = ? AND version = 'v1'").run(fac.factory_id);
+	} finally {
+		db.close();
+	}
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const unknownRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=not_a_node`);
+			assert.equal(unknownRes.status, 404, "Unknown node with corrupt bound definition and intact index manifest must return 404");
+			const knownRes = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`);
+			assert.equal(knownRes.status, 200);
+			const knownBody = await knownRes.json() as any;
+			assert.equal(knownBody.evidence, "unavailable");
+			assert.equal(knownBody.absence, "evidence unavailable");
+		},
+	);
+	rmSync(join(f.stateDir, `${launched.task_id}.json`));
+	await verifyReadOnlyViewer(
+		{ stateDirs: f.root, viewerOptions: { statePath, coordinationPath, env: viewerEnv, home: f.home } },
+		async viewer => {
+			const res = await fetch(`${viewer.url}/api/factories/${fac.factory_id}/output?node=build`);
+			assert.equal(res.status, 200);
+			const body = await res.json() as any;
+			assert.equal(body.evidence, "unavailable");
+			assert.equal(body.absence, "evidence unavailable");
+		},
+	);
+
+	// B3: Budget trimming always emits counted marker (kept + omitted = true length), allows kept=0 bare marker,
+	// and drops the field with visible omission count only when even the bare marker does not fit.
+	const bareMarkerExact = reboundOutputText("abcdef… [truncated, 10 characters omitted]", 36);
+	assert.equal(bareMarkerExact, "… [truncated, 16 characters omitted]");
+
+	const preTruncated = sanitizeOutputText("A".repeat(12000), 8000);
+	const olderTrimmed = enforceOutputResponseBudget(
+		{
+			factory_id: "f1",
+			node_id: "build",
+			evidence: "available",
+			total_attempts: 2,
+			omitted_attempts: 0,
+			attempts: [
+				{
+					attempt_id: "a.2",
+					attempt_number: 2,
+					max_attempts: 2,
+					status: "succeeded",
+					status_text: "Succeeded",
+					evidence: "available",
+					summary: "NEWEST_SUMMARY",
+					detail: "NEWEST_DETAIL",
+				},
+				{
+					attempt_id: "a.1",
+					attempt_number: 1,
+					max_attempts: 2,
+					status: "partial",
+					status_text: "Partial",
+					evidence: "available",
+					summary: "S".repeat(200),
+					detail: preTruncated,
+					outputs_text: "O".repeat(300),
+				},
+			],
+		},
+		650,
+	);
+	assert.ok(Buffer.byteLength(JSON.stringify(olderTrimmed), "utf8") <= 650);
+	const trimmedAtt1 = (olderTrimmed.attempts as any[])[1];
+	for (const [field, trueLen] of [["summary", 200], ["detail", 12000], ["outputs_text", 300]] as const) {
+		const v = trimmedAtt1[field];
+		if (v !== undefined) {
+			assert.notEqual(v, "…");
+			const m = /^(.*?)… \[truncated, (\d+) characters? omitted\]$/.exec(v);
+			assert.ok(m, `Expected counted marker on ${field}, got ${JSON.stringify(v)}`);
+			assert.equal(Array.from(m![1]!).length + Number(m![2]!), trueLen, `Exact count mismatch for ${field}`);
+		}
+	}
+
+	// When even the bare marker does not fit on the newest attempt's optional field, drop it and record visible omission count
+	const droppedFieldBody = enforceOutputResponseBudget(
+		{
+			factory_id: "f1",
+			node_id: "build",
+			evidence: "available",
+			total_attempts: 1,
+			omitted_attempts: 0,
+			attempts: [
+				{
+					attempt_id: "a.1",
+					attempt_number: 1,
+					max_attempts: 1,
+					status: "succeeded",
+					status_text: "Succeeded",
+					evidence: "available",
+					summary: "S".repeat(280),
+					outputs_text: "O".repeat(500),
+				},
+			],
+		},
+		570,
+	);
+	assert.ok(Buffer.byteLength(JSON.stringify(droppedFieldBody), "utf8") <= 570);
+	const droppedAtt = (droppedFieldBody.attempts as any[])[0];
+	assert.equal("outputs_text" in droppedAtt, false, "outputs_text must be dropped when bare marker cannot fit");
+	assert.equal(droppedAtt.omitted_characters, 500);
+	assert.equal(droppedAtt.summary, "S".repeat(280));
 });

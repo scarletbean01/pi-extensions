@@ -368,6 +368,7 @@ function verifyRegularHandoffFiles(
 export interface ResolvedNodeObservation {
 	attempt_id?: string;
 	attempt_number: number;
+	attempt_number_unverified?: boolean;
 	max_attempts: number;
 	instance_id: string;
 	key: string;
@@ -991,10 +992,17 @@ function resolveSingleAttemptFromContext(
 			attempt_status_text: "Uncertain",
 			reason: "Node evidence is missing, damaged or contradictory.",
 			resource_state: entry.status,
-			process_state: isLatest ? processState : "unknown",
+			process_state: "unknown",
 			...(loop ? { loop } : {}),
 		};
 	}
+}
+
+interface PartialResolvedTracker {
+	attemptNum: number;
+	attemptId?: string;
+	key: string;
+	expected?: CompletionExpectation;
 }
 
 function resolveSharedNodeContext(
@@ -1003,6 +1011,7 @@ function resolveSharedNodeContext(
 	byInstanceNodeId: ReadonlyMap<string, string>,
 	blockedPaths: readonly string[],
 	options: ResolveRunObservationsOptions,
+	tracker?: PartialResolvedTracker,
 ): SharedNodeContext {
 	const { session_dir: dir, task_id, review_plan } = manifest;
 	const enforceNodeRecordSizeLimit = Boolean(
@@ -1056,8 +1065,16 @@ function resolveSharedNodeContext(
 	}
 	const attemptNum = attempt?.number ?? 1;
 	const attemptId = attempt ? `${entry.instance_id}.${attempt.number}` : entry.attempt_id;
+	if (tracker) {
+		tracker.attemptNum = attemptNum;
+		tracker.attemptId = attemptId;
+	}
 	if (finalization && attemptId && finalization.attempt_id !== attemptId) {
 		throw new Error("Finalization does not match the latest attempt");
+	}
+	if (tracker) {
+		tracker.key = review_plan && (attempt || finalization) ? (attemptId ?? entry.instance_id) : entry.instance_id;
+		tracker.expected = { ...expectationFor(manifest, entry), attempt_id: attemptId };
 	}
 
 	const readyFile = readyPath(dir, entry.instance_id);
@@ -1133,6 +1150,53 @@ function resolveSharedNodeContext(
 	};
 }
 
+function resolveNodeObservationWithContext(
+	manifest: BootstrapManifest,
+	entry: AgentLaunch,
+	byInstanceNodeId: ReadonlyMap<string, string>,
+	blockedPaths: readonly string[],
+	options: ResolveRunObservationsOptions = {},
+): { observation: ResolvedNodeObservation; context?: SharedNodeContext } {
+	const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
+	const maxAttempts = loop ? loop.max_revisions + 1 : 1;
+	const tracker: PartialResolvedTracker = {
+		attemptNum: 1,
+		attemptId: entry.attempt_id,
+		key: entry.instance_id,
+	};
+	try {
+		const ctx = resolveSharedNodeContext(manifest, entry, byInstanceNodeId, blockedPaths, options, tracker);
+		return {
+			observation: resolveSingleAttemptFromContext(ctx, ctx.latestAttemptNum),
+			context: ctx,
+		};
+	} catch {
+		return {
+			observation: {
+				attempt_id: tracker.attemptId,
+				attempt_number: tracker.attemptNum,
+				attempt_number_unverified: true,
+				max_attempts: maxAttempts,
+				instance_id: entry.instance_id,
+				key: tracker.key,
+				...(tracker.expected ? { expected: tracker.expected } : {}),
+				has_result: false,
+				has_disposition: false,
+				corrupt_or_unverified: true,
+				evidence_problem: "Attempt output evidence is unavailable because the result record is missing, damaged, unreadable, or fails verification.",
+				status: "needs_attention",
+				status_text: "Uncertain",
+				attempt_status: "needs_attention",
+				attempt_status_text: "Uncertain",
+				reason: "Node evidence is missing, damaged or contradictory.",
+				resource_state: entry.status,
+				process_state: "unknown",
+				...(loop ? { loop } : {}),
+			},
+		};
+	}
+}
+
 /** Resolve one node's latest attempt, expected identity, durable records, and derived status without mutating state. */
 export function resolveNodeObservation(
 	manifest: BootstrapManifest,
@@ -1141,32 +1205,7 @@ export function resolveNodeObservation(
 	blockedPaths: readonly string[],
 	options: ResolveRunObservationsOptions = {},
 ): ResolvedNodeObservation {
-	const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
-	const maxAttempts = loop ? loop.max_revisions + 1 : 1;
-	try {
-		const ctx = resolveSharedNodeContext(manifest, entry, byInstanceNodeId, blockedPaths, options);
-		return resolveSingleAttemptFromContext(ctx, ctx.latestAttemptNum);
-	} catch {
-		return {
-			attempt_id: entry.attempt_id,
-			attempt_number: 1,
-			max_attempts: maxAttempts,
-			instance_id: entry.instance_id,
-			key: entry.instance_id,
-			has_result: false,
-			has_disposition: false,
-			corrupt_or_unverified: true,
-			evidence_problem: "Attempt output evidence is unavailable because the result record is missing, damaged, unreadable, or fails verification.",
-			status: "needs_attention",
-			status_text: "Uncertain",
-			attempt_status: "needs_attention",
-			attempt_status_text: "Uncertain",
-			reason: "Node evidence is missing, damaged or contradictory.",
-			resource_state: entry.status,
-			process_state: "unknown",
-			...(loop ? { loop } : {}),
-		};
-	}
+	return resolveNodeObservationWithContext(manifest, entry, byInstanceNodeId, blockedPaths, options).observation;
 }
 
 /**
@@ -1180,27 +1219,41 @@ export function resolveNodeAttempts(
 	blockedPaths: readonly string[],
 	latestObservation: ResolvedNodeObservation,
 	maxReturnedAttempts = 20,
-): { attempts: ResolvedNodeObservation[]; totalAttempts: number; omittedAttempts: number } {
+	preResolvedContext?: { resolved: true; context: SharedNodeContext | undefined },
+): { attempts: ResolvedNodeObservation[]; totalAttempts: number; totalAttemptsExact: boolean; omittedAttempts: number } {
 	const loop = reviewLoopFor(manifest.review_plan, entry.instance_id);
 	const maxAttempts = loop ? loop.max_revisions + 1 : 1;
 	if (!loop || maxAttempts <= 1) {
+		const exact = !latestObservation.attempt_number_unverified;
 		return {
 			attempts: [latestObservation],
-			totalAttempts: 1,
+			totalAttempts: exact ? 1 : 0,
+			totalAttemptsExact: exact,
 			omittedAttempts: 0,
 		};
 	}
 
 	let ctx: SharedNodeContext | undefined;
-	try {
-		ctx = resolveSharedNodeContext(manifest, entry, byInstanceNodeId, blockedPaths, {
-			enforceNodeRecordSizeLimit: true,
-			skipLoopResultPrecheckNodeId: entry.node_id,
-		});
-	} catch {
-		// Shared node context failed (e.g. corrupt handoff claim, finalization, or progress on the latest attempt).
-		// Probe 1..maxAttempts safely for earlier attempts that still have readable durable files without
-		// dropping the damaged latest attempt at index 0.
+	if (preResolvedContext?.resolved) {
+		ctx = preResolvedContext.context;
+	} else {
+		try {
+			ctx = resolveSharedNodeContext(manifest, entry, byInstanceNodeId, blockedPaths, {
+				enforceNodeRecordSizeLimit: true,
+				skipLoopResultPrecheckNodeId: entry.node_id,
+			});
+		} catch {
+			ctx = undefined;
+		}
+	}
+
+	if (!ctx) {
+		// Shared node context failed (e.g. corrupt handoff claim, finalization, readiness, or progress on the latest attempt).
+		// Probe 1..maxAttempts safely and list EVERY existing attempt under its own number alongside the unverified latest
+		// observation at index 0, without letting index 0 stand in for highestExisting or reporting total_attempts as exact.
+		const unverifiedLatest: ResolvedNodeObservation = latestObservation.attempt_number_unverified
+			? latestObservation
+			: { ...latestObservation, attempt_number_unverified: true };
 		const fallbackCtx: SharedNodeContext = {
 			manifest,
 			entry,
@@ -1214,18 +1267,19 @@ export function resolveNodeAttempts(
 			readyAlive: false,
 		};
 		const dir = manifest.session_dir;
-		let highestExisting = 1;
 		const existingAttempts: number[] = [];
 		try {
 			assertRegularDirNoSymlink(dir, "session directory");
 			for (let n = 1; n <= maxAttempts; n++) {
 				const keyN = `${entry.instance_id}.${n}`;
-				const hasAny = [
+				const candidatePaths = [
 					resultPath(dir, keyN),
 					dispositionPath(dir, keyN),
 					join(dir, `${keyN}.error.json`),
 					outcomeClaimPath(dir, keyN),
-				].some(p => {
+					...(n === 1 ? [join(dir, `${entry.instance_id}.error.json`)] : []),
+				];
+				const hasAny = candidatePaths.some(p => {
 					try {
 						assertPathInsideDir(dir, p, "attempt record");
 						return pathEntryExists(p);
@@ -1234,27 +1288,25 @@ export function resolveNodeAttempts(
 					}
 				});
 				if (hasAny) {
-					highestExisting = Math.max(highestExisting, n);
 					existingAttempts.push(n);
 				}
 			}
 		} catch {
-			return { attempts: [latestObservation], totalAttempts: 1, omittedAttempts: 0 };
+			return { attempts: [unverifiedLatest], totalAttempts: 0, totalAttemptsExact: false, omittedAttempts: 0 };
 		}
-		if (existingAttempts.length <= 1) {
-			return { attempts: [latestObservation], totalAttempts: Math.max(1, highestExisting), omittedAttempts: 0 };
+		if (existingAttempts.length === 0) {
+			return { attempts: [unverifiedLatest], totalAttempts: 0, totalAttemptsExact: false, omittedAttempts: 0 };
 		}
 		const olderNums = existingAttempts
-			.filter(n => n < highestExisting)
 			.sort((a, b) => b - a)
 			.slice(0, Math.max(0, maxReturnedAttempts - 1));
 		const olderObs = olderNums.map(n => resolveSingleAttemptFromContext(fallbackCtx, n));
-		const totalAttempts = highestExisting;
-		const attempts = [latestObservation, ...olderObs].slice(0, maxReturnedAttempts);
+		const attempts = [unverifiedLatest, ...olderObs].slice(0, maxReturnedAttempts);
 		return {
 			attempts,
-			totalAttempts,
-			omittedAttempts: Math.max(0, totalAttempts - attempts.length),
+			totalAttempts: existingAttempts.length,
+			totalAttemptsExact: false,
+			omittedAttempts: Math.max(0, existingAttempts.length - olderNums.length),
 		};
 	}
 
@@ -1267,6 +1319,7 @@ export function resolveNodeAttempts(
 	return {
 		attempts,
 		totalAttempts,
+		totalAttemptsExact: true,
 		omittedAttempts: Math.max(0, totalAttempts - attempts.length),
 	};
 }
@@ -1287,9 +1340,12 @@ export function resolveRunObservations(
 		...(manifest.factory_managed?.canonical_checkout ? [manifest.factory_managed.canonical_checkout] : []),
 	];
 	const observations = new Map<string, ResolvedNodeObservation>();
+	const contexts = new Map<string, SharedNodeContext | undefined>();
 	for (const entry of definition.agents) {
 		const launched = roster.get(entry.node.node_id)!;
-		observations.set(entry.node.node_id, resolveNodeObservation(manifest, launched, byInstance, runBlockedPaths, options));
+		const res = resolveNodeObservationWithContext(manifest, launched, byInstance, runBlockedPaths, options);
+		observations.set(entry.node.node_id, res.observation);
+		contexts.set(entry.node.node_id, res.context);
 	}
 
 	const entryByNode = new Map(definition.agents.map(entry => [entry.node.node_id, entry]));
@@ -1397,5 +1453,5 @@ export function resolveRunObservations(
 		}
 	}
 
-	return { roster, runBlockedPaths, observations, depEdges, bound_version, manifest, definition };
+	return { roster, runBlockedPaths, observations, contexts, depEdges, bound_version, manifest, definition };
 }
