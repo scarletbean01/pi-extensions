@@ -756,6 +756,15 @@ test("served safe.js pure client logic enforces safeHref, typed live absence, nu
 			assert.equal(safe.matchesSelectedFactory({}, "fac_a"), false);
 			assert.equal(safe.matchesSelectedFactory(null, "fac_a"), false);
 
+			assert.equal(safe.outputApiUrl("fac_1", "build_1"), "/api/factories/fac_1/output?node=build_1");
+			assert.equal(safe.outputApiUrl("../bad", "build_1"), null);
+			assert.equal(safe.outputApiUrl("fac_1", "../bad"), null);
+			assert.equal(safe.outputApiUrl("fac_1", ""), null);
+			assert.equal(safe.matchesSelectedOutputTarget({ factory_id: "fac_a", node_id: "n1" }, "fac_a", "n1"), true);
+			assert.equal(safe.matchesSelectedOutputTarget({ factory_id: "fac_a", node_id: "n2" }, "fac_a", "n1"), false);
+			assert.equal(safe.matchesSelectedOutputTarget({ factory_id: "fac_b", node_id: "n1" }, "fac_a", "n1"), false);
+			assert.equal(safe.matchesSelectedOutputTarget({ factory_id: "fac_a" }, "fac_a", "n1"), false);
+
 			// 7. Frozen export and maps (hardening)
 			assert.equal(Object.isFrozen(safe), true, "FactoryViewerSafe must be frozen");
 			assert.equal(Object.isFrozen(safe.VIEW_LABELS), true, "VIEW_LABELS must be frozen");
@@ -2020,6 +2029,7 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				//     next verified run rebuilds & resets; ended run persists; Stale/recovery/uncertain/404/factory switch
 				let phase = 0;
 				let resolveBeta!: (r: any) => void;
+				let outputFetchCount = 0;
 				const appLiveFlow = bootApp("?factory=fac_1&view=live", async url => {
 					if (url === "/api/factories") {
 						return jsonResp(200, [
@@ -2029,6 +2039,26 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 					}
 					if (url === "/api/factories/fac_2/live") {
 						return new Promise(res => { resolveBeta = res; });
+					}
+					if (url === "/api/factories/fac_1/output?node=build") {
+						outputFetchCount++;
+						return jsonResp(200, {
+							factory_id: "fac_1",
+							node_id: "build",
+							run_id: "run-1",
+							bound_version: "v1",
+							evidence: "not applicable",
+							latest_attempt: {
+								attempt_id: "build.1",
+								attempt_number: 1,
+								max_attempts: 2,
+								status: "running",
+								status_text: "Running",
+								evidence: "not applicable",
+								absence: "not applicable",
+								explanation: "Attempt output is recorded when the attempt finishes.",
+							},
+						});
 					}
 					phase++;
 					if (phase === 1) return jsonResp(200, makeRunSnap("fac_1", "run-1", "att-1", "running", "2026-11-24T12:00:00Z", { build: "running", review: "waiting" }));
@@ -2064,19 +2094,22 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				assert.equal(nodeBuildBefore.getAttribute("aria-pressed"), "true");
 				assert.equal(appLiveFlow.fakeDocument.activeElement, nodeBuildBefore);
 				// Expand <details> in detail panel
-				const detailsBefore = collectAllElements(appLiveFlow.content).find(e => e.tagName === "details")!;
+				await flushMicrotasks();
+				assert.equal(outputFetchCount, 1, "Selecting a node must fetch /output once");
+				const detailsBefore = collectAllElements(appLiveFlow.content).find(e => e.tagName === "details" && e.textContent.includes("Optional attempt timestamps"))!;
 				assert.ok(detailsBefore);
 				detailsBefore.open = true;
 
 				// Poll 2, 3, 4 (same run-1): SVG, nodes, viewBox, selection, <details>.open, and activeElement MUST survive!
 				for (const expectedChecked of ["2026-11-24T12:00:02Z", "2026-11-24T12:00:04Z", "2026-11-24T12:00:06Z"]) {
 					await appLiveFlow.advanceTimers(2000);
+					assert.equal(outputFetchCount, 1, "Two-second poll must not re-fetch /output in Ticket 01");
 					const svgNow = collectAllElements(appLiveFlow.content).find(e => e.tagName === "svg")!;
 					const nodeBuildNow = collectAllElements(svgNow).find(e => e.getAttribute("data-node-id") === "build")!;
 					const nodeReviewNow = collectAllElements(svgNow).find(e => e.getAttribute("data-node-id") === "review")!;
 					const allDetails = collectAllElements(appLiveFlow.content).filter(e => e.tagName === "details");
-					assert.equal(allDetails.length, 1, "Same-run poll must keep exactly one <details>");
-					const detailsNow = allDetails[0]!;
+					assert.equal(allDetails.length, 2, "Same-run poll must keep Attempt output and timestamps <details>");
+					const detailsNow = allDetails.find(e => e.textContent.includes("Optional attempt timestamps"))!;
 					assert.equal(svgNow, svgBefore, "Same-run poll must NOT recreate <svg>");
 					assert.equal(nodeBuildNow, nodeBuildBefore, "Same-run poll must NOT recreate node <g>");
 					assert.equal(nodeReviewNow, nodeReviewBefore, "Same-run poll must NOT recreate untouched node <g>");
@@ -2340,6 +2373,372 @@ test("served app.js wiring renders loading/timeout/error states, live absences, 
 				};
 				const deletedTrans = appDel.context.FactoryViewerSafe.classifyLiveTransition(endedSnap, delFixtures["/api/factories/fac_del/live"]);
 				assert.equal(deletedTrans.effectiveSnapshot.state, "deleted");
+			}
+
+			// I. Ticket 01 Attempt output section: plain text + preserved whitespace, typed absence, abort & stale discard on node/factory switch, mismatch discard, and in-section error
+			{
+				const makeSnap = (factoryId: string) => ({
+					factory_id: factoryId,
+					current_version: "v1",
+					checked_at: "2026-11-28T12:00:00Z",
+					state: "running",
+					reason: "Running",
+					run: { run_id: `run-${factoryId}`, attempt_id: `att-${factoryId}`, bound_version: "v1" },
+					outcome: "incomplete",
+					settlement: "unsettled",
+					capacity_release: "held",
+					graph: {
+						evidence: "available",
+						bound_version: "v1",
+						topology: "graph",
+						nodes: [
+							{ id: "node_a", kind: "agent", status: "succeeded", status_text: "Succeeded", current_attempt: { attempt_id: "a.1", attempt_number: 1, max_attempts: 1, instance_id: "i-a", process_state: "exited", resource_state: "closed" } },
+							{ id: "node_b", kind: "agent", status: "running", status_text: "Running", current_attempt: { attempt_id: "b.1", attempt_number: 1, max_attempts: 1, instance_id: "i-b", process_state: "alive", resource_state: "open" } },
+							{ id: "node_c", kind: "agent", status: "needs_attention", status_text: "Uncertain", current_attempt: { attempt_id: "c.1", attempt_number: 1, max_attempts: 1, instance_id: "i-c", process_state: "exited", resource_state: "closed" } },
+							{ id: "node_err", kind: "agent", status: "failed", status_text: "Failed", current_attempt: { attempt_id: "e.1", attempt_number: 1, max_attempts: 1, instance_id: "i-e", process_state: "exited", resource_state: "closed" } },
+							{ id: "node_mis", kind: "agent", status: "succeeded", status_text: "Succeeded", current_attempt: { attempt_id: "m.1", attempt_number: 1, max_attempts: 1, instance_id: "i-m", process_state: "exited", resource_state: "closed" } },
+						],
+						edges: [],
+					},
+				});
+
+				let resolveA!: (r: any) => void;
+				let signalA: AbortSignal | undefined;
+				let resolveB!: (r: any) => void;
+				let signalB: AbortSignal | undefined;
+
+				const appOut = bootApp("?factory=fac_1&view=live", async (url, init) => {
+					if (url === "/api/factories") {
+						return jsonResp(200, [
+							{ factory_id: "fac_1", name: "Fac1", current_version: "v1", management: "managed" },
+							{ factory_id: "fac_2", name: "Fac2", current_version: "v1", management: "managed" },
+						]);
+					}
+					if (url === "/api/factories/fac_1/live") return jsonResp(200, makeSnap("fac_1"));
+					if (url === "/api/factories/fac_2/live") return jsonResp(200, makeSnap("fac_2"));
+					if (url === "/api/factories/fac_1/output?node=node_a") {
+						signalA = init?.signal;
+						return new Promise(res => { resolveA = res; });
+					}
+					if (url === "/api/factories/fac_1/output?node=node_b") {
+						signalB = init?.signal;
+						return new Promise(res => { resolveB = res; });
+					}
+					if (url === "/api/factories/fac_1/output?node=node_c") {
+						return jsonResp(200, {
+							factory_id: "fac_1",
+							node_id: "node_c",
+							evidence: "unavailable",
+							latest_attempt: {
+								attempt_id: "c.1",
+								attempt_number: 1,
+								max_attempts: 1,
+								status: "needs_attention",
+								status_text: "Uncertain",
+								evidence: "unavailable",
+								absence: "evidence unavailable",
+								explanation: "Result record is damaged.",
+							},
+						});
+					}
+					if (url === "/api/factories/fac_1/output?node=node_err") {
+						return jsonResp(503, { error: "Evidence unavailable" });
+					}
+					if (url === "/api/factories/fac_1/output?node=node_mis") {
+						return jsonResp(200, {
+							factory_id: "fac_1",
+							node_id: "wrong_node",
+							evidence: "available",
+							latest_attempt: {
+								attempt_id: "w.1",
+								attempt_number: 1,
+								max_attempts: 1,
+								status: "succeeded",
+								status_text: "Succeeded",
+								evidence: "available",
+								summary: "MISMATCHED_OUTPUT_LEAK",
+								detail: "MISMATCHED_DETAIL",
+							},
+						});
+					}
+					if (url === "/api/factories/fac_2/output?node=node_a") {
+						return jsonResp(200, {
+							factory_id: "fac_2",
+							node_id: "node_a",
+							evidence: "available",
+							latest_attempt: {
+								attempt_id: "a.1",
+								attempt_number: 1,
+								max_attempts: 1,
+								status: "succeeded",
+								status_text: "Succeeded",
+								evidence: "available",
+								summary: "Fac2 summary\nLine 2",
+								detail: "Fac2 <script>alert('xss')</script>\n  indented",
+							},
+						});
+					}
+					throw new Error(`Unexpected URL ${url}`);
+				});
+				await flushMicrotasks();
+
+				const clickNode = async (id: string) => {
+					const g = collectAllElements(appOut.content).find(e => e.getAttribute("data-node-id") === id)!;
+					for (const fn of g.listeners.get("click") ?? []) fn({});
+					await flushMicrotasks();
+				};
+
+				// 1. Select node_a, then switch to node_b before node_a resolves -> aborts A & discards late A response
+				await clickNode("node_a");
+				assert.ok(signalA && !signalA.aborted);
+				assert.match(appOut.content.textContent, /Attempt output/);
+				assert.match(appOut.content.textContent, /Loading attempt output/);
+
+				await clickNode("node_b");
+				assert.equal(signalA.aborted, true, "Selecting another node must abort in-flight output request");
+				assert.ok(signalB && !signalB.aborted);
+				resolveA(jsonResp(200, {
+					factory_id: "fac_1",
+					node_id: "node_a",
+					evidence: "available",
+					latest_attempt: {
+						attempt_id: "a.1",
+						attempt_number: 1,
+						max_attempts: 1,
+						status: "succeeded",
+						status_text: "Succeeded",
+						evidence: "available",
+						summary: "STALE_NODE_A_LEAK",
+						detail: "STALE_NODE_A_DETAIL",
+					},
+				}));
+				await flushMicrotasks();
+				assert.equal(appOut.content.textContent.includes("STALE_NODE_A_LEAK"), false, "Late stale response for node_a must be discarded");
+
+				// Now resolve node_b with Not applicable
+				resolveB(jsonResp(200, {
+					factory_id: "fac_1",
+					node_id: "node_b",
+					evidence: "not applicable",
+					latest_attempt: {
+						attempt_id: "b.1",
+						attempt_number: 1,
+						max_attempts: 1,
+						status: "running",
+						status_text: "Running",
+						evidence: "not applicable",
+						absence: "not applicable",
+						explanation: "Attempt output is recorded when the attempt finishes.",
+					},
+				}));
+				await flushMicrotasks();
+				assert.match(appOut.content.textContent, /— Not applicable/);
+				assert.match(appOut.content.textContent, /Attempt output is recorded when the attempt finishes\./);
+
+				// 2. node_c -> Evidence unavailable
+				await clickNode("node_c");
+				assert.match(appOut.content.textContent, /! Evidence unavailable/);
+				assert.match(appOut.content.textContent, /Result record is damaged\./);
+
+				// 3. node_err -> error inside Attempt output section only; SVG graph & selected-node header stay intact
+				await clickNode("node_err");
+				assert.ok(collectAllElements(appOut.content).find(e => e.tagName === "svg"), "Graph must stay visible on output error");
+				assert.match(appOut.content.textContent, /Selected node/);
+				assert.match(appOut.content.textContent, /node_err/);
+				assert.match(appOut.content.textContent, /! HTTP 503/);
+
+				// 4. node_mis -> mismatched node_id discarded, shows error inside section only
+				await clickNode("node_mis");
+				assert.equal(appOut.content.textContent.includes("MISMATCHED_OUTPUT_LEAK"), false);
+				assert.match(appOut.content.textContent, /did not match/i);
+
+				// 5. Switch back to node_a (in-flight), then switch factory to fac_2 -> aborts node_a & discards stale response
+				await clickNode("node_a");
+				assert.ok(signalA && !signalA.aborted);
+				const fac2Link = collectAllElements(appOut.sidebar).find(e => e.tagName === "a" && (e.getAttribute("href") ?? "").includes("fac_2"))!;
+				for (const fn of fac2Link.listeners.get("click") ?? []) fn({ button: 0, preventDefault() {} });
+				await flushMicrotasks();
+				assert.equal(signalA.aborted, true, "Switching factory must abort in-flight output request");
+				resolveA(jsonResp(200, {
+					factory_id: "fac_1",
+					node_id: "node_a",
+					evidence: "available",
+					latest_attempt: {
+						attempt_id: "a.1",
+						attempt_number: 1,
+						max_attempts: 1,
+						status: "succeeded",
+						status_text: "Succeeded",
+						evidence: "available",
+						summary: "STALE_FAC1_OUTPUT_LEAK",
+						detail: "STALE_FAC1_DETAIL",
+					},
+				}));
+				await flushMicrotasks();
+				assert.equal(appOut.content.textContent.includes("STALE_FAC1_OUTPUT_LEAK"), false);
+
+				// 6. Select node_a in fac_2 -> renders plain text with preserved whitespace & .output-text, no injected markup
+				await clickNode("node_a");
+				assert.ok(collectTextNodes(appOut.content).some(t => t.includes("Fac2 <script>alert('xss')</script>\n  indented")));
+				const outBlocks = collectAllElements(appOut.content).filter(e => e.classList.contains("output-text"));
+				assert.equal(outBlocks.length, 2, "Summary and detail must use .output-text");
+
+				// N5/N6: outputBody must not carry nested aria-live inside detailPanel, and status chip renders once (in <summary>, not in body facts <dl>)
+				const outputHeading = collectAllElements(appOut.content).find(e => e.tagName === "h4" && e.textContent === "Attempt output")!;
+				assert.ok(outputHeading, "Expected Attempt output heading");
+				const outputSection = collectAllElements(appOut.content).find(e => e.tagName === "section" && e.children.some(c => c.children.includes(outputHeading)))!;
+				assert.ok(outputSection, "Expected Attempt output section");
+				const nestedAriaLive = collectAllElements(outputSection).filter(e => e.hasAttribute("aria-live"));
+				assert.equal(nestedAriaLive.length, 0, "Attempt output section must not nest aria-live inside detailPanel");
+				const outputDetails = collectAllElements(outputSection).find(e => e.tagName === "details")!;
+				assert.ok(outputDetails);
+				const statusChipsInDetails = collectAllElements(outputDetails).filter(e => e.classList.contains("chip"));
+				assert.equal(statusChipsInDetails.length, 1, "Status chip must render once (in <summary>), not duplicated in body facts");
+				assert.equal(collectAllElements(outputDetails).some(e => e.tagName === "dt" && e.textContent === "Status"), false, "Body facts must not duplicate Status");
+				appOut.assertSafeDom();
+			}
+
+			// J. N1: same-factory reload while /output is in flight must not leave Attempt output stuck on "Loading attempt output…"
+			{
+				let outputCalls = 0;
+				let resolveOutput!: (r: any) => void;
+				let resolveLiveReload!: (r: any) => void;
+				let liveCalls = 0;
+
+				const snap = {
+					factory_id: "fac_1",
+					current_version: "v1",
+					checked_at: "2026-11-28T12:00:00Z",
+					state: "running",
+					reason: "Running",
+					run: { run_id: "run-n1", attempt_id: "att-n1", bound_version: "v1" },
+					outcome: "incomplete",
+					settlement: "unsettled",
+					capacity_release: "held",
+					graph: {
+						evidence: "available",
+						bound_version: "v1",
+						topology: "graph",
+						nodes: [
+							{ id: "node_a", kind: "agent", status: "succeeded", status_text: "Succeeded", current_attempt: { attempt_id: "a.1", attempt_number: 1, max_attempts: 1, instance_id: "i-a", process_state: "exited", resource_state: "closed" } },
+						],
+						edges: [],
+					},
+				};
+
+				const appN1 = bootApp("?factory=fac_1&view=live", async (url, init) => {
+					if (url === "/api/factories") {
+						return jsonResp(200, [{ factory_id: "fac_1", name: "Fac1", current_version: "v1", management: "managed" }]);
+					}
+					if (url === "/api/factories/fac_1/live") {
+						liveCalls++;
+						if (liveCalls === 1) return jsonResp(200, snap);
+						return new Promise(res => { resolveLiveReload = res; });
+					}
+					if (url === "/api/factories/fac_1/output?node=node_a") {
+						outputCalls++;
+						return new Promise((res, rej) => {
+							resolveOutput = res;
+							init?.signal?.addEventListener("abort", () => {
+								const err = new Error("The operation was aborted");
+								err.name = "AbortError";
+								rej(err);
+							});
+						});
+					}
+					throw new Error(`Unexpected URL ${url}`);
+				});
+				await flushMicrotasks();
+
+				const gNode = collectAllElements(appN1.content).find(e => e.getAttribute("data-node-id") === "node_a")!;
+				for (const fn of gNode.listeners.get("click") ?? []) fn({});
+				await flushMicrotasks();
+				assert.equal(outputCalls, 1);
+				assert.match(appN1.content.textContent, /Loading attempt output/);
+
+				// Trigger same-factory reload (click Live Graph tab) while output request is in flight
+				const liveTab = appN1.viewsNav.querySelectorAll("[data-view]").find(t => t.getAttribute("data-view") === "live")!;
+				for (const fn of liveTab.listeners.get("click") ?? []) fn({ button: 0, preventDefault() {} });
+				await flushMicrotasks();
+
+				resolveLiveReload(jsonResp(200, snap));
+				await flushMicrotasks();
+
+				// Resolve whichever output request is active (original if preserved, or re-issued if aborted)
+				resolveOutput(jsonResp(200, {
+					factory_id: "fac_1",
+					node_id: "node_a",
+					evidence: "available",
+					latest_attempt: {
+						attempt_id: "a.1",
+						attempt_number: 1,
+						max_attempts: 1,
+						status: "succeeded",
+						status_text: "Succeeded",
+						evidence: "available",
+						summary: "Recovered summary after reload",
+						detail: "Recovered detail after reload",
+					},
+				}));
+				await flushMicrotasks();
+
+				assert.equal(appN1.content.textContent.includes("Loading attempt output"), false, "Attempt output must not stay stuck loading after same-factory reload");
+				assert.match(appN1.content.textContent, /Recovered summary after reload/);
+				assert.match(appN1.content.textContent, /Recovered detail after reload/);
+				appN1.assertSafeDom();
+
+				// Also verify AbortError recovery: if an output request aborts without rendering, the next live patch re-issues /output
+				let abortPhaseCalls = 0;
+				let abortPhaseLiveCalls = 0;
+				const appN1Abort = bootApp("?factory=fac_1&view=live", async (url) => {
+					if (url === "/api/factories") {
+						return jsonResp(200, [{ factory_id: "fac_1", name: "Fac1", current_version: "v1", management: "managed" }]);
+					}
+					if (url === "/api/factories/fac_1/live") {
+						abortPhaseLiveCalls++;
+						return jsonResp(200, snap);
+					}
+					if (url === "/api/factories/fac_1/output?node=node_a") {
+						abortPhaseCalls++;
+						if (abortPhaseCalls === 1) {
+							const err = new Error("The operation was aborted");
+							err.name = "AbortError";
+							throw err;
+						}
+						return jsonResp(200, {
+							factory_id: "fac_1",
+							node_id: "node_a",
+							evidence: "available",
+							latest_attempt: {
+								attempt_id: "a.1",
+								attempt_number: 1,
+								max_attempts: 1,
+								status: "succeeded",
+								status_text: "Succeeded",
+								evidence: "available",
+								summary: "Re-fetched after abort",
+								detail: "Re-fetched detail",
+							},
+						});
+					}
+					throw new Error(`Unexpected URL ${url}`);
+				});
+				await flushMicrotasks();
+
+				const gNodeAbort = collectAllElements(appN1Abort.content).find(e => e.getAttribute("data-node-id") === "node_a")!;
+				for (const fn of gNodeAbort.listeners.get("click") ?? []) fn({});
+				await flushMicrotasks();
+				assert.equal(abortPhaseCalls, 1);
+				assert.match(appN1Abort.content.textContent, /Loading attempt output/);
+
+				const liveTabAbort = appN1Abort.viewsNav.querySelectorAll("[data-view]").find(t => t.getAttribute("data-view") === "live")!;
+				for (const fn of liveTabAbort.listeners.get("click") ?? []) fn({ button: 0, preventDefault() {} });
+				await flushMicrotasks();
+				assert.ok(abortPhaseLiveCalls >= 2);
+				assert.equal(abortPhaseCalls, 2, "Next live patch must re-issue /output after an aborted request");
+				assert.equal(appN1Abort.content.textContent.includes("Loading attempt output"), false);
+				assert.match(appN1Abort.content.textContent, /Re-fetched after abort/);
+				appN1Abort.assertSafeDom();
 			}
 		},
 	);

@@ -9,7 +9,7 @@ import { readFailFast } from "../../bootstrap/ownership.ts";
 import { attemptNumber, blockedReviewForwardEdge, finalizePath, finalizedReviewRejection, readFinalization, reviewLoopFor, type ReviewLoop } from "../../bootstrap/review-loop.ts";
 import { assertNoSymlinkPath, dispositionPath, expectationFor, inboundEdgesOf, parseCompletion, parseDisposition, parseWorkerReady, pathEntryExists, processAlive, readRegularJsonNoSymlink, readyPath, resultPath, type AgentLaunch, type BootstrapManifest, type CommandEvidence } from "../../bootstrap/session-store.ts";
 import { headSummary, nodeLink, type TypedAbsence } from "./inspect.ts";
-import { deletionMarkerFields } from "./sanitize.ts";
+import { deletionMarkerFields, sanitizeOperatorText } from "./sanitize.ts";
 
 const STATUS_TEXT: Record<ExecutionState, string> = {
   pending: "Pending",
@@ -147,7 +147,12 @@ function verifyRegularHandoffFiles(
   }
 }
 
-function nodeObservation(manifest: BootstrapManifest, entry: AgentLaunch, byInstanceNodeId: ReadonlyMap<string, string>): InternalNodeObservation {
+function nodeObservation(
+  manifest: BootstrapManifest,
+  entry: AgentLaunch,
+  byInstanceNodeId: ReadonlyMap<string, string>,
+  blockedPaths: readonly string[],
+): InternalNodeObservation {
   const { session_dir: dir, task_id, review_plan } = manifest;
   const loop = reviewLoopFor(review_plan, entry.instance_id);
   const maxAttempts = loop ? loop.max_revisions + 1 : 1;
@@ -272,6 +277,12 @@ function nodeObservation(manifest: BootstrapManifest, entry: AgentLaunch, byInst
 
     if (hasResult) {
       const record = parseCompletion(readRegularJsonNoSymlink(result, "node result"), expected);
+      const scrubbedSummary = record.result.summary
+        ? sanitizeOperatorText(record.result.summary, 1000, blockedPaths)
+        : undefined;
+      const scrubbedResult = scrubbedSummary !== undefined
+        ? { ...record.result, summary: scrubbedSummary }
+        : record.result;
       const command = projectCommandOutcome(record.result.command_evidence);
       const baseFields = {
         attempt_id: attemptId,
@@ -285,7 +296,7 @@ function nodeObservation(manifest: BootstrapManifest, entry: AgentLaunch, byInst
         ...(updatedAt ? { updated_at: updatedAt } : {}),
         completed_at: record.completed_at,
         result_status: record.result.status,
-        ...(record.result.summary ? { summary: record.result.summary } : {}),
+        ...(scrubbedSummary ? { summary: scrubbedSummary } : {}),
         ...(command ? { command } : {}),
         ...(loop ? { loop } : {}),
         source_instance: attempt?.source,
@@ -305,13 +316,13 @@ function nodeObservation(manifest: BootstrapManifest, entry: AgentLaunch, byInst
         };
       }
       if (loop && finalization) {
-        const rejection = finalizedReviewRejection(loop, finalization, entry.node_id, record.result);
+        const rejection = finalizedReviewRejection(loop, finalization, entry.node_id, scrubbedResult);
         const closedEdge = blockedReviewForwardEdge(
           loop,
           finalization,
           entry.node_id,
-          { ...executionFromResult(record.result.status), reason: record.result.summary },
-          record.result,
+          { ...executionFromResult(record.result.status), reason: scrubbedSummary ?? "" },
+          scrubbedResult,
         );
         if (rejection) {
           return {
@@ -329,7 +340,7 @@ function nodeObservation(manifest: BootstrapManifest, entry: AgentLaunch, byInst
           ...baseFields,
           status: state,
           status_text: STATUS_TEXT[state],
-          ...(state === "failed" || state === "partial" ? { reason: record.result.summary } : {}),
+          ...(state === "failed" || state === "partial" ? { reason: scrubbedSummary ?? "" } : {}),
           finalized: true,
           ...(lastVerdict ? { last_verdict: lastVerdict } : {}),
           ...(closedEdge ? { review_rejected_closure: closedEdge } : {}),
@@ -340,7 +351,7 @@ function nodeObservation(manifest: BootstrapManifest, entry: AgentLaunch, byInst
         ...baseFields,
         status: state,
         status_text: STATUS_TEXT[state],
-        ...(state === "failed" || state === "partial" ? { reason: record.result.summary } : {}),
+        ...(state === "failed" || state === "partial" ? { reason: scrubbedSummary ?? "" } : {}),
       };
     }
 
@@ -564,7 +575,11 @@ function nodeObservation(manifest: BootstrapManifest, entry: AgentLaunch, byInst
   }
 }
 
-function projectGraph(factoryId: string, { definition, manifest, bound_version }: ReleasedFactoryRun) {
+function projectGraph(
+  factoryId: string,
+  { definition, manifest, bound_version }: ReleasedFactoryRun,
+  blockedPaths: readonly string[],
+) {
   if (manifest.factory_managed?.factory_id !== factoryId || manifest.factory_managed?.bound_version !== bound_version) {
     throw new Error("Run factory binding does not match the selected factory release");
   }
@@ -578,6 +593,12 @@ function projectGraph(factoryId: string, { definition, manifest, bound_version }
   }
   verifyBoundReviewPlan(definition, manifest.review_plan, manifest.pane_manifest);
 
+  const runBlockedPaths = [
+    ...blockedPaths,
+    manifest.session_dir,
+    manifest.project_cwd,
+    ...(manifest.factory_managed?.canonical_checkout ? [manifest.factory_managed.canonical_checkout] : []),
+  ];
   const nodeIds = new Set(definition.agents.map(entry => entry.node.node_id));
   const observations = new Map<string, InternalNodeObservation>();
   for (const entry of definition.agents) {
@@ -588,7 +609,7 @@ function projectGraph(factoryId: string, { definition, manifest, bound_version }
         JSON.stringify(inboundEdgesOf(launched).map(id => byInstance.get(id))) !== JSON.stringify(inbound)) {
       throw new Error("Run roster differs from the retained version");
     }
-    observations.set(node.node_id, nodeObservation(manifest, launched, byInstance));
+    observations.set(node.node_id, nodeObservation(manifest, launched, byInstance, runBlockedPaths));
   }
 
   // Propagate finalized non-approval loop closures onto unadmitted pending/waiting successors without writing to disk.
@@ -897,7 +918,7 @@ export function liveSnapshot(
     }
     const attempt = active[0];
     try {
-      const graph = projectGraph(factory.factory_id, releases[0]);
+      const graph = projectGraph(factory.factory_id, releases[0], blockedPaths);
       const outcome = aggregateRun(graph.nodes.map(node => node.status));
       const baseFields = {
         ...base,

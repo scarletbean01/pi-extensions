@@ -246,6 +246,7 @@ const PERMANENT_CLASS_ALLOWLIST = new Set([
 	"table-wrap",
 	// 9. Wrapping for long identifiers
 	"mono",
+	"output-text",
 ]);
 
 const TEMPORARY_LEGACY_CLASS_ALLOWLIST = new Set<string>();
@@ -337,6 +338,7 @@ const PERMANENT_STYLE_SELECTORS_BY_CATEGORY = {
 		".collection .collection-item",
 		"dd",
 		".chip", // allow long server-supplied chip labels to wrap at narrow viewports
+		".output-text",
 	],
 	// 10. Contrast fixes and content-link underlines
 	category10ContrastAndUnderlines: [
@@ -996,6 +998,24 @@ test("Materialize guard: every served shell and emitted class exists in material
 					explanation: "Proposals",
 					records: [{ proposal_id: "prop-1", action: "add", reference: "ref-1", text: "Rule", provenance: { source: "agent", run_id: "r1", attempt_id: "a1", evidence_ref: "e1" }, outcome: "pending", outcome_explanation: "Pending", file_sync_state: { absence: "not applicable" }, uncertain: false }],
 				},
+				"/api/factories/fac_1/output?node=left": {
+					factory_id: "fac_1",
+					node_id: "left",
+					run_id: "run-1",
+					bound_version: "v1",
+					evidence: "available",
+					latest_attempt: {
+						attempt_id: "left.1",
+						attempt_number: 1,
+						max_attempts: 2,
+						status: "succeeded",
+						status_text: "Succeeded",
+						result_status: "success",
+						evidence: "available",
+						summary: "Left summary",
+						detail: "Line 1\nLine 2",
+					},
+				},
 			};
 
 			// Loading state + 503 error state + narrow drawer open/close
@@ -1014,6 +1034,7 @@ test("Materialize guard: every served shell and emitted class exists in material
 			const nodeLeft = app.content.querySelectorAll("g").find((g) => g.getAttribute("data-node-id") === "left");
 			if (nodeLeft) {
 				for (const fn of nodeLeft.listeners.get("click") ?? []) fn({});
+				await flushMicrotasks();
 			}
 			for (const c of app.collectRenderedClasses()) usedClasses.add(c);
 
@@ -1440,6 +1461,24 @@ test("Materialize Slice 2 components: chips, card-panel banners, cards, dl.row f
 					explanation: "Proposals",
 					records: [{ proposal_id: "prop-1", action: "add", reference: "ref-1", text: "Rule", provenance: { source: "agent", run_id: "r1", attempt_id: "a1", evidence_ref: "e1" }, outcome: "pending", outcome_explanation: "Pending", file_sync_state: { absence: "not applicable" }, uncertain: false }],
 				},
+				"/api/factories/fac_1/output?node=left": {
+					factory_id: "fac_1",
+					node_id: "left",
+					run_id: "run-1",
+					bound_version: "v1",
+					evidence: "available",
+					latest_attempt: {
+						attempt_id: "left.1",
+						attempt_number: 1,
+						max_attempts: 2,
+						status: "succeeded",
+						status_text: "Succeeded",
+						result_status: "success",
+						evidence: "available",
+						summary: "Left summary",
+						detail: "Line 1\nLine 2",
+					},
+				},
 			};
 
 			// 1. Factories view: tables (striped highlight inside .table-wrap, never responsive-table), cards, btn/btn-flat, sidebar collections & collapsible Deleted
@@ -1719,6 +1758,24 @@ test("Slice 3: every .chip and .card-panel across all seven views carries a tone
 						{ proposal_id: "prop-3", action: "retire", reference: "ref-3", text: "Rule 3", provenance: { source: "agent", run_id: "r1", attempt_id: "a1", evidence_ref: "e3" }, outcome: "confirmed", outcome_explanation: "Confirmed", file_sync_state: "synced", file_sync_state_explanation: "Synced", uncertain: false },
 					],
 				},
+				"/api/factories/fac_1/output?node=left": {
+					factory_id: "fac_1",
+					node_id: "left",
+					run_id: "run-1",
+					bound_version: "v1",
+					evidence: "available",
+					latest_attempt: {
+						attempt_id: "left.1",
+						attempt_number: 1,
+						max_attempts: 2,
+						status: "succeeded",
+						status_text: "Succeeded",
+						result_status: "success",
+						evidence: "available",
+						summary: "Left summary",
+						detail: "Line 1\nLine 2",
+					},
+				},
 			};
 
 			// 1. Tone class sets on every .chip and .card-panel across error state and all 7 views
@@ -1740,6 +1797,7 @@ test("Slice 3: every .chip and .card-panel across all seven views carries a tone
 				if (label === "live") {
 					const nodeLeft = app.content.querySelectorAll("g").find((g) => g.getAttribute("data-node-id") === "left");
 					for (const fn of nodeLeft?.listeners.get("click") ?? []) fn({});
+					await flushMicrotasks();
 					app.context.mountOrPatchLiveView(fixtures["/api/factories/fac_1/live"], null, {
 						lastCheckedAt: "2026-11-25T12:00:00Z",
 						reason: "Refresh failed",

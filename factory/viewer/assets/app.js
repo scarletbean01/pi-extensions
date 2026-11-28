@@ -21,6 +21,8 @@ const {
   resolveLiveBoundVersionAbsence,
   safeNodeDomId,
   matchesSelectedFactory,
+  outputApiUrl,
+  matchesSelectedOutputTarget,
   resolveStopStateValue,
   resolveInspectOverallEvidence,
   resolveBooleanVerification,
@@ -146,6 +148,8 @@ const state = {
   selectedGraphNodeId: "",
   requestSeq: 0,
   controller: null,
+  outputRequestSeq: 0,
+  outputController: null,
   liveSession: createLiveSessionState(""),
   liveDom: null,
   liveInFlight: false,
@@ -744,10 +748,126 @@ function createDetailState() {
     reasonEl: null,
     factsDl: null,
     causesWrap: null,
+    outputSec: null,
+    outputBody: null,
+    outputLoadedKey: "",
     actionsEl: null,
     detailsEl: null,
     detailsDl: null,
   };
+}
+
+function abortOutputRequest() {
+  state.outputRequestSeq++;
+  if (state.outputController) {
+    state.outputController.abort();
+    state.outputController = null;
+  }
+}
+
+function renderAttemptOutputBody(slot, data, errorInfo) {
+  slot.setAttribute("aria-busy", "false");
+  if (errorInfo) {
+    slot.replaceChildren(errorBanner(errorInfo.status, errorInfo.message, errorInfo.detail));
+    return;
+  }
+  if (!data || typeof data !== "object") {
+    slot.replaceChildren(absenceNode({ absence: "evidence unavailable", explanation: "Attempt output response was empty or invalid." }));
+    return;
+  }
+  const att = data.latest_attempt && typeof data.latest_attempt === "object" ? data.latest_attempt : null;
+  if (!att) {
+    slot.replaceChildren(absenceNode(isAbsenceObject(data)
+      ? data
+      : { absence: "evidence unavailable", explanation: data.explanation || "Attempt output evidence is unavailable." }));
+    return;
+  }
+  const details = el("details", undefined, { class: "collapsible", open: true });
+  const summaryEl = el("summary", undefined, { class: "collapsible-header" });
+  summaryEl.append(
+    document.createTextNode(`Attempt ${att.attempt_number ?? "?"} of ${att.max_attempts ?? "?"} `),
+    statusPill(att.status, att.status_text || att.status),
+  );
+  const body = el("div", undefined, { class: "collapsible-body" });
+  if (att.evidence === "available") {
+    const facts = el("dl", undefined, { class: "row" });
+    facts.append(
+      factItem("Attempt ID", isAbsenceObject(att.attempt_id) ? absenceNode(att.attempt_id) : el("code", att.attempt_id)),
+    );
+    if (att.completed_at) facts.append(factItem("Completed at", att.completed_at));
+    body.append(facts);
+
+    const sumSec = el("div", undefined, { class: "section" });
+    sumSec.append(el("strong", "Summary"));
+    sumSec.append(att.summary
+      ? el("div", att.summary, { class: "output-text" })
+      : el("p", "No summary recorded.", { class: "grey-text text-darken-3" }));
+    body.append(sumSec);
+
+    const detSec = el("div", undefined, { class: "section" });
+    detSec.append(el("strong", "Detail"));
+    detSec.append(att.detail
+      ? el("div", att.detail, { class: "output-text" })
+      : el("p", "No detail recorded.", { class: "grey-text text-darken-3" }));
+    body.append(detSec);
+  } else {
+    body.append(absenceNode(att));
+  }
+  details.append(summaryEl, body);
+  slot.replaceChildren(details);
+}
+
+async function requestNodeOutput(factoryId, nodeId, ds) {
+  abortOutputRequest();
+  const slot = ds.outputBody;
+  if (!slot) return;
+  const outputKey = `${factoryId}\u0000${nodeId}`;
+  ds.outputLoadedKey = "";
+  const url = outputApiUrl(factoryId, nodeId);
+  if (!url) {
+    renderAttemptOutputBody(slot, null, {
+      status: null,
+      message: "Invalid factory or node identifier",
+      detail: "Unable to request attempt output without valid identifiers.",
+    });
+    ds.outputLoadedKey = outputKey;
+    return;
+  }
+  const seq = ++state.outputRequestSeq;
+  const controller = new AbortController();
+  state.outputController = controller;
+  slot.setAttribute("aria-busy", "true");
+  slot.replaceChildren(el("p", "Loading attempt output…"));
+  try {
+    const data = await fetchJsonStrict(url, controller.signal);
+    if (seq !== state.outputRequestSeq || factoryId !== state.selectedFactoryId || nodeId !== state.selectedGraphNodeId || state.activeView !== "live") return;
+    if (!matchesSelectedOutputTarget(data, factoryId, nodeId)) {
+      const gotFactory = data && typeof data === "object" && typeof data.factory_id === "string" ? data.factory_id : "missing";
+      const gotNode = data && typeof data === "object" && typeof data.node_id === "string" ? data.node_id : "missing";
+      renderAttemptOutputBody(slot, null, {
+        status: null,
+        message: "Output response did not match the selected node",
+        detail: `Expected factory "${factoryId}" node "${nodeId}" but received "${gotFactory}" / "${gotNode}".`,
+      });
+      ds.outputLoadedKey = outputKey;
+      return;
+    }
+    renderAttemptOutputBody(slot, data, null);
+    ds.outputLoadedKey = outputKey;
+  } catch (err) {
+    if (err && err.name === "AbortError") return;
+    if (seq !== state.outputRequestSeq || factoryId !== state.selectedFactoryId || nodeId !== state.selectedGraphNodeId || state.activeView !== "live") return;
+    renderAttemptOutputBody(slot, null, {
+      status: err?.status || null,
+      message: err?.message || "Failed to load attempt output",
+      detail: err?.detail || "Unable to fetch attempt output from the local viewer.",
+    });
+    ds.outputLoadedKey = outputKey;
+  } finally {
+    if (seq === state.outputRequestSeq && state.outputController === controller) {
+      state.outputController = null;
+    }
+  }
 }
 
 function buildDetailHeaderNodes(node) {
@@ -805,6 +925,7 @@ function patchLiveNodeDetail(detailEl, node, boundVersion, detailState) {
   }
   if (!node) {
     if (ds.mode !== "empty") {
+      abortOutputRequest();
       detailEl.replaceChildren(ds.headingEl);
       ds.bodyPlaceholder = el("p", "Select a node in the graph (click or press Enter/Space on a focused node) to inspect its current attempt and version-bound configuration.");
       detailEl.append(ds.bodyPlaceholder);
@@ -815,6 +936,9 @@ function patchLiveNodeDetail(detailEl, node, boundVersion, detailState) {
       ds.reasonEl = null;
       ds.factsDl = null;
       ds.causesWrap = null;
+      ds.outputSec = null;
+      ds.outputBody = null;
+      ds.outputLoadedKey = "";
       ds.actionsEl = null;
       ds.detailsEl = null;
       ds.detailsDl = null;
@@ -867,6 +991,13 @@ function patchLiveNodeDetail(detailEl, node, boundVersion, detailState) {
         c.check ? `${c.check.name} (${c.check.evidence})` : "—",
       ]))
       : null;
+    ds.outputSec = el("section", undefined, { class: "card" });
+    const outputCardBody = el("div", undefined, { class: "card-content" });
+    outputCardBody.append(el("h4", "Attempt output", { class: "card-title" }));
+    ds.outputBody = el("div", undefined, { "aria-busy": "false" });
+    outputCardBody.append(ds.outputBody);
+    ds.outputSec.append(outputCardBody);
+    ds.outputLoadedKey = "";
     ds.actionsEl = el("div", undefined, { class: "section" });
     if (cfgLink && isAbsenceObject(cfgLink)) {
       ds.actionsEl.append(absenceNode(cfgLink));
@@ -889,9 +1020,11 @@ function patchLiveNodeDetail(detailEl, node, boundVersion, detailState) {
     if (ds.reasonEl) children.push(ds.reasonEl);
     children.push(ds.factsDl);
     if (ds.causesWrap) children.push(ds.causesWrap);
+    children.push(ds.outputSec);
     children.push(ds.actionsEl);
     if (ds.detailsEl) children.push(ds.detailsEl);
     detailEl.replaceChildren(...children);
+    void requestNodeOutput(state.selectedFactoryId, node.id, ds);
     return ds;
   }
 
@@ -926,7 +1059,7 @@ function patchLiveNodeDetail(detailEl, node, boundVersion, detailState) {
         c.reason,
         c.check ? `${c.check.name} (${c.check.evidence})` : "—",
       ]));
-      detailEl.insertBefore(ds.causesWrap, ds.actionsEl);
+      detailEl.insertBefore(ds.causesWrap, ds.outputSec || ds.actionsEl);
     }
   }
   if (nextSigs.actions !== ds.sigs.actions) {
@@ -959,6 +1092,10 @@ function patchLiveNodeDetail(detailEl, node, boundVersion, detailState) {
     }
   }
   ds.sigs = nextSigs;
+  const outputKey = `${state.selectedFactoryId}\u0000${node.id}`;
+  if (ds.outputLoadedKey !== outputKey && !state.outputController) {
+    void requestNodeOutput(state.selectedFactoryId, node.id, ds);
+  }
   return ds;
 }
 
@@ -1643,6 +1780,7 @@ function mountOrPatchLiveView(data, transition, stale) {
   );
 
   if (!canPatch) {
+    abortOutputRequest();
     if (transition?.clearSelection) state.selectedGraphNodeId = "";
     const staleSlot = el("div");
     const announcer = el("div", undefined, { class: "sr-only", "aria-live": "polite" });
@@ -2729,14 +2867,16 @@ async function fetchLiveView({ isPoll }) {
 
 async function loadCurrentView() {
   clearPollTimer();
+  const reqFactory = state.selectedFactoryId;
+  const reqView = state.activeView;
+  if (reqView !== "live" || !state.liveDom || state.liveDom.factoryId !== reqFactory) {
+    abortOutputRequest();
+  }
   if (state.controller) {
     state.controller.abort();
     state.controller = null;
   }
   state.liveInFlight = false;
-
-  const reqFactory = state.selectedFactoryId;
-  const reqView = state.activeView;
 
   updateChrome();
   renderSidebarFactories();

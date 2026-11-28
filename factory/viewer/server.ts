@@ -8,6 +8,7 @@ import { parseVersionToken } from "../../bootstrap/factory-records.ts";
 import { factoryOperations, validateSubmissionReference, type Inspection, type ReleasedFactoryRun } from "../operations.ts";
 import { publicInspect } from "./inspect.ts";
 import { liveSnapshot } from "./live.ts";
+import { nodeOutputSnapshot } from "./output.ts";
 import { absentProposalsSnapshot, proposalsSnapshot, unavailableProposalsSnapshot } from "./proposals.ts";
 import { queueSnapshot, receiptSnapshot, unavailableQueueSnapshot } from "./queue.ts";
 import { absentRequestsSnapshot, collectRequestBlockedPaths, createViewerDirectionReader, projectViewerDeletion, requestsSnapshot, sanitizeOperatorText, unavailableRequestsSnapshot } from "./requests.ts";
@@ -180,11 +181,19 @@ export async function startViewer(
         }
         json(res, 200, { factories, deleted, damaged }); return;
       }
-      const match = /^\/api\/factories\/([^/]+)\/(live|inspect|queue|receipts|requests|proposals)$/.exec(url.pathname);
+      const match = /^\/api\/factories\/([^/]+)\/(live|inspect|queue|receipts|requests|proposals|output)$/.exec(url.pathname);
       if (match) {
         const [, id, view] = match;
         if (!token.test(id)) { json(res, 404, { error:"Factory not found" }); return; }
-        const allowed = view === "inspect" ? ["version", "node", "factory"] : view === "queue" ? ["filter"] : view === "receipts" ? ["reference"] : [];
+        const allowed = view === "inspect"
+          ? ["version", "node", "factory"]
+          : view === "queue"
+            ? ["filter"]
+            : view === "receipts"
+              ? ["reference"]
+              : view === "output"
+                ? ["node"]
+                : [];
         const keys = [...url.searchParams.keys()];
         if (keys.some(key => !allowed.includes(key)) || new Set(keys).size !== keys.length || [...url.searchParams.values()].some(value => value.length > 256)) { json(res, 400, { error: "Unsupported query parameter" }); return; }
         try {
@@ -280,6 +289,18 @@ export async function startViewer(
               json(res, 200, absentProposalsSnapshot(id, target.management === "unmanaged" ? "not applicable" : "no records", proposals, blockedPaths)); return;
             }
             json(res, 200, proposalsSnapshot(proposals, id, blockedPaths)); return;
+          }
+          if (view === "output") {
+            const nodeId = url.searchParams.get("node");
+            if (nodeId === null || !token.test(nodeId)) {
+              json(res, 400, { error: "Invalid node identifier" }); return;
+            }
+            const { inspection, releases } = inspectLive(id);
+            const outcome = nodeOutputSnapshot(id, nodeId, inspection, releases, blockedPaths);
+            if (outcome.kind === "not_found") {
+              json(res, 404, { error: outcome.error }); return;
+            }
+            json(res, 200, outcome.body); return;
           }
           const { inspection, releases } = inspectLive(id);
           json(res, 200, liveSnapshot(inspection, releases, blockedPaths)); return;

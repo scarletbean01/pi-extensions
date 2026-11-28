@@ -183,6 +183,9 @@ test("viewer rejects non-GET methods, non-loopback Host headers, bad request tar
 		"/api/factories/fac_1/receipts?path=/etc/passwd",
 		"/api/factories/fac_1/requests?path=/etc/passwd",
 		"/api/factories/fac_1/proposals?path=/etc/passwd",
+		"/api/factories/fac_1/output?path=/etc/passwd",
+		"/api/factories/fac_1/output",
+		"/api/factories/fac_1/output?node=../bad",
 	]) {
 		assert.equal((await fetch(`${base}${badPath}`)).status, 400, `expected 400 for ${badPath}`);
 	}
@@ -191,6 +194,7 @@ test("viewer rejects non-GET methods, non-loopback Host headers, bad request tar
 		`/api/factories/fac_1/receipts?reference=${"a".repeat(257)}`,
 		`/api/factories/fac_1/inspect?version=v${"1".repeat(256)}`,
 		`/api/factories/fac_1/queue?filter=${"a".repeat(257)}`,
+		`/api/factories/fac_1/output?node=${"a".repeat(257)}`,
 	]) {
 		const res = await fetch(`${base}${overLongPath}`);
 		assert.equal(res.status, 400, `expected 400 for over-long query value`);
